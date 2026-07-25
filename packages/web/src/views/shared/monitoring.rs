@@ -20,7 +20,9 @@ pub fn Monitoring() -> Element {
         .unwrap_or(false);
 
     if !is_admin {
-        return rsx! { NoPermissionView { resource: i18n.t("page.monitoring").to_string() } };
+        return rsx! {
+            NoPermissionView { resource: i18n.t("page.monitoring").to_string() }
+        };
     }
 
     let overview = use_resource(move || async move {
@@ -40,13 +42,17 @@ pub fn Monitoring() -> Element {
             }
 
             match overview() {
-                None => rsx! { p { class: "text-secondary", {i18n.t("table.loading")} } },
+                None => rsx! {
+                    p { class: "text-secondary", {i18n.t("table.loading")} }
+                },
                 Some(Err(ref e)) => rsx! {
                     div { class: "alert alert-error",
                         p { "{i18n.t(\"common.load_failed\")}: {e}" }
                     }
                 },
-                Some(Ok(ref data)) => rsx! { MonitoringConsole { data: data.clone() } },
+                Some(Ok(ref data)) => rsx! {
+                    MonitoringConsole { data: data.clone() }
+                },
             }
         }
     }
@@ -84,11 +90,31 @@ fn MonitoringConsole(data: MonitoringOverviewResponse) -> Element {
         }
 
         div { class: "monitoring-stat-grid",
-            StatCard { label: i18n.t("monitoring.total_node_tasks").to_string(), value: data.summary.total_node_tasks.to_string(), meta: i18n.t("monitoring.total_usage_logs").to_string() }
-            StatCard { label: i18n.t("monitoring.succeeded_tasks").to_string(), value: data.summary.succeeded_node_tasks.to_string(), meta: i18n.t("monitoring.succeeded_tasks_desc").to_string() }
-            StatCard { label: i18n.t("monitoring.failed_tasks").to_string(), value: data.summary.failed_node_tasks.to_string(), meta: i18n.t("monitoring.active_tasks_desc").to_string() }
-            StatCard { label: i18n.t("monitoring.avg_latency").to_string(), value: format_duration(data.summary.avg_node_latency_ms), meta: i18n.t("monitoring.avg_latency_desc").to_string() }
-            StatCard { label: i18n.t("monitoring.tokens").to_string(), value: compact_number(total_tokens as i64), meta: i18n.t("monitoring.total_usage_logs").to_string() }
+            StatCard {
+                label: i18n.t("monitoring.total_node_tasks").to_string(),
+                value: data.summary.total_node_tasks.to_string(),
+                meta: i18n.t("monitoring.total_usage_logs").to_string(),
+            }
+            StatCard {
+                label: i18n.t("monitoring.succeeded_tasks").to_string(),
+                value: data.summary.succeeded_node_tasks.to_string(),
+                meta: i18n.t("monitoring.succeeded_tasks_desc").to_string(),
+            }
+            StatCard {
+                label: i18n.t("monitoring.failed_tasks").to_string(),
+                value: data.summary.failed_node_tasks.to_string(),
+                meta: i18n.t("monitoring.active_tasks_desc").to_string(),
+            }
+            StatCard {
+                label: i18n.t("monitoring.avg_latency").to_string(),
+                value: format_duration(data.summary.avg_node_latency_ms),
+                meta: i18n.t("monitoring.avg_latency_desc").to_string(),
+            }
+            StatCard {
+                label: i18n.t("monitoring.tokens").to_string(),
+                value: compact_number(total_tokens as i64),
+                meta: i18n.t("monitoring.total_usage_logs").to_string(),
+            }
         }
 
         div { class: "monitoring-trace-shell",
@@ -164,7 +190,9 @@ fn MonitoringConsole(data: MonitoringOverviewResponse) -> Element {
                                 span { class: "account-model-chip", "{model}" }
                             }
                             if accepted_models(&node.accepted_models_json).is_empty() {
-                                span { class: "account-model-chip account-model-chip-muted", {i18n.t("node_gateway.no_models")} }
+                                span { class: "account-model-chip account-model-chip-muted",
+                                    {i18n.t("node_gateway.no_models")}
+                                }
                             }
                         }
                     }
@@ -232,10 +260,26 @@ fn TraceDetail(trace: MonitoringTraceEntry) -> Element {
                 span { "{i18n.t(\"pricing.model_name\")}: {trace.model}" }
             }
             div { class: "monitoring-timeline",
-                TraceStage { label: i18n.t("monitoring.stage_queued").to_string(), value: compact_time(&trace.queued_at), active: true }
-                TraceStage { label: i18n.t("monitoring.stage_claimed").to_string(), value: trace.claimed_at.as_deref().map(compact_time).unwrap_or_else(|| "-".to_string()), active: trace.claimed_at.is_some() }
-                TraceStage { label: i18n.t("monitoring.stage_finished").to_string(), value: trace.finished_at.as_deref().map(compact_time).unwrap_or_else(|| "-".to_string()), active: trace.finished_at.is_some() }
-                TraceStage { label: i18n.t("monitoring.stage_usage").to_string(), value: trace.usage_status.clone().unwrap_or_else(|| "-".to_string()), active: trace.usage_status.is_some() }
+                TraceStage {
+                    label: i18n.t("monitoring.stage_queued").to_string(),
+                    value: compact_time(&trace.queued_at),
+                    active: true,
+                }
+                TraceStage {
+                    label: i18n.t("monitoring.stage_claimed").to_string(),
+                    value: trace.claimed_at.as_deref().map(compact_time).unwrap_or_else(|| "-".to_string()),
+                    active: trace.claimed_at.is_some(),
+                }
+                TraceStage {
+                    label: i18n.t("monitoring.stage_finished").to_string(),
+                    value: trace.finished_at.as_deref().map(compact_time).unwrap_or_else(|| "-".to_string()),
+                    active: trace.finished_at.is_some(),
+                }
+                TraceStage {
+                    label: i18n.t("monitoring.stage_usage").to_string(),
+                    value: trace.usage_status.clone().unwrap_or_else(|| "-".to_string()),
+                    active: trace.usage_status.is_some(),
+                }
             }
         }
     }
@@ -246,19 +290,54 @@ fn TraceMap(trace: MonitoringTraceEntry) -> Element {
     let i18n = use_i18n();
     rsx! {
         section { class: "monitoring-detail-card monitoring-map",
-            Lane { title: "Gateway".to_string(), subtitle: "OpenAI API".to_string(),
-                MapPill { label: i18n.t("monitoring.map_receive_request").to_string(), value: compact_time(&trace.queued_at), class_name: "at-start".to_string() }
-                MapPill { label: i18n.t("monitoring.map_return_client").to_string(), value: trace.finished_at.as_deref().map(compact_time).unwrap_or_else(|| "-".to_string()), class_name: "at-end".to_string() }
+            Lane {
+                title: i18n.t("monitoring.map_gateway").to_string(),
+                subtitle: i18n.t("monitoring.map_gateway_subtitle").to_string(),
+                MapPill {
+                    label: i18n.t("monitoring.map_receive_request").to_string(),
+                    value: compact_time(&trace.queued_at),
+                    class_name: "at-start".to_string(),
+                }
+                MapPill {
+                    label: i18n.t("monitoring.map_return_client").to_string(),
+                    value: trace.finished_at.as_deref().map(compact_time).unwrap_or_else(|| "-".to_string()),
+                    class_name: "at-end".to_string(),
+                }
             }
-            Lane { title: i18n.t("monitoring.map_router").to_string(), subtitle: "node: model".to_string(),
-                MapPill { label: i18n.t("monitoring.map_match_route").to_string(), value: trace.claimed_at.as_deref().map(compact_time).unwrap_or_else(|| "-".to_string()), class_name: "at-mid".to_string() }
+            Lane {
+                title: i18n.t("monitoring.map_router").to_string(),
+                subtitle: i18n.t("monitoring.map_router_subtitle").to_string(),
+                MapPill {
+                    label: i18n.t("monitoring.map_match_route").to_string(),
+                    value: trace.claimed_at.as_deref().map(compact_time).unwrap_or_else(|| "-".to_string()),
+                    class_name: "at-mid".to_string(),
+                }
             }
-            Lane { title: "Node".to_string(), subtitle: trace.node_name.clone().unwrap_or_else(|| "-".to_string()),
-                MapPill { label: i18n.t("monitoring.map_process_request").to_string(), value: format_duration(trace.duration_ms), class_name: "at-run".to_string() }
-                MapPill { label: i18n.t("monitoring.map_submit_result").to_string(), value: trace.last_submission_action.clone().unwrap_or_else(|| "-".to_string()), class_name: "at-done".to_string() }
+            Lane {
+                title: i18n.t("monitoring.map_node").to_string(),
+                subtitle: trace.node_name.clone().unwrap_or_else(|| "-".to_string()),
+                MapPill {
+                    label: i18n.t("monitoring.map_process_request").to_string(),
+                    value: format_duration(trace.duration_ms),
+                    class_name: "at-run".to_string(),
+                }
+                MapPill {
+                    label: i18n.t("monitoring.map_submit_result").to_string(),
+                    value: trace.last_submission_action.clone().unwrap_or_else(|| "-".to_string()),
+                    class_name: "at-done".to_string(),
+                }
             }
-            Lane { title: i18n.t("monitoring.map_model_service").to_string(), subtitle: trace.model.clone(),
-                MapPill { label: i18n.t("monitoring.map_model_response").to_string(), value: trace.total_tokens.map(|v| format!("{} tokens", v)).unwrap_or_else(|| "-".to_string()), class_name: "at-run".to_string() }
+            Lane {
+                title: i18n.t("monitoring.map_model_service").to_string(),
+                subtitle: trace.model.clone(),
+                MapPill {
+                    label: i18n.t("monitoring.map_model_response").to_string(),
+                    value: trace
+                        .total_tokens
+                        .map(|v| format!("{} tokens", v))
+                        .unwrap_or_else(|| "-".to_string()),
+                    class_name: "at-run".to_string(),
+                }
             }
         }
     }
@@ -275,9 +354,7 @@ fn Lane(title: String, subtitle: String, children: Element) -> Element {
                     p { class: "monitoring-lane-subtitle", "{subtitle}" }
                 }
             }
-            div { class: "monitoring-lane-body",
-                {children}
-            }
+            div { class: "monitoring-lane-body", {children} }
         }
     }
 }
@@ -333,12 +410,30 @@ fn BasicInfo(trace: MonitoringTraceEntry) -> Element {
             div { class: "monitoring-card-head",
                 h3 { {i18n.t("monitoring.basic_info")} }
             }
-            InfoRow { label: i18n.t("monitoring.request").to_string(), value: short_id(&trace.request_id) }
-            InfoRow { label: i18n.t("table.status").to_string(), value: trace.status.clone() }
-            InfoRow { label: i18n.t("monitoring.queued_at").to_string(), value: trace.queued_at.clone() }
-            InfoRow { label: i18n.t("monitoring.duration").to_string(), value: format_duration(trace.duration_ms) }
-            InfoRow { label: i18n.t("monitoring.node").to_string(), value: trace.node_name.clone().unwrap_or_else(|| "-".to_string()) }
-            InfoRow { label: i18n.t("pricing.model_name").to_string(), value: trace.model.clone() }
+            InfoRow {
+                label: i18n.t("monitoring.request").to_string(),
+                value: short_id(&trace.request_id),
+            }
+            InfoRow {
+                label: i18n.t("table.status").to_string(),
+                value: trace.status.clone(),
+            }
+            InfoRow {
+                label: i18n.t("monitoring.queued_at").to_string(),
+                value: trace.queued_at.clone(),
+            }
+            InfoRow {
+                label: i18n.t("monitoring.duration").to_string(),
+                value: format_duration(trace.duration_ms),
+            }
+            InfoRow {
+                label: i18n.t("monitoring.node").to_string(),
+                value: trace.node_name.clone().unwrap_or_else(|| "-".to_string()),
+            }
+            InfoRow {
+                label: i18n.t("pricing.model_name").to_string(),
+                value: trace.model.clone(),
+            }
         }
     }
 }
@@ -351,10 +446,22 @@ fn MetricInfo(trace: MonitoringTraceEntry) -> Element {
             div { class: "monitoring-card-head",
                 h3 { {i18n.t("monitoring.request_metrics")} }
             }
-            InfoRow { label: i18n.t("monitoring.tokens").to_string(), value: trace.total_tokens.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()) }
-            InfoRow { label: i18n.t("monitoring.submissions").to_string(), value: trace.submissions_count.to_string() }
-            InfoRow { label: i18n.t("monitoring.amount").to_string(), value: trace.amount.clone().unwrap_or_else(|| "-".to_string()) }
-            InfoRow { label: i18n.t("monitoring.stage_usage").to_string(), value: trace.usage_status.clone().unwrap_or_else(|| "-".to_string()) }
+            InfoRow {
+                label: i18n.t("monitoring.tokens").to_string(),
+                value: trace.total_tokens.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+            }
+            InfoRow {
+                label: i18n.t("monitoring.submissions").to_string(),
+                value: trace.submissions_count.to_string(),
+            }
+            InfoRow {
+                label: i18n.t("monitoring.amount").to_string(),
+                value: trace.amount.clone().unwrap_or_else(|| "-".to_string()),
+            }
+            InfoRow {
+                label: i18n.t("monitoring.stage_usage").to_string(),
+                value: trace.usage_status.clone().unwrap_or_else(|| "-".to_string()),
+            }
         }
     }
 }
@@ -384,7 +491,9 @@ fn NodeStatusBadge(status: String) -> Element {
         "excluded" => i18n.t("node_gateway.status_excluded"),
         _ => status.as_str(),
     };
-    rsx! { Badge { variant, "{label}" } }
+    rsx! {
+        Badge { variant, "{label}" }
+    }
 }
 
 #[component]
@@ -405,7 +514,9 @@ fn TaskStatusBadge(status: String) -> Element {
         "expired" => i18n.t("node_gateway.task_expired"),
         _ => status.as_str(),
     };
-    rsx! { Badge { variant, "{label}" } }
+    rsx! {
+        Badge { variant, "{label}" }
+    }
 }
 
 fn accepted_models(value: &serde_json::Value) -> Vec<String> {

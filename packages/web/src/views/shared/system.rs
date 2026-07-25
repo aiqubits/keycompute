@@ -23,7 +23,9 @@ pub fn System() -> Element {
         .unwrap_or(false);
 
     if !is_admin {
-        return rsx! { NoPermissionView { resource: i18n.t("page.system").to_string() } };
+        return rsx! {
+            NoPermissionView { resource: i18n.t("page.system").to_string() }
+        };
     }
 
     let provider_health = use_resource(move || async move {
@@ -84,8 +86,12 @@ pub fn System() -> Element {
             div { class: "card",
                 div { class: "card-body",
                     match provider_health() {
-                        None => rsx! { p { class: "text-secondary", {i18n.t("table.loading")} } },
-                        Some(Err(_)) => rsx! { p { class: "text-secondary", {i18n.t("common.load_failed")} } },
+                        None => rsx! {
+                            p { class: "text-secondary", {i18n.t("table.loading")} }
+                        },
+                        Some(Err(_)) => rsx! {
+                            p { class: "text-secondary", {i18n.t("common.load_failed")} }
+                        },
                         Some(Ok(ref resp)) => rsx! {
                             div { class: "health-grid",
                                 for name in resp.healthy_providers.iter() {
@@ -145,7 +151,9 @@ pub fn System() -> Element {
                 }
                 div { class: "card-body",
                     match routing_info() {
-                        None => rsx! { p { class: "text-secondary", {i18n.t("table.loading")} } },
+                        None => rsx! {
+                            p { class: "text-secondary", {i18n.t("table.loading")} }
+                        },
                         Some(Err(ref e)) => rsx! {
                             div { class: "alert alert-error",
                                 p { "{i18n.t(\"common.load_failed\")}: {e}" }
@@ -161,6 +169,7 @@ pub fn System() -> Element {
                                             p { class: "text-sm",
                                                 "{i18n.t(\"system.primary_target\")}: {primary.provider} ({primary.endpoint})"
                                             }
+
                                         }
                                         if !info.fallback_chain.is_empty() {
                                             p { class: "text-sm",
@@ -185,7 +194,7 @@ pub fn System() -> Element {
                                     col_count: 4,
                                     thead {
                                         tr {
-                                            TableHead { "Provider" }
+                                            TableHead { {i18n.t("system.provider_column")} }
                                             TableHead { {i18n.t("system.health_status")} }
                                             TableHead { {i18n.t("system.account_count")} }
                                             TableHead { {i18n.t("table.status")} }

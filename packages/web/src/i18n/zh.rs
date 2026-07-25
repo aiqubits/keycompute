@@ -65,8 +65,8 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     );
     m.insert("auth.register_now", "立即注册");
     m.insert("auth.login_now", "立即登录");
-    m.insert("auth.email_placeholder", "请输入邮箱");
-    m.insert("auth.password_placeholder", "请输入密码");
+    m.insert("auth.email_placeholder", "admin@keycompute.local");
+    m.insert("auth.password_placeholder", "change-me-admin-password");
     m.insert("auth.username_placeholder", "请输入用户名");
     m.insert("auth.name_placeholder", "请输入姓名");
     m.insert("auth.confirm_password_placeholder", "再次输入密码");
@@ -81,6 +81,10 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("auth.send_failed", "发送失败");
     m.insert("auth.sending", "发送中...");
     m.insert("auth.cooldown_retry", "请稍后重试");
+    m.insert(
+        "auth.identity_error",
+        "邮箱地址或用户名错误，无法发送重置密码链接",
+    );
     m.insert("auth.send_reset_link", "发送重置链接");
     m.insert("auth.logging_in", "登录中...");
     m.insert("auth.registering", "注册中...");
@@ -172,6 +176,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("common.load_failed", "加载失败");
     m.insert("common.redirecting", "跳转中");
     m.insert("common.redirect_to_login", "正在跳转到登录页…");
+    m.insert("common.redirect_to_home", "正在跳转到首页…");
     m.insert("common.admin_only_page", "权限不足：该页面仅管理员可访问");
     m.insert("common.expand", "展开");
     m.insert("common.collapse", "折叠");
@@ -310,6 +315,25 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert(
         "home.features.custom.desc",
         "按需定制，灵活适配企业方业务场景",
+    );
+    m.insert("home.menu", "菜单");
+    m.insert("home.lang_switch_label", "EN");
+    m.insert("home.tip.title", "赞赏支持");
+    m.insert("home.tip.subtitle_prefix", "如果您喜欢 ");
+    m.insert("home.tip.subtitle_suffix", "，欢迎请我们喝杯咖啡 ☕");
+    m.insert("home.tip.wechat_qr_alt", "微信赞赏码");
+    m.insert("home.tip.wechat_label", "微信赞赏");
+    m.insert("home.tip.alipay_qr_alt", "支付宝赞赏码");
+    m.insert("home.tip.alipay_label", "支付宝赞赏");
+    m.insert("home.contributors.title", "社区贡献者");
+    m.insert(
+        "home.contributors.subtitle",
+        "感谢所有为 KeyCompute 做出贡献的开发者 ❤️",
+    );
+    m.insert("home.sponsors.title", "社区赞助者");
+    m.insert(
+        "home.sponsors.subtitle",
+        "感谢以下赞助者对 KeyCompute 的大力支持 🙏",
     );
 
     // ── 需求收集 ─────────────────────────────────
@@ -698,6 +722,8 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("pricing.model_placeholder", "如 gpt-4o");
     m.insert("pricing.provider_type", "计费维度");
     m.insert("pricing.provider_type_placeholder", "选择计费维度");
+    m.insert("pricing.label_provider_account", "Provider 账号");
+    m.insert("pricing.label_node", "节点");
     m.insert("pricing.input_price_label", "输入单价（每1K tokens）");
     m.insert("pricing.output_price_label", "输出单价（每1K tokens）");
     m.insert("pricing.input_placeholder", "如 0.000005");
@@ -801,6 +827,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("system.route_failed", "路由失败");
     m.insert("system.provider_status", "Provider 状态");
     m.insert("system.no_provider_configured", "未配置任何 Provider");
+    m.insert("system.provider_column", "Provider");
     m.insert("system.health_status", "健康状态");
     m.insert("system.account_count", "账号数量");
     m.insert("system.healthy", "健康");
@@ -1006,6 +1033,10 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("monitoring.map_submit_result", "提交结果");
     m.insert("monitoring.map_model_service", "模型服务");
     m.insert("monitoring.map_model_response", "模型响应");
+    m.insert("monitoring.map_gateway", "网关");
+    m.insert("monitoring.map_gateway_subtitle", "OpenAI API");
+    m.insert("monitoring.map_router_subtitle", "节点: 模型");
+    m.insert("monitoring.map_node", "节点");
     m.insert("users.subtitle", "查看和管理平台所有注册用户");
     m.insert("users.search_placeholder", "搜索邮箱或用户名...");
     m.insert("users.empty", "暂无用户数据");

@@ -696,6 +696,64 @@ input, textarea, select {
 
 }
 
+/* ── Login Light Theme ─────────────────────── */
+[data-theme="light"] .kc-login-page {
+  --kc-login-bg-primary: #f0f4f8;
+  --kc-login-bg-secondary: #ffffff;
+  --kc-login-surface: #ffffff;
+  --kc-login-surface-hover: #f8fafc;
+  --kc-login-accent: #0891b2;
+  --kc-login-accent-glow: rgba(8, 145, 178, 0.12);
+  --kc-login-accent-secondary: #7c3aed;
+  --kc-login-text-primary: #0f172a;
+  --kc-login-text-secondary: #475569;
+  --kc-login-text-muted: #94a3b8;
+  --kc-login-border: rgba(8, 145, 178, 0.15);
+  --kc-login-border-active: rgba(8, 145, 178, 0.4);
+  --kc-login-success: #059669;
+  --kc-login-error: #dc2626;
+}
+
+[data-theme="light"] .kc-login-bg-grid {
+  background-image:
+    linear-gradient(rgba(8, 145, 178, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(8, 145, 178, 0.05) 1px, transparent 1px);
+}
+
+[data-theme="light"] .kc-login-bg-glow {
+  opacity: 0.08;
+}
+
+[data-theme="light"] .kc-login-card {
+  background: color-mix(in srgb, var(--kc-login-surface) 97%, transparent);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.08);
+}
+
+[data-theme="light"] .kc-login-button {
+  color: #ffffff;
+}
+
+[data-theme="light"] .kc-login-form-input {
+  background: var(--kc-login-bg-secondary);
+  border-color: var(--kc-login-border);
+}
+
+[data-theme="light"] .kc-login-form-input:hover {
+  background: var(--kc-login-surface-hover);
+}
+
+[data-theme="light"] .kc-login-status-error {
+  color: var(--kc-login-error);
+  background: rgba(220, 38, 38, 0.06);
+  border: 1px solid rgba(220, 38, 38, 0.2);
+}
+
+[data-theme="light"] .kc-login-status-success {
+  color: var(--kc-login-success);
+  background: rgba(5, 150, 105, 0.06);
+  border: 1px solid rgba(5, 150, 105, 0.2);
+}
+
 /* ── Authenticated Console Surface ──────────── */
 .page-container {
   display: flex;

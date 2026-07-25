@@ -68,8 +68,8 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     );
     m.insert("auth.register_now", "Sign up");
     m.insert("auth.login_now", "Sign in");
-    m.insert("auth.email_placeholder", "Enter your email");
-    m.insert("auth.password_placeholder", "Enter your password");
+    m.insert("auth.email_placeholder", "admin@keycompute.local");
+    m.insert("auth.password_placeholder", "change-me-admin-password");
     m.insert("auth.username_placeholder", "Enter your username");
     m.insert("auth.name_placeholder", "Enter your name");
     m.insert("auth.confirm_password_placeholder", "Re-enter password");
@@ -90,6 +90,10 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("auth.send_failed", "Failed to send");
     m.insert("auth.sending", "Sending...");
     m.insert("auth.cooldown_retry", "Try again later");
+    m.insert(
+        "auth.identity_error",
+        "Invalid email or username, unable to send reset link",
+    );
     m.insert("auth.send_reset_link", "Send Reset Link");
     m.insert("auth.logging_in", "Signing in...");
     m.insert("auth.registering", "Signing up...");
@@ -193,6 +197,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("common.load_failed", "Load failed");
     m.insert("common.redirecting", "Redirecting");
     m.insert("common.redirect_to_login", "Redirecting to sign in...");
+    m.insert("common.redirect_to_home", "Redirecting to home...");
     m.insert(
         "common.admin_only_page",
         "Permission denied: this page is available to admins only",
@@ -353,8 +358,30 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
         "home.features.custom.desc",
         "On-demand configuration, flexible business adaptation",
     );
+    m.insert("home.menu", "Menu");
+    m.insert("home.lang_switch_label", "中");
+    m.insert("home.tip.title", "Support Us");
+    m.insert("home.tip.subtitle_prefix", "If you like ");
+    m.insert(
+        "home.tip.subtitle_suffix",
+        ", feel free to buy us a coffee ☕",
+    );
+    m.insert("home.tip.wechat_qr_alt", "WeChat Tip QR");
+    m.insert("home.tip.wechat_label", "WeChat Pay");
+    m.insert("home.tip.alipay_qr_alt", "Alipay Tip QR");
+    m.insert("home.tip.alipay_label", "Alipay");
+    m.insert("home.contributors.title", "Community Contributors");
+    m.insert(
+        "home.contributors.subtitle",
+        "Thanks to all contributors who make KeyCompute better ❤️",
+    );
+    m.insert("home.sponsors.title", "Community Sponsors");
+    m.insert(
+        "home.sponsors.subtitle",
+        "Special thanks to our sponsors for their generous support 🙏",
+    );
 
-    // ── Requirement Collection ──────────────────
+    // ── Requirement Collection ──────────────────────
     m.insert("req.bubble", "Request Consult");
     m.insert("req.title", "Submit Compute Request");
     m.insert(
@@ -803,6 +830,8 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("pricing.model_placeholder", "e.g. gpt-4o");
     m.insert("pricing.provider_type", "Provider Type");
     m.insert("pricing.provider_type_placeholder", "Select provider type");
+    m.insert("pricing.label_provider_account", "Provider Account");
+    m.insert("pricing.label_node", "Node");
     m.insert("pricing.input_price_label", "Input Price (per 1K tokens)");
     m.insert("pricing.output_price_label", "Output Price (per 1K tokens)");
     m.insert("pricing.input_placeholder", "e.g. 0.000005");
@@ -952,6 +981,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("system.route_failed", "Route failed");
     m.insert("system.provider_status", "Provider Status");
     m.insert("system.no_provider_configured", "No providers configured");
+    m.insert("system.provider_column", "Provider");
     m.insert("system.health_status", "Health");
     m.insert("system.account_count", "Accounts");
     m.insert("system.healthy", "Healthy");
@@ -1181,6 +1211,10 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("monitoring.map_submit_result", "Submit Result");
     m.insert("monitoring.map_model_service", "Model Service");
     m.insert("monitoring.map_model_response", "Model Response");
+    m.insert("monitoring.map_gateway", "Gateway");
+    m.insert("monitoring.map_gateway_subtitle", "OpenAI API");
+    m.insert("monitoring.map_router_subtitle", "node: model");
+    m.insert("monitoring.map_node", "Node");
     m.insert(
         "users.subtitle",
         "View and manage all registered users on the platform",

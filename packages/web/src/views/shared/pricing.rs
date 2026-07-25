@@ -15,15 +15,16 @@ fn is_global_default(tenant_id: &Option<String>) -> bool {
 }
 
 use crate::hooks::use_i18n::use_i18n;
+use crate::i18n::I18n;
 use crate::services::{api_client::with_auto_refresh, pricing_service, tenant_service};
 use crate::stores::auth_store::AuthStore;
 use crate::stores::user_store::UserStore;
 use crate::utils::time::format_time;
 
-fn pricing_provider_label(dimension: &str) -> &str {
+fn pricing_provider_label<'a>(dimension: &'a str, i18n: &I18n) -> &'a str {
     match dimension {
-        "provideraccount" => "ProviderAccount",
-        "node" => "Node",
+        "provideraccount" => i18n.t("pricing.label_provider_account"),
+        "node" => i18n.t("pricing.label_node"),
         _ => dimension,
     }
 }
@@ -145,7 +146,8 @@ pub fn Pricing() -> Element {
                                     }
                                 }
                             }
-                            tbody { // 显示租户 ID：nil UUID 表示全局默认
+                            tbody { // 显示租户 ID：nil UUID 表示全局默认 // 显示租户 ID：nil UUID 表示全局默认
+
                                 if pricing_list().and_then(|r| r.ok()).is_some() {
                                     for p in paged_list.iter() {
                                         tr { key: "{p.id}",
@@ -159,7 +161,7 @@ pub fn Pricing() -> Element {
                                                     }
                                                     div { class: "pricing-provider-row",
                                                         span { class: "pricing-provider-badge {pricing_provider_class(&p.billing_dimension)}",
-                                                            "{pricing_provider_label(&p.billing_dimension)}"
+                                                            "{pricing_provider_label(&p.billing_dimension, &i18n)}"
                                                         }
                                                         span { class: "pricing-provider-code", "{p.billing_dimension}" }
                                                     }
@@ -493,8 +495,10 @@ fn CreatePricingModal(
                             class: "input-field",
                             value: "{provider}",
                             onchange: move |e| provider.set(e.value()),
-                            option { value: "provideraccount", "ProviderAccount" }
-                            option { value: "node", "Node" }
+                            option { value: "provideraccount",
+                                {i18n.t("pricing.label_provider_account")}
+                            }
+                            option { value: "node", {i18n.t("pricing.label_node")} }
                         }
                     }
                     div { class: "form-group",

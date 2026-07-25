@@ -137,6 +137,19 @@ pub fn Home() -> Element {
     let t_distribution_desc = i18n.t("home.features.distribution.desc");
     let t_custom_title = i18n.t("home.features.custom.title");
     let t_custom_desc = i18n.t("home.features.custom.desc");
+    let t_menu = i18n.t("home.menu");
+    let t_lang_switch = i18n.t("home.lang_switch_label");
+    let t_tip_title = i18n.t("home.tip.title");
+    let t_tip_subtitle_prefix = i18n.t("home.tip.subtitle_prefix");
+    let t_tip_subtitle_suffix = i18n.t("home.tip.subtitle_suffix");
+    let t_tip_wechat_qr_alt = i18n.t("home.tip.wechat_qr_alt");
+    let t_tip_wechat_label = i18n.t("home.tip.wechat_label");
+    let t_tip_alipay_qr_alt = i18n.t("home.tip.alipay_qr_alt");
+    let t_tip_alipay_label = i18n.t("home.tip.alipay_label");
+    let t_contributors_title = i18n.t("home.contributors.title");
+    let t_contributors_subtitle = i18n.t("home.contributors.subtitle");
+    let t_sponsors_title = i18n.t("home.sponsors.title");
+    let t_sponsors_subtitle = i18n.t("home.sponsors.subtitle");
     let t_req_bubble = i18n.t("req.bubble");
 
     rsx! {
@@ -230,7 +243,7 @@ pub fn Home() -> Element {
                     button {
                         class: "kc-home-mobile-menu-btn",
                         r#type: "button",
-                        title: if is_zh { "菜单" } else { "Menu" },
+                        title: "{t_menu}",
                         onclick: move |_| nav_menu_open.toggle(),
                         if nav_menu_open() {
                             svg {
@@ -411,13 +424,7 @@ pub fn Home() -> Element {
                                     save_lang_to_storage(&new_lang);
                                 }
                             },
-                            span { class: "kc-home-lang-toggle-text",
-                                if is_zh {
-                                    "EN"
-                                } else {
-                                    "中"
-                                }
-                            }
+                            span { class: "kc-home-lang-toggle-text", "{t_lang_switch}" }
                         }
 
                         // 登录/注册按钮 或 控制台按钮
@@ -684,51 +691,29 @@ pub fn Home() -> Element {
                 div { class: "container",
                     h2 { class: "kc-home-tip-title",
                         span { "☕ " }
-                        if is_zh {
-                            "赞赏支持"
-                        } else {
-                            "Support Us"
-                        }
+                        "{t_tip_title}"
                     }
                     p { class: "kc-home-tip-subtitle",
-                        if is_zh {
-                            "如果您喜欢 "
-                            {site_name}
-                            "，欢迎请我们喝杯咖啡 ☕"
-                        } else {
-                            "If you like "
-                            {site_name}
-                            ", feel free to buy us a coffee ☕"
-                        }
+                        "{t_tip_subtitle_prefix}"
+                        {site_name}
+                        "{t_tip_subtitle_suffix}"
                     }
                     div { class: "kc-home-tip-cards",
                         div { class: "kc-home-tip-card",
                             img {
                                 class: "kc-home-tip-qr",
                                 src: asset!("/assets/wechat_tip.jpg"),
-                                alt: if is_zh { "微信赞赏码" } else { "WeChat Tip QR" },
+                                alt: "{t_tip_wechat_qr_alt}",
                             }
-                            span { class: "kc-home-tip-label",
-                                if is_zh {
-                                    "微信赞赏"
-                                } else {
-                                    "WeChat Pay"
-                                }
-                            }
+                            span { class: "kc-home-tip-label", "{t_tip_wechat_label}" }
                         }
                         div { class: "kc-home-tip-card",
                             img {
                                 class: "kc-home-tip-qr",
                                 src: asset!("/assets/alipay_tip.png"),
-                                alt: if is_zh { "支付宝赞赏码" } else { "Alipay Tip QR" },
+                                alt: "{t_tip_alipay_qr_alt}",
                             }
-                            span { class: "kc-home-tip-label",
-                                if is_zh {
-                                    "支付宝赞赏"
-                                } else {
-                                    "Alipay"
-                                }
-                            }
+                            span { class: "kc-home-tip-label", "{t_tip_alipay_label}" }
                         }
                     }
                 }
@@ -744,19 +729,9 @@ pub fn Home() -> Element {
                     div { class: "container",
                         h2 { class: "kc-home-tip-title",
                             span { "👥 " }
-                            if is_zh {
-                                "社区贡献者"
-                            } else {
-                                "Community Contributors"
-                            }
+                            "{t_contributors_title}"
                         }
-                        p { class: "kc-home-tip-subtitle",
-                            if is_zh {
-                                "感谢所有为 KeyCompute 做出贡献的开发者 ❤️"
-                            } else {
-                                "Thanks to all contributors who make KeyCompute better ❤️"
-                            }
-                        }
+                        p { class: "kc-home-tip-subtitle", "{t_contributors_subtitle}" }
                         img {
                             src: "https://contrib.rocks/image?repo=keycompute/keycompute",
                             alt: "KeyCompute Contributors",
@@ -771,19 +746,9 @@ pub fn Home() -> Element {
                 div { class: "container",
                     h2 { class: "kc-home-tip-title",
                         span { "🌟 " }
-                        if is_zh {
-                            "社区赞助者"
-                        } else {
-                            "Community Sponsors"
-                        }
+                        "{t_sponsors_title}"
                     }
-                    p { class: "kc-home-tip-subtitle",
-                        if is_zh {
-                            "感谢以下赞助者对 KeyCompute 的大力支持 🙏"
-                        } else {
-                            "Special thanks to our sponsors for their generous support 🙏"
-                        }
-                    }
+                    p { class: "kc-home-tip-subtitle", "{t_sponsors_subtitle}" }
                     div { class: "kc-home-sponsors-grid",
                         for name in sponsors() {
                             div { class: "kc-home-sponsor-card", "{name}" }
