@@ -74,10 +74,12 @@ impl AuthExtractor {
             .ok_or_else(|| ApiError::Auth("Invalid Authorization format".to_string()))?;
 
         // 使用 AuthService 验证 Token（自动检测 JWT 或 API Key）
+        // 注意：通过 From 转换而非手动拼接前缀，避免与 KeyComputeError 的
+        // Display 前缀（"authentication failed: "）叠加产生重复文案
         let auth_context = auth_service
             .verify_token(token)
             .await
-            .map_err(|e| ApiError::Auth(format!("Authentication failed: {}", e)))?;
+            .map_err(ApiError::from)?;
 
         Ok(Self::from_auth_context(auth_context))
     }

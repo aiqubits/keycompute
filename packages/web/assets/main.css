@@ -3458,6 +3458,47 @@ select.form-input:focus {
   color: var(--color-primary, #2563eb);
 }
 
+/* 分销邀请链接复制区域（与 API Key 深色复制框风格对齐） */
+.distribution-invite-copy-section .kc-api-copy-block {
+  margin-top: 0;
+}
+
+.distribution-invite-copy-section .kc-api-example {
+  min-height: 44px;
+  padding: 16px 88px 16px 18px;
+  color: #f8fafc;
+  font-family: var(--font-mono, "SFMono-Regular", Consolas, monospace);
+  font-size: 13px;
+  line-height: 1.5;
+  background: linear-gradient(135deg, #111827, #020617);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.distribution-invite-copy-section .kc-api-example.copied {
+  border-color: rgba(16, 185, 129, 0.5);
+  box-shadow: inset 0 0 0 2px rgba(16, 185, 129, 0.42);
+}
+
+.distribution-invite-copy-section .kc-api-copy-button {
+  top: 12px;
+  right: 12px;
+}
+
+@media (max-width: 780px) {
+  .distribution-invite-copy-section .kc-api-example {
+    padding-right: 18px;
+  }
+
+  .distribution-invite-copy-section .kc-api-copy-button {
+    position: static;
+    justify-content: center;
+    width: calc(100% - 24px);
+    margin: 10px 12px;
+  }
+}
+
 .setting-input-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -6501,6 +6542,8 @@ select.form-input:focus {
 .node-token-copy-section .kc-api-example {
   min-height: 44px;
   padding: 16px 88px 16px 18px;
+  /* 背景是深色，浅色主题下不能继承深色的 --text-primary，需显式浅色文字 */
+  color: #f8fafc;
   font-family: var(--font-mono, "SFMono-Regular", Consolas, monospace);
   font-size: 13px;
   line-height: 1.5;

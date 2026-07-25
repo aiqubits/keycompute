@@ -333,6 +333,21 @@ impl BillingService {
             return;
         };
 
+        // 检查分销系统是否启用（开关关闭时彻底停止分销计算）
+        let distribution_enabled = keycompute_db::SystemSetting::get_bool(
+            pool.as_ref(),
+            keycompute_db::models::system_setting::setting_keys::DISTRIBUTION_ENABLED,
+            true,
+        )
+        .await;
+        if !distribution_enabled {
+            tracing::debug!(
+                request_id = %ctx.request_id,
+                "Distribution is disabled via system settings, skipping"
+            );
+            return;
+        }
+
         // 创建分销上下文
         let dist_ctx = DistributionContext::new(
             usage_log.id,
@@ -384,13 +399,38 @@ impl BillingService {
         };
 
         // 确定分成比例（优先使用规则表，否则使用配置默认值）
+        // 使用字符串桥接（string-bridge）转换 f64 -> Decimal，避免 from_f64_retain 引入
+        // 浮点噪声（如 0.03 -> 0.0299999…）以及潜在的 unwrap panic：f64::to_string() 输出
+        // 最短可往返表示（0.03 -> "0.03"），再解析为精确 Decimal，解析失败时回退到硬编码默认。
         let dist_config = keycompute_config::DistributionConfig::default();
-        let default_level1_ratio = Decimal::from_f64_retain(dist_config.level1_ratio()).unwrap();
-        let default_level2_ratio = Decimal::from_f64_retain(dist_config.level2_ratio()).unwrap();
+        let default_level1_ratio = dist_config
+            .level1_ratio()
+            .to_string()
+            .parse::<Decimal>()
+            .unwrap_or_else(|_| Decimal::new(3, 2)); // 0.03
+        let default_level2_ratio = dist_config
+            .level2_ratio()
+            .to_string()
+            .parse::<Decimal>()
+            .unwrap_or_else(|_| Decimal::new(2, 2)); // 0.02
 
+        // 按优先级匹配规则（rules 已按 priority DESC, created_at ASC 排序）：
+        // 1. 优先匹配特定受益人的规则（per-user override）
+        // 2. 否则使用最高优先级的全局规则（beneficiary_id == nil，对所有用户生效）
+        // 3. 都无匹配时使用配置默认值
+        //
+        // 优先级约定（Priority Convention）：
+        //   - 100: Admin 通过 API 配置的全局覆盖规则
+        //   -  10: 系统初始化的一级分销默认规则
+        //   -   5: 系统初始化的二级分销默认规则
+        //   -   0: 默认优先级（per-user 规则）
+        // Billing 匹配：L1 = 最高优先级全局规则（find），L2 = 最低优先级全局规则（rfind，排除 L1）
+        let nil_id = Uuid::nil();
+        let l1_global_rule = rules.iter().find(|r| r.beneficiary_id == nil_id);
         let level1_ratio = rules
             .iter()
             .find(|r| r.beneficiary_id == l1_id)
+            .or(l1_global_rule)
             .and_then(|r| bigdecimal_to_decimal(&r.commission_rate).ok())
             .unwrap_or(default_level1_ratio);
 
@@ -399,6 +439,16 @@ impl BillingService {
                 rules
                     .iter()
                     .find(|r| r.beneficiary_id == l2_id)
+                    .and_then(|r| bigdecimal_to_decimal(&r.commission_rate).ok())
+            })
+            .or_else(|| {
+                // L2 回退：使用优先级最低的全局规则，但排除 L1 已命中的规则（避免只有一条规则时两级佣金率相同）
+                // NOTE: 当 level2_beneficiary 为 None 时此闭包也会执行，但 calculate_shares 内部
+                // 以 level2_beneficiary.is_some() 为 guard，因此此处解析出的 ratio 会被安全忽略。
+                let l1_rule_id = l1_global_rule.map(|r| r.id);
+                rules
+                    .iter()
+                    .rfind(|r| r.beneficiary_id == nil_id && Some(r.id) != l1_rule_id)
                     .and_then(|r| bigdecimal_to_decimal(&r.commission_rate).ok())
             })
             .unwrap_or(default_level2_ratio);
@@ -813,5 +863,49 @@ mod tests {
 
         // 1000/1000*1 + 500/1000*2 = 1 + 1 = 2
         assert_eq!(log.user_amount, Decimal::from(2));
+    }
+
+    /// 验证 trigger_distribution 中默认分成比例的 string-bridge 转换：
+    /// f64 -> to_string() -> parse::<Decimal>() 必须得到精确的 0.03 / 0.02，
+    /// 不能出现 from_f64_retain 那样的浮点噪声（如 0.0299999…）。
+    #[test]
+    fn test_default_ratio_string_bridge_precision() {
+        let dist_config = keycompute_config::DistributionConfig::default();
+
+        let l1 = dist_config
+            .level1_ratio()
+            .to_string()
+            .parse::<Decimal>()
+            .unwrap_or_else(|_| Decimal::new(3, 2));
+        let l2 = dist_config
+            .level2_ratio()
+            .to_string()
+            .parse::<Decimal>()
+            .unwrap_or_else(|_| Decimal::new(2, 2));
+
+        // 精确等于 0.03 / 0.02（string-bridge 无浮点噪声）
+        assert_eq!(l1, Decimal::new(3, 2));
+        assert_eq!(l2, Decimal::new(2, 2));
+        // 序列化后不应出现拖尾噪声位
+        assert_eq!(l1.to_string(), "0.03");
+        assert_eq!(l2.to_string(), "0.02");
+    }
+
+    /// 覆盖自定义比例（含典型浮点截断场景 0.07）经 string-bridge 仍然精确。
+    #[test]
+    fn test_custom_ratio_string_bridge_precision() {
+        let dist_config = keycompute_config::DistributionConfig::with_ratios(0.07, 0.15);
+        let l1 = dist_config
+            .level1_ratio()
+            .to_string()
+            .parse::<Decimal>()
+            .unwrap_or_else(|_| Decimal::new(7, 2));
+        let l2 = dist_config
+            .level2_ratio()
+            .to_string()
+            .parse::<Decimal>()
+            .unwrap_or_else(|_| Decimal::new(15, 2));
+        assert_eq!(l1, Decimal::new(7, 2)); // 0.07
+        assert_eq!(l2, Decimal::new(15, 2)); // 0.15
     }
 }

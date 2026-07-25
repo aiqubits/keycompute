@@ -56,6 +56,7 @@ pub fn on_copy(
 ///     ui_store,
 /// ),
 /// ```
+#[allow(dead_code)]
 pub fn on_copy_toast(
     text: String,
     success_msg: &'static str,

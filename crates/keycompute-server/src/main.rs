@@ -434,7 +434,7 @@ async fn validate_distribution_public_base_url(
 async fn initialize_default_distribution_rules(
     pool: &impl ConnectionTrait,
     tenant_id: uuid::Uuid,
-    admin_user_id: uuid::Uuid,
+    _admin_user_id: uuid::Uuid,
 ) -> anyhow::Result<()> {
     use bigdecimal::BigDecimal;
     use std::str::FromStr;
@@ -465,10 +465,10 @@ async fn initialize_default_distribution_rules(
         "正在创建默认分销规则"
     );
 
-    // 创建一级分销规则
+    // 创建一级分销规则（全局规则，对所有用户生效）
     let level1_rule = CreateDistributionRuleRequest {
         tenant_id,
-        beneficiary_id: admin_user_id,
+        beneficiary_id: uuid::Uuid::nil(), // 全局规则，对所有用户生效
         name: "一级分销规则".to_string(),
         description: Some("默认一级分销规则，推荐人可获得指定比例的分销佣金".to_string()),
         commission_rate: level1_ratio,
@@ -482,10 +482,10 @@ async fn initialize_default_distribution_rules(
         Err(e) => warn!("一级分销规则创建失败: {}", e),
     }
 
-    // 创建二级分销规则
+    // 创建二级分销规则（全局规则，对所有用户生效）
     let level2_rule = CreateDistributionRuleRequest {
         tenant_id,
-        beneficiary_id: admin_user_id,
+        beneficiary_id: uuid::Uuid::nil(), // 全局规则，对所有用户生效
         name: "二级分销规则".to_string(),
         description: Some("默认二级分销规则，间接推荐人可获得指定比例的分销佣金".to_string()),
         commission_rate: level2_ratio,

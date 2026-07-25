@@ -217,12 +217,10 @@ impl UserService {
                     KeyComputeError::AuthError(format!("Tenant not found: {}", tenant_id))
                 })?;
 
-            // 检查租户状态
+            // 检查租户状态：具体状态值属于内部信息只进日志，不拼入错误消息
             if tenant.status != "active" {
-                return Err(KeyComputeError::AuthError(format!(
-                    "Tenant is not active: {}",
-                    tenant.status
-                )));
+                tracing::warn!(tenant_id = %tenant.id, status = %tenant.status, "Tenant is not active");
+                return Err(KeyComputeError::AuthError("Tenant is not active".into()));
             }
 
             tracing::info!(tenant_id = %tenant.id, name = %tenant.name, status = %tenant.status, "Tenant loaded");

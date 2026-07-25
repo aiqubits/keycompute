@@ -565,21 +565,26 @@ pub async fn create_distribution_rule(
         .as_deref()
         .ok_or_else(|| ApiError::Internal("Database not available".to_string()))?;
 
-    // 创建规则 - 使用当前用户作为受益人（简化处理）
-    let create_req = keycompute_db::CreateDistributionRuleRequest {
-        tenant_id: auth.tenant_id,
-        beneficiary_id: auth.user_id, // 使用当前用户作为受益人
-        name: req.name.clone(),
-        description: None,
-        commission_rate: string_to_bigdecimal(&req.commission_rate.to_string())?,
-        priority: Some(0),
-        effective_from: Some(chrono::Utc::now()),
-        effective_until: None,
-    };
-
-    let rule = keycompute_db::TenantDistributionRule::create(pool, &create_req)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to create rule: {}", e)))?;
+    // 全局规则使用 Uuid::nil() 表示对系统所有用户生效（租户级全局规则）
+    // 采用 upsert 语义：如已存在同租户的 priority=100 全局规则则更新（并重新激活），否则创建。
+    //
+    // 并发安全：upsert 在写库事务 + 租户级 advisory lock 内原子执行
+    //（见 TenantDistributionRule::upsert_global_override），消除并发请求下
+    // check-then-create/update 的 TOCTOU 重复创建问题，并在提交前校验
+    // priority=100 全局规则的唯一性；事务由 DbRouter 路由到写库，
+    // 不受读副本复制延迟影响。
+    let new_rate = string_to_bigdecimal(&req.commission_rate.to_string())?;
+    let rule = keycompute_db::TenantDistributionRule::upsert_global_override(
+        pool,
+        auth.tenant_id,
+        &req.name,
+        new_rate,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, tenant_id = %auth.tenant_id, "Failed to upsert distribution rule");
+        ApiError::Internal("Distribution rule operation failed".to_string())
+    })?;
 
     Ok(Json(DistributionRuleResponse {
         id: rule.id.to_string(),

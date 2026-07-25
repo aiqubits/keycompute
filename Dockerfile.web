@@ -34,9 +34,22 @@ RUN rustup target add wasm32-unknown-unknown
 # 项目 dioxus 版本为 0.7.9（见 Cargo.toml workspace.dependencies）
 RUN cargo install dioxus-cli@0.7.9 --locked
 
-# 预安装 wasm-bindgen-cli（版本必须与项目 wasm-bindgen 版本匹配）
+# 预安装 wasm-bindgen-cli（版本必须与项目 wasm-bindgen 版本严格一致）
 # 项目 wasm-bindgen 版本为 0.2.114（见 Cargo.lock）
+# NO_DOWNLOADS=1 模式下 dx 会对 `wasm-bindgen --version` 做精确版本匹配
 RUN cargo install wasm-bindgen-cli@0.2.114 --locked
+
+# 预安装 esbuild（dx web 构建需要；NO_DOWNLOADS=1 禁止 dx 自动下载，必须预置到 PATH）
+# 从 npm registry 下载，便于版本锁定与二进制命名
+ENV ESBUILD_VERSION=0.25.0
+RUN ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
+    curl -L --proto '=https' --tlsv1.2 -sSf \
+    "https://registry.npmjs.org/@esbuild/linux-${ARCH}/-/linux-${ARCH}-${ESBUILD_VERSION}.tgz" \
+    -o /tmp/esbuild.tgz && \
+    tar xzf /tmp/esbuild.tgz -C /tmp && \
+    mv /tmp/package/bin/esbuild /usr/local/bin/esbuild && \
+    chmod +x /usr/local/bin/esbuild && \
+    rm -rf /tmp/esbuild.tgz /tmp/package
 
 WORKDIR /app
 
@@ -55,10 +68,13 @@ RUN cargo fetch
 # 编译前端（生产模式，在工作区根目录执行）
 # dx build 产物输出到工作区根目录的 dist/ 下（即 /app/dist）
 # --platform web 显式指定平台，Docker/CI 无图形环境下避免平台推断错误
-# DX_SKIP_WASM_OPT=true 跳过 wasm-opt 下载（避免 GitHub 连接超时）
-# API_BASE_URL 为空字符串，使用相对路径，通过 Nginx 反向代理访问后端
-ENV DX_SKIP_WASM_OPT=true
-ENV API_BASE_URL=""
+# NO_DOWNLOADS=1 是 dioxus-cli 0.7.9 实际生效的开关（见 CliSettings::prefer_no_downloads）：
+# 强制 dx 使用 PATH 中的本地工具链（apt binaryen 的 wasm-opt + 上面预装的 wasm-bindgen-cli/esbuild），
+# 而不是构建时从 GitHub 下载（避免连接超时）。wasm-opt 优化不会被跳过。
+# 此前的 DX_SKIP_WASM_OPT 会被 dx 静默忽略，仍然触发网络下载。
+# API_BASE_URL 未设置时编译期缺省为空字符串（同源相对路径，经 Nginx 反代访问后端）；
+# 分域部署时可在此处注入绝对 URL（如 ENV API_BASE_URL=https://api.example.com）
+ENV NO_DOWNLOADS=1
 RUN dx build --release --package web --platform web
 
 # ─────────────────────────────────────────────────────────────────────────────

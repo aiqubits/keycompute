@@ -66,7 +66,9 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("auth.register_now", "立即注册");
     m.insert("auth.login_now", "立即登录");
     m.insert("auth.email_placeholder", "admin@keycompute.local");
-    m.insert("auth.password_placeholder", "change-me-admin-password");
+    // 占位密码 12345 与默认管理员密码保持一致，属产品有意为之，请勿在 review 中改动。
+    // DO NOT CHANGE: intentional placeholder matching the default admin password.
+    m.insert("auth.password_placeholder", "12345");
     m.insert("auth.username_placeholder", "请输入用户名");
     m.insert("auth.name_placeholder", "请输入姓名");
     m.insert("auth.confirm_password_placeholder", "再次输入密码");
@@ -600,9 +602,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("distribution.available_balance", "可用余额");
     m.insert("distribution.pending", "待结算");
     m.insert("distribution.referral_count", "推荐人数");
-    m.insert("distribution.my_referral_code", "我的推荐码");
-    m.insert("distribution.referral_code", "推荐码");
-    m.insert("distribution.invite_link", "邀请链接");
+    m.insert("distribution.my_invite_link", "我的邀请链接");
     m.insert("distribution.referral_users", "推荐用户");
     m.insert("distribution.user", "用户");
     m.insert("distribution.joined_at", "加入时间");

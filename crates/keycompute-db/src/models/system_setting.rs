@@ -65,8 +65,6 @@ pub mod setting_keys {
     pub const SITE_DESCRIPTION: &str = "site_description";
     pub const SITE_LOGO_URL: &str = "site_logo_url";
     pub const SITE_FAVICON_URL: &str = "site_favicon_url";
-    /// API 基础 URL（用于生成 API 用法示例）
-    pub const API_BASE_URL: &str = "api_base_url";
 
     // 注册设置
     pub const DEFAULT_USER_QUOTA: &str = "default_user_quota";
@@ -152,8 +150,6 @@ pub struct PublicSettings {
     pub site_description: Option<String>,
     pub site_logo_url: Option<String>,
     pub site_favicon_url: Option<String>,
-    /// API 基础 URL（用于生成 API 用法示例）
-    pub api_base_url: Option<String>,
     pub maintenance_mode: bool,
     pub maintenance_message: Option<String>,
     pub distribution_enabled: bool,
@@ -174,7 +170,6 @@ impl Default for PublicSettings {
             site_description: Some("AI token compute service platform".to_string()),
             site_logo_url: None,
             site_favicon_url: None,
-            api_base_url: None,
             maintenance_mode: false,
             maintenance_message: None,
             distribution_enabled: true,
@@ -432,7 +427,6 @@ impl SystemSetting {
             site_description: get_value(setting_keys::SITE_DESCRIPTION),
             site_logo_url: get_value(setting_keys::SITE_LOGO_URL),
             site_favicon_url: get_value(setting_keys::SITE_FAVICON_URL),
-            api_base_url: get_value(setting_keys::API_BASE_URL),
             maintenance_mode: get_bool_value(setting_keys::MAINTENANCE_MODE, false),
             maintenance_message: get_value(setting_keys::MAINTENANCE_MESSAGE),
             distribution_enabled: get_bool_value(setting_keys::DISTRIBUTION_ENABLED, true),

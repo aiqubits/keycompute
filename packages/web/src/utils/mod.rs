@@ -1,7 +1,7 @@
 pub mod copy;
 pub mod time;
 
-pub use copy::{on_copy, on_copy_toast};
+pub use copy::on_copy;
 
 /// 复制文本到剪贴板（WASM 环境）
 /// 返回 `true` 表示复制成功，`false` 表示不可用（非 HTTPS 上下文等）。

@@ -8,6 +8,7 @@ use crate::services::auth_service;
 use crate::services::requirement_service::{RequirementSubmission, submit_requirement};
 use crate::stores::auth_store::AuthStore;
 use crate::stores::public_settings_store::PublicSettingsStore;
+use crate::stores::referral_store::ReferralStore;
 use crate::stores::user_store::{UserInfo, UserStore};
 use ui::ThemeCtx;
 use ui::components::modal::Modal;
@@ -57,6 +58,21 @@ pub fn Home() -> Element {
     let mut show_login_modal = use_signal(|| false);
     let mut show_register_modal = use_signal(|| false);
     let mut show_requirement_modal = use_signal(|| false);
+
+    // 推荐码：从 ReferralStore 中读取（由 /auth/register?ref=xxx 重定向时设置）
+    let mut referral_store = use_context::<ReferralStore>();
+    let mut referral_code = use_signal(|| None::<String>);
+
+    // 如果有推荐码，自动打开注册弹窗。
+    // 注意：take_code() 会读取并清空 ReferralStore 内部 signal，因而本 effect 依赖该 signal
+    // 会被再次触发；但 take_code() 以 is_some() 为守卫，第二次返回 None 且不再写入，
+    // 故 effect 会自然收敛，不会形成无限循环。
+    use_effect(move || {
+        if let Some(code) = referral_store.take_code() {
+            referral_code.set(Some(code));
+            show_register_modal.set(true);
+        }
+    });
 
     // 移动端菜单折叠状态
     let mut nav_menu_open = use_signal(|| false);
@@ -785,6 +801,7 @@ pub fn Home() -> Element {
             // 注册弹窗
             RegisterModal {
                 open: show_register_modal,
+                referral_code,
                 onclose: move |_| show_register_modal.set(false),
                 on_switch_to_login: move |_| {
                     show_register_modal.set(false);
@@ -1021,6 +1038,7 @@ fn LoginModal(
 #[component]
 fn RegisterModal(
     open: ReadSignal<bool>,
+    referral_code: ReadSignal<Option<String>>,
     onclose: EventHandler<()>,
     on_switch_to_login: EventHandler<()>,
 ) -> Element {
@@ -1093,8 +1111,10 @@ fn RegisterModal(
             success_msg.set(None);
 
             let email_val = email();
+            let ref_code = referral_code();
             spawn(async move {
-                match auth_service::request_registration_code(&email_val, None).await {
+                match auth_service::request_registration_code(&email_val, ref_code.as_deref()).await
+                {
                     Ok(resp) => {
                         email.set(resp.email.clone());
                         code_requested.set(true);

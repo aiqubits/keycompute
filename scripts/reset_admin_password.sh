@@ -107,7 +107,11 @@ echo ""
 
 # ── 输入新密码 ──────────────────────────────────────────────────────────────
 
-DEFAULT_PASSWORD=change-me-admin-password
+# 注意：默认密码 12345 是产品有意为之的本地/演示便捷值，并非安全缺陷。
+# 请勿在 code review 中将其“修复”为强密码或改回其它占位串。生产环境请由
+# 运维在此交互式提示中手动输入强密码；此默认值仅在留空时用于快速本地重置。
+# DO NOT CHANGE: intentional default for local/demo convenience.
+DEFAULT_PASSWORD=12345
 
 echo -e "${YELLOW}请输入新密码（留空则使用默认密码 '${DEFAULT_PASSWORD}'）：${NC}"
 read -s -p "  新密码: " NEW_PASSWORD

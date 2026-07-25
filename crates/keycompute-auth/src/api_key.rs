@@ -138,9 +138,14 @@ impl ProduceAiKeyValidator {
             .await
             .map_err(|e| KeyComputeError::DatabaseError(format!("Failed to query user: {}", e)))?;
 
+        // 用户已被删除但 key 记录残留（孤儿 key），对外统一返回通用错误，避免泄露内部状态
         let Some(user) = user else {
-            tracing::warn!(user_id = %produce_ai_key.user_id, "User not found");
-            return Err(KeyComputeError::AuthError("User not found".into()));
+            tracing::warn!(
+                produce_ai_key_id = %produce_ai_key.id,
+                user_id = %produce_ai_key.user_id,
+                "User not found for produce AI key (orphaned key)"
+            );
+            return Err(KeyComputeError::AuthError("Invalid API key".into()));
         };
 
         // 验证用户租户 ID 与 Produce AI Key 租户 ID 一致
@@ -151,7 +156,7 @@ impl ProduceAiKeyValidator {
                 produce_ai_key_tenant_id = %produce_ai_key.tenant_id,
                 "User tenant does not match Produce AI key tenant"
             );
-            return Err(KeyComputeError::AuthError("User tenant mismatch".into()));
+            return Err(KeyComputeError::AuthError("Invalid API key".into()));
         }
 
         // 查询租户信息并验证状态
@@ -163,21 +168,18 @@ impl ProduceAiKeyValidator {
             })?;
 
         let Some(tenant) = tenant else {
-            tracing::warn!(tenant_id = %user.tenant_id, "Tenant not found");
-            return Err(KeyComputeError::AuthError("Tenant not found".into()));
+            tracing::warn!(tenant_id = %user.tenant_id, "Tenant not found for produce AI key");
+            return Err(KeyComputeError::AuthError("Invalid API key".into()));
         };
 
-        // 检查租户状态
+        // 检查租户状态：具体状态值属于内部信息只进日志，不对外暴露
         if !tenant.is_active() {
             tracing::warn!(
                 tenant_id = %tenant.id,
                 status = %tenant.status,
                 "Tenant is not active"
             );
-            return Err(KeyComputeError::AuthError(format!(
-                "Tenant is not active: {}",
-                tenant.status
-            )));
+            return Err(KeyComputeError::AuthError("Tenant is not active".into()));
         }
 
         // 更新最后使用时间

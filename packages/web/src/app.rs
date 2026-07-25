@@ -6,6 +6,7 @@ use crate::services::{api_client::get_client, settings_service, user_service};
 use crate::stores::{
     auth_store::AuthStore,
     public_settings_store::{PublicSettingsState, PublicSettingsStore},
+    referral_store::ReferralStore,
     ui_store::{ToastMsg, UiStore},
     user_store::{UserInfo, UserStore},
 };
@@ -50,6 +51,10 @@ pub fn App() -> Element {
     let _ui_store = use_context_provider(|| UiStore::new(toast_signal));
     let _lang = use_context_provider(|| lang_signal);
     let _theme = use_context_provider(|| ThemeCtx(theme_signal));
+
+    // 推荐码存储：分销链接 /auth/register?ref=xxx 中的推荐码在重定向到首页时通过此 store 传递
+    let referral_code_signal = use_signal(|| None::<String>);
+    let _referral_store = use_context_provider(|| ReferralStore::new(referral_code_signal));
 
     // 应用启动时同步主题到 HTML data-theme 属性
     use_effect(move || {

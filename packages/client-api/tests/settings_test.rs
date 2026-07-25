@@ -171,7 +171,6 @@ async fn test_get_public_settings_success() {
             "site_description": null,
             "site_logo_url": null,
             "site_favicon_url": null,
-            "api_base_url": null,
             "maintenance_mode": false,
             "maintenance_message": null,
             "alipay_enabled": false,

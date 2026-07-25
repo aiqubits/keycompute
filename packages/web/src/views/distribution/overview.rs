@@ -10,8 +10,9 @@ use crate::services::{
 use crate::stores::{
     auth_store::AuthStore, public_settings_store::PublicSettingsStore, ui_store::UiStore,
 };
-use crate::utils::on_copy_toast;
+use crate::utils::on_copy;
 use crate::utils::time::format_time;
+use ui::icons::IconCopy;
 
 fn is_distribution_disabled_error<T>(result: &Option<Result<T, ClientError>>) -> bool {
     matches!(
@@ -107,18 +108,16 @@ fn DistributionOverviewContent() -> Element {
         Some(Ok(ref e)) => e.referral_count.to_string(),
         _ => "—".to_string(),
     };
-    let code_text = match referral_code() {
-        Some(Ok(ref r)) => r.referral_code.clone(),
+    let invite_link = match referral_code() {
+        Some(Ok(ref r)) => r.referral_link.clone(),
         Some(Err(ref e)) => user_error_message(e),
         None => i18n.t("table.loading").to_string(),
     };
-    let invite_link = match referral_code() {
-        Some(Ok(ref r)) => r.referral_link.clone(),
-        _ => String::new(),
-    };
+    let link_ready = matches!(referral_code(), Some(Ok(_)));
     let invite_link_text = invite_link.clone();
-    let copy_text = i18n.t("common.copy");
-    let copied_text = i18n.t("common.copied");
+    let copied = use_signal(|| false);
+    let copied_label = i18n.t("common.copied");
+    let copy_label = i18n.t("common.copy");
     let copy_manual_hint = i18n.t("common.copy_manual_hint");
     let distribution_disabled = is_distribution_disabled_error(&earnings())
         || is_distribution_disabled_error(&referral_code())
@@ -170,33 +169,36 @@ fn DistributionOverviewContent() -> Element {
                     }
                 }
 
-                // 推荐码
+                // 我的邀请链接
                 div { class: "card",
                     div { class: "card-header",
-                        h3 { class: "card-title", {i18n.t("distribution.my_referral_code")} }
+                        h3 { class: "card-title", {i18n.t("distribution.my_invite_link")} }
                     }
                     div { class: "card-body",
-                        div { class: "info-grid",
-                            div { class: "info-item",
-                                span { class: "info-label", {i18n.t("distribution.referral_code")} }
-                                span { class: "info-value",
-                                    code { "{code_text}" }
-                                }
-                            }
-                            if !invite_link.is_empty() {
-                                div { class: "info-item",
-                                    span { class: "info-label", {i18n.t("distribution.invite_link")} }
-                                    span { class: "info-value",
-                                        button {
-                                            class: "distribution-copy-value",
-                                            r#type: "button",
-                                            title: "{copy_text}",
-                                            onclick: on_copy_toast(invite_link_text.clone(), copied_text, copy_manual_hint, ui_store),
-                                            "{invite_link_text}"
+                        // 链接就绪时才渲染复制块，避免加载中/错误文案以邀请链接样式展示误导用户
+                        if link_ready {
+                            div { class: "distribution-invite-copy-section",
+                                div { class: "kc-api-copy-block",
+                                    pre {
+                                        class: if copied() { "kc-api-example copied" } else { "kc-api-example" },
+                                        title: if copied() { copied_label } else { copy_label },
+                                        "{invite_link_text}"
+                                    }
+                                    button {
+                                        class: "kc-api-copy-button",
+                                        r#type: "button",
+                                        onclick: on_copy(invite_link_text.clone(), copy_manual_hint.to_string(), ui_store, copied),
+                                        IconCopy { size: 15 }
+                                        if copied() {
+                                            {copied_label}
+                                        } else {
+                                            {copy_label}
                                         }
                                     }
                                 }
                             }
+                        } else {
+                            p { class: "empty-text", "{invite_link_text}" }
                         }
                     }
                 }

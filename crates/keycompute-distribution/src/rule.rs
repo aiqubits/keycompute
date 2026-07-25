@@ -72,13 +72,11 @@ impl RuleEngine {
 
     /// 从配置创建规则引擎
     pub fn from_config(config: &keycompute_config::DistributionConfig) -> Self {
-        // 使用整数运算避免浮点数转换和 unwrap，确保精确性
-        // 3% = 3/100 -> 数值 3，精度 2
-        // 2% = 2/100 -> 数值 2，精度 2
+        // 使用 round() 避免浮点数截断误差（例如 0.07*100=6.9999... 截断为 6）
         let level1_ratio =
-            Decimal::from_i128_with_scale((config.level1_ratio() * 100.0) as i128, 2);
+            Decimal::from_i128_with_scale((config.level1_ratio() * 100.0).round() as i128, 2);
         let level2_ratio =
-            Decimal::from_i128_with_scale((config.level2_ratio() * 100.0) as i128, 2);
+            Decimal::from_i128_with_scale((config.level2_ratio() * 100.0).round() as i128, 2);
         Self {
             default_level1_ratio: level1_ratio,
             default_level2_ratio: level2_ratio,
@@ -299,5 +297,62 @@ mod tests {
         let rule = rule.unwrap();
         assert_eq!(rule.tenant_id, tenant_id);
         assert_eq!(rule.share_ratio, ratio);
+    }
+
+    /// 验证 from_config 中的 round() 修复：浮点数截断误差不会导致精度损失
+    /// 例如 0.07 * 100.0 = 6.9999... 应该被 round() 到 7，而不是截断为 6
+    #[test]
+    fn test_from_config_rounding_precision() {
+        use keycompute_config::DistributionConfig;
+
+        // 测试 0.07 (7%) —— 典型的浮点截断误差场景
+        let config = DistributionConfig::with_ratios(0.07, 0.03);
+        let engine = RuleEngine::from_config(&config);
+        let (l1, l2) = engine.default_ratios();
+        assert_eq!(l1, Decimal::from_i128_with_scale(7, 2)); // 0.07
+        assert_eq!(l2, Decimal::from_i128_with_scale(3, 2)); // 0.03
+
+        // 测试 0.15 (15%) / 0.08 (8%)
+        let config = DistributionConfig::with_ratios(0.15, 0.08);
+        let engine = RuleEngine::from_config(&config);
+        let (l1, l2) = engine.default_ratios();
+        assert_eq!(l1, Decimal::from_i128_with_scale(15, 2)); // 0.15
+        assert_eq!(l2, Decimal::from_i128_with_scale(8, 2)); // 0.08
+
+        // 测试边界值 0.01 (1%) / 0.99 (99%)
+        let config = DistributionConfig::with_ratios(0.01, 0.99);
+        let engine = RuleEngine::from_config(&config);
+        let (l1, l2) = engine.default_ratios();
+        assert_eq!(l1, Decimal::from_i128_with_scale(1, 2)); // 0.01
+        assert_eq!(l2, Decimal::from_i128_with_scale(99, 2)); // 0.99
+
+        // 测试 0.0 (0%) 和 0.10 (10%) —— 0.10*100=10.0 无截断问题
+        let config = DistributionConfig::with_ratios(0.0, 0.10);
+        let engine = RuleEngine::from_config(&config);
+        let (l1, l2) = engine.default_ratios();
+        assert_eq!(l1, Decimal::from_i128_with_scale(0, 2)); // 0.00
+        assert_eq!(l2, Decimal::from_i128_with_scale(10, 2)); // 0.10
+    }
+
+    /// 记录 from_config 的精度限制：比例以整百分位（scale=2）存储，
+    /// 亚百分位（如 0.5%）会被 round() 舍入到最近的整百分位。
+    /// 若未来需支持亚百分位比例，需提高 scale 并同步更新本测试。
+    #[test]
+    fn test_from_config_sub_percent_rounds_to_whole_percent() {
+        use keycompute_config::DistributionConfig;
+
+        // 0.005 (0.5%)：0.5 四舍五入（round half away from zero）到 1 → 0.01
+        let config = DistributionConfig::with_ratios(0.005, 0.004);
+        let engine = RuleEngine::from_config(&config);
+        let (l1, l2) = engine.default_ratios();
+        assert_eq!(l1, Decimal::from_i128_with_scale(1, 2)); // 0.005 → 0.01
+        assert_eq!(l2, Decimal::from_i128_with_scale(0, 2)); // 0.004 → 0.00
+
+        // 0.001 (0.1%)：低于半百分位，舍入为 0 —— 分销比例实质失效
+        let config = DistributionConfig::with_ratios(0.001, 0.024);
+        let engine = RuleEngine::from_config(&config);
+        let (l1, l2) = engine.default_ratios();
+        assert_eq!(l1, Decimal::from_i128_with_scale(0, 2)); // 0.001 → 0.00
+        assert_eq!(l2, Decimal::from_i128_with_scale(2, 2)); // 0.024 → 0.02
     }
 }

@@ -93,6 +93,32 @@ CREATE INDEX IF NOT EXISTS idx_produce_ai_keys_tenant ON produce_ai_keys(tenant_
 CREATE INDEX IF NOT EXISTS idx_produce_ai_keys_user ON produce_ai_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_produce_ai_keys_hash ON produce_ai_keys(produce_ai_key_hash);
 CREATE INDEX IF NOT EXISTS idx_produce_ai_keys_revoked ON produce_ai_keys(revoked) WHERE revoked = FALSE;
+
+-- 补充外键级联删除：用户/租户删除时同步删除其 produce_ai_keys，
+-- 防止孤儿 key 残留导致认证时命中 hash 但查不到用户
+-- 首次添加约束前先清理存量孤儿数据，避免 ALTER TABLE 因存量脏数据失败
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_produce_ai_keys_user'
+    ) THEN
+        DELETE FROM produce_ai_keys k
+        WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = k.user_id);
+        ALTER TABLE produce_ai_keys
+        ADD CONSTRAINT fk_produce_ai_keys_user
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_produce_ai_keys_tenant'
+    ) THEN
+        DELETE FROM produce_ai_keys k
+        WHERE NOT EXISTS (SELECT 1 FROM tenants t WHERE t.id = k.tenant_id);
+        ALTER TABLE produce_ai_keys
+        ADD CONSTRAINT fk_produce_ai_keys_tenant
+        FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE;
+    END IF;
+END $$;
 -- accounts: 上游 Provider 账号池
 CREATE TABLE IF NOT EXISTS accounts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
