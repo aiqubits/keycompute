@@ -35,7 +35,8 @@ impl AlipaySigner {
 
     /// 对字符串进行签名
     pub fn sign(&self, content: &str) -> Result<String, SignError> {
-        let signing_key = SigningKey::<Sha256>::new_unprefixed(self.private_key.clone());
+        // Alipay RSA2 is standard RSASSA-PKCS1-v1_5 with a SHA-256 DigestInfo prefix.
+        let signing_key = SigningKey::<Sha256>::new(self.private_key.clone());
         let signature = signing_key.sign(content.as_bytes());
 
         // 转换为Base64
@@ -73,7 +74,7 @@ impl AlipayVerifier {
         let signature =
             Signature::try_from(sig_bytes.as_slice()).map_err(|_| SignError::InvalidSignature)?;
 
-        let verifying_key = VerifyingKey::<Sha256>::new_unprefixed(self.public_key.clone());
+        let verifying_key = VerifyingKey::<Sha256>::new(self.public_key.clone());
         match verifying_key.verify(content.as_bytes(), &signature) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
@@ -152,8 +153,12 @@ pub fn verify_params(
 
 #[cfg(test)]
 mod tests {
-    // 注意：实际测试需要真实的 RSA 密钥对
-    // 这里只测试基本的结构
+    use super::*;
+    use rsa::{
+        RsaPrivateKey,
+        pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
+        rand_core::OsRng,
+    };
 
     #[test]
     fn test_sign_params_ordering() {
@@ -173,5 +178,27 @@ mod tests {
             .join("&");
 
         assert_eq!(content, "a=1&b=2&c=3");
+    }
+
+    #[test]
+    fn rsa2_signatures_interoperate_with_standard_sha256withrsa() {
+        let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let public_key = private_key.to_public_key();
+        let signer =
+            AlipaySigner::from_pem(private_key.to_pkcs8_pem(LineEnding::LF).unwrap().as_str())
+                .unwrap();
+        let verifier =
+            AlipayVerifier::from_pem(&public_key.to_public_key_pem(LineEnding::LF).unwrap())
+                .unwrap();
+        let content = "app_id=2026000000000000&method=alipay.trade.query";
+
+        let signature = signer.sign(content).unwrap();
+        assert!(verifier.verify(content, &signature).unwrap());
+
+        let signature_bytes = STANDARD.decode(signature).unwrap();
+        let signature = Signature::try_from(signature_bytes.as_slice()).unwrap();
+        VerifyingKey::<Sha256>::new(public_key)
+            .verify(content.as_bytes(), &signature)
+            .expect("Alipay RSA2 signature must be standard SHA256withRSA");
     }
 }

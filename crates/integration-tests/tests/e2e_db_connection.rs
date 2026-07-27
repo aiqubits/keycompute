@@ -1,4 +1,4 @@
-//! 数据库连接与迁移测试
+//! 数据库连接测试
 
 use integration_tests::common::VerificationChain;
 use integration_tests::db::create_test_pool;
@@ -96,5 +96,36 @@ mod tests {
 
         chain.print_report();
         assert!(chain.all_passed());
+    }
+
+    /// 哨兵列校验：完整 schema 上应通过，缺列（模拟存量旧库）应拒绝启动
+    #[tokio::test]
+    async fn test_schema_sentinel_verification() {
+        let pool = create_test_pool().await;
+
+        // 当前测试库已应用完整 schema，哨兵校验必须通过
+        keycompute_db::verify_schema_sentinels(&pool)
+            .await
+            .expect("sentinel verification must pass on an up-to-date schema");
+
+        // 模拟旧库缺列：验证一个不存在的列必须失败并指名缺失项
+        let error = keycompute_db::verify_required_columns(
+            &pool,
+            &[
+                ("payment_orders", "payment_scene"),
+                ("payment_orders", "column_only_in_future_schema"),
+            ],
+        )
+        .await
+        .expect_err("a missing sentinel column must fail verification");
+        let message = error.to_string();
+        assert!(
+            message.contains("payment_orders.column_only_in_future_schema"),
+            "error should name the missing column, got: {message}"
+        );
+        assert!(
+            !message.contains("payment_orders.payment_scene,"),
+            "columns that exist must not be reported as missing, got: {message}"
+        );
     }
 }

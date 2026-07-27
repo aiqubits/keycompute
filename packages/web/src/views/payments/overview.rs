@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant, Pagination, Table, TableHead};
+use ui::{Badge, BadgeVariant, Table, TableHead};
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::router::Route;
@@ -7,22 +7,25 @@ use crate::services::{api_client::with_auto_refresh, billing_service, payment_se
 use crate::stores::auth_store::AuthStore;
 use crate::utils::time::format_time;
 
-const PAGE_SIZE: usize = 20;
-
 /// 支付与账单页面 - /payments
 ///
-/// 包含：账户余额、充値记录、账单统计、账单明细
+/// 包含：账户余额、充值记录和账单统计
 #[component]
 pub fn PaymentsOverview() -> Element {
     let i18n = use_i18n();
     let auth_store = use_context::<AuthStore>();
 
     let nav = use_navigator();
-    let mut page = use_signal(|| 1u32);
-
     let balance = use_resource(move || async move {
         with_auto_refresh(auth_store, |token| async move {
             payment_service::get_balance(&token).await
+        })
+        .await
+    });
+
+    let payment_methods = use_resource(move || async move {
+        with_auto_refresh(auth_store, |token| async move {
+            payment_service::get_methods(&token).await
         })
         .await
     });
@@ -42,14 +45,6 @@ pub fn PaymentsOverview() -> Element {
         .await
     });
 
-    // 用量明细（真实数据，来自 usage_logs 表）
-    let usage_records = use_resource(move || async move {
-        with_auto_refresh(auth_store, |token| async move {
-            billing_service::list(&token).await
-        })
-        .await
-    });
-
     rsx! {
         div {
             class: "page-container",
@@ -57,10 +52,12 @@ pub fn PaymentsOverview() -> Element {
                 class: "page-header",
                 h1 { class: "page-title", {i18n.t("payments.title")} }
                 p { class: "page-subtitle", {i18n.t("payments.subtitle")} }
-                button {
-                    class: "btn btn-primary",
-                    onclick: move |_| { nav.push(Route::Recharge {}); },
-                    {i18n.t("payments.recharge_now")}
+                if matches!(payment_methods(), Some(Ok(ref methods)) if !methods.methods.is_empty()) {
+                    button {
+                        class: "btn btn-primary",
+                        onclick: move |_| { nav.push(Route::Recharge {}); },
+                        {i18n.t("payments.recharge_now")}
+                    }
                 }
             }
 
@@ -136,7 +133,7 @@ pub fn PaymentsOverview() -> Element {
                         } else {
                             rsx! {
                                 Table {
-                                    col_count: 4,
+                                    col_count: 5,
                                     thead {
                                         tr {
                                             TableHead { {i18n.t("payments.order_no")} }
@@ -167,72 +164,6 @@ pub fn PaymentsOverview() -> Element {
                             }
                         }
                     }
-                }
-            }
-
-            // ─── 用量明细 ───
-            div { class: "section",
-                h2 { class: "section-title", {i18n.t("payments.usage_details")} }
-                match usage_records() {
-                    None => rsx! { p { class: "loading-text", {i18n.t("table.loading")} } },
-                    Some(Err(e)) => rsx! { p { class: "error-text", "{i18n.t(\"common.load_failed\")}：{e}" } },
-                    Some(Ok(recs)) if recs.is_empty() => rsx! {
-                        p { class: "empty-text", {i18n.t("payments.no_usage_records")} }
-                    },
-                    Some(Ok(recs)) => rsx! {
-                        div { class: "table-container",
-                            table { class: "data-table",
-                                thead {
-                                    tr {
-                                        th { {i18n.t("common.time")} }
-                                        th { {i18n.t("usage.model")} }
-                                        th { {i18n.t("payments.input_tokens")} }
-                                        th { {i18n.t("payments.output_tokens")} }
-                                        th { {i18n.t("payments.total_tokens")} }
-                                        th { {i18n.t("common.cost")} }
-                                        th { {i18n.t("table.status")} }
-                                    }
-                                }
-                                tbody {
-                                    {
-                                        let start = (page() as usize - 1) * PAGE_SIZE;
-                                        rsx! {
-                                            for r in recs.iter().skip(start).take(PAGE_SIZE) {
-                                                tr {
-                                                    td { { format_time(&r.created_at) } }
-                                                    td { "{r.model}" }
-                                                    td { "{r.prompt_tokens}" }
-                                                    td { "{r.completion_tokens}" }
-                                                    td { "{r.total_tokens}" }
-                                                    td { "¥{crate::utils::format_money(r.cost)}" }
-                                                    td {
-                                                        span {
-                                                            class: if r.status == "success" { "badge badge-success" } else { "badge badge-warning" },
-                                                            "{r.status}"
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        {
-                            let total = recs.len();
-                            let total_pages = total.div_ceil(PAGE_SIZE).max(1) as u32;
-                            rsx! {
-                                div { class: "pagination",
-                                    span { class: "pagination-info", "{i18n.t(\"common.total_items\")} {total} {i18n.t(\"pricing.items_suffix\")}" }
-                                    Pagination {
-                                        current: page(),
-                                        total_pages,
-                                        on_page_change: move |p| page.set(p),
-                                    }
-                                }
-                            }
-                        }
-                    },
                 }
             }
         }

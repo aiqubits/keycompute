@@ -1,3 +1,6 @@
+-- KeyCompute 新库完整结构。
+-- 仅用于空数据库初始化，不包含旧版本升级、数据回填或兼容迁移逻辑。
+
 -- tenants: 租户/组织表
 CREATE TABLE IF NOT EXISTS tenants (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -23,13 +26,11 @@ CREATE TABLE IF NOT EXISTS users (
     name VARCHAR(255),
     role VARCHAR(50) NOT NULL DEFAULT 'user'
         CONSTRAINT chk_users_role_allowed CHECK (role IN ('system', 'admin', 'user')),
+    -- 安全事件或权限变化时递增，使此前签发的 JWT 立即失效
+    token_version INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- token_version: 用于使已签发的 JWT 失效。
--- 密码重置或登出等安全事件时递增，使旧 token（携带旧 token_version）在服务端校验时被拒绝。
-ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
@@ -76,8 +77,9 @@ EXECUTE FUNCTION prevent_system_user_delete();
 -- produce_ai_keys: Produce AI Key 表（用户访问系统的 API Key）
 CREATE TABLE IF NOT EXISTS produce_ai_keys (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id UUID NOT NULL,
-    user_id UUID NOT NULL,
+    -- 删除用户或租户时同步删除密钥，避免认证命中孤儿记录
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
     produce_ai_key_hash VARCHAR(255) NOT NULL UNIQUE,
     produce_ai_key_preview VARCHAR(20) NOT NULL,
@@ -93,32 +95,6 @@ CREATE INDEX IF NOT EXISTS idx_produce_ai_keys_tenant ON produce_ai_keys(tenant_
 CREATE INDEX IF NOT EXISTS idx_produce_ai_keys_user ON produce_ai_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_produce_ai_keys_hash ON produce_ai_keys(produce_ai_key_hash);
 CREATE INDEX IF NOT EXISTS idx_produce_ai_keys_revoked ON produce_ai_keys(revoked) WHERE revoked = FALSE;
-
--- 补充外键级联删除：用户/租户删除时同步删除其 produce_ai_keys，
--- 防止孤儿 key 残留导致认证时命中 hash 但查不到用户
--- 首次添加约束前先清理存量孤儿数据，避免 ALTER TABLE 因存量脏数据失败
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'fk_produce_ai_keys_user'
-    ) THEN
-        DELETE FROM produce_ai_keys k
-        WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = k.user_id);
-        ALTER TABLE produce_ai_keys
-        ADD CONSTRAINT fk_produce_ai_keys_user
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'fk_produce_ai_keys_tenant'
-    ) THEN
-        DELETE FROM produce_ai_keys k
-        WHERE NOT EXISTS (SELECT 1 FROM tenants t WHERE t.id = k.tenant_id);
-        ALTER TABLE produce_ai_keys
-        ADD CONSTRAINT fk_produce_ai_keys_tenant
-        FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE;
-    END IF;
-END $$;
 -- accounts: 上游 Provider 账号池
 CREATE TABLE IF NOT EXISTS accounts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -202,15 +178,22 @@ CREATE TABLE IF NOT EXISTS distribution_records (
     beneficiary_id UUID NOT NULL,
     share_amount DECIMAL(20, 10) NOT NULL,
     share_ratio DECIMAL(5, 4) NOT NULL,
+    -- 分销层级；参与唯一约束以提供写入幂等性
+    level VARCHAR(20) NOT NULL DEFAULT 'level1',
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
     settled_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uk_distribution_records_unique
+        UNIQUE (usage_log_id, beneficiary_id, level)
 );
 
 CREATE INDEX IF NOT EXISTS idx_distribution_records_tenant_id ON distribution_records(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_distribution_records_usage_log_id ON distribution_records(usage_log_id);
 CREATE INDEX IF NOT EXISTS idx_distribution_records_beneficiary_id ON distribution_records(beneficiary_id);
 CREATE INDEX IF NOT EXISTS idx_distribution_records_status ON distribution_records(status);
+CREATE INDEX IF NOT EXISTS idx_distribution_records_level ON distribution_records(level);
+COMMENT ON CONSTRAINT uk_distribution_records_unique ON distribution_records IS
+'幂等性保护：防止同一 usage_log 对同一受益人的重复分销记录';
 -- tenant_distribution_rules: 租户分销规则
 CREATE TABLE IF NOT EXISTS tenant_distribution_rules (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -334,55 +317,6 @@ CREATE INDEX IF NOT EXISTS idx_user_referrals_user ON user_referrals(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_referrals_level1 ON user_referrals(level1_referrer_id);
 CREATE INDEX IF NOT EXISTS idx_user_referrals_level2 ON user_referrals(level2_referrer_id);
 CREATE INDEX IF NOT EXISTS idx_user_referrals_status ON user_referrals(status);
--- 为 distribution_records 添加 level 字段
--- 用于明确标识分销层级（level1 或 level2）
-
-ALTER TABLE distribution_records
-ADD COLUMN IF NOT EXISTS level VARCHAR(20) NOT NULL DEFAULT 'level1';
-
--- 创建索引以支持按层级查询
-CREATE INDEX IF NOT EXISTS idx_distribution_records_level ON distribution_records(level);
-
--- 更新已有数据（根据 share_ratio 推断层级）
--- share_ratio > 2% 的为 level1，否则为 level2
-UPDATE distribution_records
-SET level = CASE
-    WHEN share_ratio > 0.02 THEN 'level1'
-    ELSE 'level2'
-END
-WHERE level = 'level1';
-
--- 清理可能的重复数据（保留最新的一条）
--- 使用 DELETE 配合子查询删除重复记录
-DELETE FROM distribution_records
-WHERE id IN (
-    SELECT id FROM (
-        SELECT id,
-               ROW_NUMBER() OVER (
-                   PARTITION BY usage_log_id, beneficiary_id, level
-                   ORDER BY created_at DESC, id DESC
-               ) as rn
-        FROM distribution_records
-    ) t
-    WHERE rn > 1
-);
-
--- 添加唯一约束防止重复分销记录
--- 同一 usage_log 的同一受益人在同一层级只能有一条记录
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'uk_distribution_records_unique'
-    ) THEN
-        ALTER TABLE distribution_records
-        ADD CONSTRAINT uk_distribution_records_unique
-        UNIQUE (usage_log_id, beneficiary_id, level);
-    END IF;
-END $$;
-
--- 添加注释说明幂等性保护
-COMMENT ON CONSTRAINT uk_distribution_records_unique ON distribution_records IS 
-'幂等性保护：防止同一 usage_log 对同一受益人的重复分销记录';
 -- 支付订单表
 -- 用于存储用户充值订单记录
 
@@ -392,18 +326,22 @@ CREATE TABLE IF NOT EXISTS payment_orders (
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     -- 用户ID
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    -- 支付宝订单号（外部订单号）
+    -- 商户订单号（外部订单号）
     out_trade_no VARCHAR(64) NOT NULL UNIQUE,
-    -- 支付宝交易号（支付宝返回）
+    -- 通用渠道交易号展示字段
     trade_no VARCHAR(64),
+    -- 支付渠道交易号
+    provider_trade_no VARCHAR(64),
     -- 订单金额（单位：元）
     amount DECIMAL(12, 2) NOT NULL,
     -- 币种（默认CNY）
     currency VARCHAR(8) NOT NULL DEFAULT 'CNY',
     -- 订单状态: pending/paid/failed/closed
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    -- 支付方式: alipay
+    -- 支付方式: alipay/wechatpay
     payment_method VARCHAR(20) NOT NULL DEFAULT 'alipay',
+    -- 支付场景: page/wap/qr/native
+    payment_scene VARCHAR(20) NOT NULL DEFAULT 'page',
     -- 商品标题
     subject VARCHAR(256) NOT NULL,
     -- 商品描述
@@ -418,6 +356,14 @@ CREATE TABLE IF NOT EXISTS payment_orders (
     pay_url TEXT,
     -- 回调通知原始数据
     notify_data JSONB,
+    -- 支付渠道返回的非敏感展示数据
+    provider_payload JSONB,
+    -- 最近一次渠道错误码
+    last_error_code VARCHAR(64),
+    -- 最近一次渠道错误信息
+    last_error_message TEXT,
+    -- 最近一次主动同步时间
+    last_synced_at TIMESTAMPTZ,
     -- 备注信息
     remarks TEXT,
     -- 创建时间
@@ -433,6 +379,9 @@ CREATE INDEX IF NOT EXISTS idx_payment_orders_out_trade_no ON payment_orders(out
 CREATE INDEX IF NOT EXISTS idx_payment_orders_trade_no ON payment_orders(trade_no);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_status ON payment_orders(status);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_created_at ON payment_orders(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_payment_orders_provider_trade_no
+    ON payment_orders(payment_method, provider_trade_no)
+    WHERE provider_trade_no IS NOT NULL;
 
 -- 添加注释
 COMMENT ON TABLE payment_orders IS '支付订单表';
@@ -440,11 +389,13 @@ COMMENT ON COLUMN payment_orders.id IS '订单ID';
 COMMENT ON COLUMN payment_orders.tenant_id IS '租户ID';
 COMMENT ON COLUMN payment_orders.user_id IS '用户ID';
 COMMENT ON COLUMN payment_orders.out_trade_no IS '商户订单号（外部订单号）';
-COMMENT ON COLUMN payment_orders.trade_no IS '支付宝交易号';
+COMMENT ON COLUMN payment_orders.trade_no IS '通用渠道交易号展示字段';
+COMMENT ON COLUMN payment_orders.provider_trade_no IS '支付渠道交易号';
 COMMENT ON COLUMN payment_orders.amount IS '订单金额（单位：元）';
 COMMENT ON COLUMN payment_orders.currency IS '币种';
 COMMENT ON COLUMN payment_orders.status IS '订单状态: pending/paid/failed/closed';
 COMMENT ON COLUMN payment_orders.payment_method IS '支付方式';
+COMMENT ON COLUMN payment_orders.payment_scene IS '支付场景: page/wap/qr/native';
 COMMENT ON COLUMN payment_orders.subject IS '商品标题';
 COMMENT ON COLUMN payment_orders.body IS '商品描述';
 COMMENT ON COLUMN payment_orders.paid_at IS '支付时间';
@@ -452,7 +403,65 @@ COMMENT ON COLUMN payment_orders.closed_at IS '关闭时间';
 COMMENT ON COLUMN payment_orders.expired_at IS '过期时间';
 COMMENT ON COLUMN payment_orders.pay_url IS '支付URL';
 COMMENT ON COLUMN payment_orders.notify_data IS '回调通知原始数据';
+COMMENT ON COLUMN payment_orders.provider_payload IS '支付渠道返回的非敏感展示数据';
+COMMENT ON COLUMN payment_orders.last_error_code IS '最近一次渠道错误码';
+COMMENT ON COLUMN payment_orders.last_error_message IS '最近一次渠道错误信息';
+COMMENT ON COLUMN payment_orders.last_synced_at IS '最近一次主动同步时间';
 COMMENT ON COLUMN payment_orders.remarks IS '备注信息';
+
+-- 支付通知去重与处理状态
+CREATE TABLE IF NOT EXISTS payment_notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    payment_method VARCHAR(20) NOT NULL,
+    provider_event_id VARCHAR(128) NOT NULL,
+    order_id UUID REFERENCES payment_orders(id) ON DELETE SET NULL,
+    out_trade_no VARCHAR(64) NOT NULL,
+    processing_status VARCHAR(24) NOT NULL DEFAULT 'received',
+    payload_digest VARCHAR(64) NOT NULL,
+    failure_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at TIMESTAMPTZ,
+    UNIQUE(payment_method, provider_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_notifications_order
+    ON payment_notifications(order_id);
+CREATE INDEX IF NOT EXISTS idx_payment_notifications_status
+    ON payment_notifications(processing_status, created_at DESC);
+
+-- 支付回调安全拒绝事件
+CREATE TABLE IF NOT EXISTS payment_security_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    payment_method VARCHAR(20) NOT NULL,
+    event_type VARCHAR(40) NOT NULL,
+    request_id VARCHAR(128),
+    source_ip VARCHAR(64),
+    payload_digest VARCHAR(64) NOT NULL,
+    detail TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_security_events_created
+    ON payment_security_events(created_at DESC);
+
+-- 支付渠道配置验证与集群运行状态
+CREATE TABLE IF NOT EXISTS payment_provider_states (
+    payment_method VARCHAR(20) PRIMARY KEY,
+    config_version BIGINT NOT NULL DEFAULT 1,
+    config_fingerprint VARCHAR(64),
+    verified_config_fingerprint VARCHAR(64),
+    verified_at TIMESTAMPTZ,
+    circuit_state VARCHAR(20) NOT NULL DEFAULT 'available',
+    last_error_code VARCHAR(64),
+    last_error_message TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_payment_provider_states_circuit
+        CHECK (circuit_state IN ('available', 'degraded', 'unavailable'))
+);
+
+INSERT INTO payment_provider_states(payment_method)
+VALUES ('alipay'), ('wechatpay')
+ON CONFLICT (payment_method) DO NOTHING;
 
 -- 用户余额表
 CREATE TABLE IF NOT EXISTS user_balances (
@@ -520,6 +529,10 @@ CREATE INDEX IF NOT EXISTS idx_balance_transactions_order_id ON balance_transact
 CREATE INDEX IF NOT EXISTS idx_balance_transactions_usage_log_id ON balance_transactions(usage_log_id);
 CREATE INDEX IF NOT EXISTS idx_balance_transactions_type ON balance_transactions(transaction_type);
 CREATE INDEX IF NOT EXISTS idx_balance_transactions_created_at ON balance_transactions(created_at);
+-- 同一支付订单只能产生一笔充值流水
+CREATE UNIQUE INDEX IF NOT EXISTS uk_balance_transactions_recharge_order
+    ON balance_transactions(order_id)
+    WHERE transaction_type = 'recharge' AND order_id IS NOT NULL;
 
 -- 添加注释
 COMMENT ON TABLE balance_transactions IS '余额变动记录表';
@@ -799,7 +812,9 @@ COMMENT ON COLUMN user_node_gateway_tokens.updated_at IS '最后更新时间';
 CREATE TABLE IF NOT EXISTS node_tips (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     -- 关联的计费记录
-    usage_log_id UUID NOT NULL REFERENCES usage_logs(id) ON DELETE CASCADE,
+    usage_log_id UUID NOT NULL
+        CONSTRAINT uk_node_tips_usage_log_id UNIQUE
+        REFERENCES usage_logs(id) ON DELETE CASCADE,
     -- 提供服务的节点 ID
     node_id UUID NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     -- 节点所有者（同时也是 tips 受益人）
@@ -824,16 +839,6 @@ CREATE INDEX IF NOT EXISTS idx_node_tips_owner_user_id ON node_tips(owner_user_i
 -- usage_log_id 上有 UNIQUE 约束，已自动创建唯一索引，无需额外 B-tree 索引
 -- 按用户查询历史记录的复合索引（覆盖 list_by_user 的 ORDER BY created_at DESC）
 CREATE INDEX IF NOT EXISTS idx_node_tips_owner_created ON node_tips(owner_user_id, created_at DESC);
--- 幂等性保护：同一 usage_log 只允许一条 tips 记录
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'uk_node_tips_usage_log_id'
-    ) THEN
-        ALTER TABLE node_tips ADD CONSTRAINT uk_node_tips_usage_log_id UNIQUE (usage_log_id);
-    END IF;
-END $$;
-
 COMMENT ON TABLE node_tips IS '节点租赁小费表';
 COMMENT ON COLUMN node_tips.usage_log_id IS '关联的计费记录 ID';
 COMMENT ON COLUMN node_tips.node_id IS '提供服务的节点 ID';
@@ -901,5 +906,3 @@ COMMENT ON COLUMN node_tip_withdrawals.encrypted_alipay_account IS '加密的支
 COMMENT ON COLUMN node_tip_withdrawals.encrypted_real_name IS '加密的真实姓名（仅 alipay 方式，AES-256-GCM 加密，格式：base64(nonce || ciphertext)）';
 COMMENT ON COLUMN node_tip_withdrawals.status IS '状态：pending / approved / completed / rejected';
 COMMENT ON COLUMN node_tip_withdrawals.admin_remark IS '管理员备注（审批/操作备注，非审计日志，生产环境建议独立审计表）';
-
-

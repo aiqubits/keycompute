@@ -49,7 +49,8 @@ pub use node_tip_withdrawal::{
 };
 pub use password_reset::{CreatePasswordResetRequest, PasswordReset};
 pub use payment_order::{
-    CreatePaymentOrderRequest, PaymentMethod, PaymentOrder, PaymentOrderStats, PaymentOrderStatus,
+    CreatePaymentOrderRequest, CreditPaidOrderError, PaymentMethod, PaymentOrder,
+    PaymentOrderStats, PaymentOrderStatus,
 };
 pub use pending_registration::{PendingRegistration, UpsertPendingRegistrationRequest};
 pub use pricing_model::{CreatePricingRequest, PricingModel, UpdatePricingRequest};

@@ -35,18 +35,18 @@ pub fn PaymentOrders() -> Element {
     // 普通用户订单
     let my_orders = use_resource(move || async move {
         if is_admin {
-            return Ok(vec![]);
+            return Ok(client_api::api::payment::PaymentOrderPage::default());
         }
         let status = status_filter();
-        let params = if status == "all" {
-            None
-        } else {
-            // 修复：必须把 status 设入查询参数
-            Some(client_api::api::payment::PaymentQueryParams::new().with_status(status.clone()))
-        };
+        let mut params = client_api::api::payment::PaymentQueryParams::new()
+            .with_page(page())
+            .with_page_size(PAGE_SIZE as u32);
+        if status != "all" {
+            params = params.with_status(status.clone());
+        }
         with_auto_refresh(auth_store, |token| {
             let value = params.clone();
-            async move { payment_service::list_orders(value, &token).await }
+            async move { payment_service::list_orders_page(Some(value), &token).await }
         })
         .await
     });
@@ -54,31 +54,46 @@ pub fn PaymentOrders() -> Element {
     // Admin 订单
     let admin_orders = use_resource(move || async move {
         if !is_admin {
-            return Ok(vec![]);
+            return Ok(client_api::api::admin::PaymentOrderPage::default());
         }
         let status = status_filter();
-        let params = if status != "all" {
-            Some(AdminPaymentQueryParams::new().with_status(status.clone()))
-        } else {
-            None
-        };
+        let mut params = AdminPaymentQueryParams::new()
+            .with_page(page())
+            .with_page_size(PAGE_SIZE as u32);
+        if status != "all" {
+            params = params.with_status(status.clone());
+        }
         with_auto_refresh(auth_store, |token| {
             let value = params.clone();
             async move {
                 let client = get_client();
                 AdminApi::new(&client)
-                    .list_all_payment_orders(value.as_ref(), &token)
+                    .list_payment_orders_page(Some(&value), &token)
                     .await
             }
         })
         .await
     });
 
+    let mut provider_statuses = use_resource(move || async move {
+        if !is_admin {
+            return Ok(vec![]);
+        }
+        with_auto_refresh(auth_store, |token| async move {
+            let client = get_client();
+            AdminApi::new(&client).get_payment_providers(&token).await
+        })
+        .await
+    });
+    let mut verifying_provider = use_signal(|| None::<String>);
+    let mut provider_action_error = use_signal(|| None::<String>);
+
     let filter_labels = [
         ("all", i18n.t("payment_orders.filter_all")),
         ("pending", i18n.t("payment_orders.filter_pending")),
         ("paid", i18n.t("payment_orders.filter_paid")),
         ("failed", i18n.t("payment_orders.filter_failed")),
+        ("closed", i18n.t("payment_orders.filter_closed")),
     ];
 
     rsx! {
@@ -89,6 +104,93 @@ pub fn PaymentOrders() -> Element {
                     {i18n.t("payment_orders.subtitle_admin")}
                 } else {
                     {i18n.t("payment_orders.subtitle_user")}
+                }
+            }
+        }
+
+        if is_admin {
+            if let Some(error) = provider_action_error() {
+                div { class: "alert alert-error", "{error}" }
+            }
+            div { class: "payment-provider-grid",
+                match provider_statuses() {
+                    None => rsx! { div { class: "loading-state", {i18n.t("table.loading")} } },
+                    Some(Err(error)) => rsx! {
+                        div { class: "alert alert-error", "{i18n.t(\"common.load_failed\")}：{error}" }
+                    },
+                    Some(Ok(providers)) => rsx! {
+                        for provider in providers {
+                            div { class: "payment-provider-card",
+                                div { class: "payment-provider-head",
+                                    div {
+                                        h3 { class: "payment-provider-name",
+                                            if provider.code == "alipay" {
+                                                {i18n.t("recharge.alipay")}
+                                            } else if provider.code == "wechatpay" {
+                                                {i18n.t("recharge.wechat_pay")}
+                                            } else {
+                                                "{provider.display_name}"
+                                            }
+                                        }
+                                        p { class: "payment-provider-scenes", {provider.scenes.join(" · ")} }
+                                    }
+                                    Badge { variant: status_to_variant(&provider.status), "{provider.status}" }
+                                }
+                                div { class: "payment-provider-meta",
+                                    span { "{i18n.t(\"payment_orders.provider_switch\")}: "
+                                        strong { if provider.enabled { {i18n.t("common.enabled")} } else { {i18n.t("common.disabled")} } }
+                                    }
+                                    span { "{i18n.t(\"payment_orders.provider_config\")}: "
+                                        strong { if provider.configured { {i18n.t("common.configured")} } else { {i18n.t("common.not_configured")} } }
+                                    }
+                                }
+                                if let Some(message) = provider.message {
+                                    p { class: "payment-provider-message", "{message}" }
+                                }
+                                if provider.configured && !provider.available {
+                                    {
+                                        let method = provider.code.clone();
+                                        let is_verifying = verifying_provider().as_deref() == Some(method.as_str());
+                                        rsx! {
+                                            button {
+                                                class: "btn btn-primary btn-sm payment-provider-action",
+                                                r#type: "button",
+                                                disabled: verifying_provider().is_some(),
+                                                onclick: move |_| {
+                                                    let method = method.clone();
+                                                    verifying_provider.set(Some(method.clone()));
+                                                    provider_action_error.set(None);
+                                                    spawn(async move {
+                                                        let result = with_auto_refresh(auth_store, |token| {
+                                                            let method = method.clone();
+                                                            async move {
+                                                                let client = get_client();
+                                                                AdminApi::new(&client)
+                                                                    .verify_payment_provider(&method, &token)
+                                                                    .await
+                                                            }
+                                                        })
+                                                        .await;
+                                                        if let Err(error) = result {
+                                                            provider_action_error.set(Some(error.to_string()));
+                                                        } else {
+                                                            provider_statuses.restart();
+                                                        }
+                                                        verifying_provider.set(None);
+                                                    });
+                                                },
+                                                if is_verifying {
+                                                    {i18n.t("payment_orders.verifying_provider")}
+                                                } else {
+                                                    {i18n.t("payment_orders.verify_provider")}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -121,24 +223,24 @@ pub fn PaymentOrders() -> Element {
                     let (is_empty, empty_text) = match admin_orders() {
                         None => (true, i18n.t("table.loading")),
                         Some(Err(_)) => (true, i18n.t("common.load_failed")),
-                        Some(Ok(ref l)) if l.is_empty() => (true, i18n.t("payment_orders.empty")),
+                        Some(Ok(ref result)) if result.orders.is_empty() => (true, i18n.t("payment_orders.empty")),
                         _ => (false, ""),
                     };
-                    let admin_start = (page() as usize - 1) * PAGE_SIZE;
                     rsx! {
-                        Table { empty: is_empty, empty_text: empty_text.to_string(), col_count: 5,
+                        Table { empty: is_empty, empty_text: empty_text.to_string(), col_count: 6,
                             thead {
                                 tr {
                                     TableHead { {i18n.t("payments.order_no")} }
                                     TableHead { {i18n.t("payment_orders.col_user")} }
+                                    TableHead { {i18n.t("recharge.payment_method")} }
                                     TableHead { {i18n.t("common.amount")} }
                                     TableHead { {i18n.t("table.status")} }
                                     TableHead { {i18n.t("table.created_at")} }
                                 }
                             }
                             tbody {
-                                if let Some(Ok(ref list)) = admin_orders() {
-                                    for o in list.iter().skip(admin_start).take(PAGE_SIZE) {
+                                if let Some(Ok(ref result)) = admin_orders() {
+                                    for o in &result.orders {
                                         tr {
                                             td {
                                                 code { "{o.out_trade_no}" }
@@ -156,6 +258,7 @@ pub fn PaymentOrders() -> Element {
                                                     }
                                                 }
                                             }
+                                            td { "{o.payment_method}" }
                                             td { "¥{o.amount}" }
                                             td {
                                                 Badge { variant: status_to_variant(&o.status), "{o.status}" }
@@ -173,10 +276,9 @@ pub fn PaymentOrders() -> Element {
                     let (is_empty, empty_text) = match my_orders() {
                         None => (true, i18n.t("table.loading")),
                         Some(Err(_)) => (true, i18n.t("common.load_failed")),
-                        Some(Ok(ref l)) if l.is_empty() => (true, i18n.t("payment_orders.empty")),
+                        Some(Ok(ref result)) if result.orders.is_empty() => (true, i18n.t("payment_orders.empty")),
                         _ => (false, ""),
                     };
-                    let my_start = (page() as usize - 1) * PAGE_SIZE;
                     rsx! {
                         Table { empty: is_empty, empty_text: empty_text.to_string(), col_count: 5,
                             thead {
@@ -189,8 +291,8 @@ pub fn PaymentOrders() -> Element {
                                 }
                             }
                             tbody {
-                                if let Some(Ok(ref list)) = my_orders() {
-                                    for o in list.iter().skip(my_start).take(PAGE_SIZE) {
+                                if let Some(Ok(ref result)) = my_orders() {
+                                    for o in &result.orders {
                                         tr {
                                             td {
                                                 code { "{o.out_trade_no}" }
@@ -213,11 +315,18 @@ pub fn PaymentOrders() -> Element {
 
         {
             let total = if is_admin {
-                admin_orders().and_then(|r| r.ok()).map(|l| l.len()).unwrap_or(0)
+                admin_orders().and_then(|r| r.ok()).map(|result| result.total as usize).unwrap_or(0)
             } else {
-                my_orders().and_then(|r| r.ok()).map(|l| l.len()).unwrap_or(0)
+                my_orders().and_then(|r| r.ok()).map(|result| result.total as usize).unwrap_or(0)
             };
-            let total_pages = total.div_ceil(PAGE_SIZE).max(1) as u32;
+            let total_pages = if is_admin {
+                admin_orders()
+                    .and_then(|result| result.ok())
+                    .map(|result| result.total_pages.max(1))
+                    .unwrap_or(1)
+            } else {
+                total.div_ceil(PAGE_SIZE).max(1) as u32
+            };
             rsx! {
                 div { class: "pagination",
                     span { class: "pagination-info",

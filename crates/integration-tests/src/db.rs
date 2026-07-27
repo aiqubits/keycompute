@@ -4,7 +4,7 @@
 
 use keycompute_db::{
     CreateTenantRequest, CreateUserRequest, PendingRegistration, Tenant,
-    UpsertPendingRegistrationRequest, User, run_migrations,
+    UpsertPendingRegistrationRequest, User, initialize_schema,
 };
 use keycompute_types::UserRole;
 use sea_orm::{
@@ -12,6 +12,51 @@ use sea_orm::{
 };
 use std::time::Duration;
 use uuid::Uuid;
+
+// 一个集成测试可并行运行多个 case，但它们共享同一个测试数据库。
+// schema 只需在进程内初始化一次，避免多个 case 同时执行 DDL。
+// 历史 system 用户的清理也在这里一次性完成：所有 case 都会等待
+// 初始化结束后才开始访问数据库，不会观察到清理过程的中间状态。
+static SCHEMA_INITIALIZED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+pub async fn initialize_test_schema(db: &DatabaseConnection) -> Result<(), keycompute_db::DbError> {
+    SCHEMA_INITIALIZED
+        .get_or_try_init(|| async {
+            initialize_schema(db).await?;
+            // 清理已存在的 system 用户（`uq_users_single_system_role` 全局唯一索引要求）。
+            // main.rs 的 initialize_default_admin 或历史测试可能遗留了 system 用户，
+            // 导致后续测试无法创建自己的 system 用户。清理失败不致命：
+            // 仅依赖 system 用户唯一性的测试会受影响。
+            if let Err(error) = remove_leftover_system_users(db).await {
+                eprintln!("warning: failed to clean leftover system users: {error}");
+            }
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+}
+
+/// 在单个事务内临时禁用保护触发器并删除遗留的 system 用户。
+///
+/// 必须在同一事务内完成禁用-删除-启用：PostgreSQL 的 DDL 是事务性的，
+/// `ALTER TABLE` 持有的 ACCESS EXCLUSIVE 锁会阻塞其他会话直到提交，
+/// 因此并发测试永远不会观察到“触发器被禁用”的窗口。若改用逐条
+/// 自动提交的语句，其他并行用例（如角色提升/降级拒绝测试）会在
+/// 禁用窗口内穿透保护导致 flaky 失败。
+async fn remove_leftover_system_users(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+    let tx = db.begin().await?;
+    tx.execute_unprepared("ALTER TABLE users DISABLE TRIGGER trg_prevent_system_user_delete")
+        .await?;
+    tx.execute_unprepared("ALTER TABLE users DISABLE TRIGGER trg_prevent_system_role_change")
+        .await?;
+    tx.execute_unprepared("DELETE FROM users WHERE role = 'system'")
+        .await?;
+    tx.execute_unprepared("ALTER TABLE users ENABLE TRIGGER trg_prevent_system_role_change")
+        .await?;
+    tx.execute_unprepared("ALTER TABLE users ENABLE TRIGGER trg_prevent_system_user_delete")
+        .await?;
+    tx.commit().await
+}
 
 pub async fn create_test_pool() -> DatabaseConnection {
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -30,31 +75,10 @@ pub async fn create_test_pool() -> DatabaseConnection {
         .await
         .expect("Failed to connect to database. Set DATABASE_URL environment variable.");
 
-    // 运行迁移
-    run_migrations(&db)
+    // 测试环境可能复用数据库；schema 本身保持可重复初始化，业务数据由各测试清理。
+    initialize_test_schema(&db)
         .await
-        .expect("Failed to run database migrations");
-
-    // 清理已存在的 system 用户（`uq_users_single_system_role` 全局唯一索引要求）
-    // main.rs 的 initialize_default_admin 或历史测试可能遗留了 system 用户，
-    // 导致后续测试无法创建自己的 system 用户
-    // 因 `trg_prevent_system_user_delete` + `trg_prevent_system_role_change`
-    // 两个触发器保护了 system 用户不可删除/不可改角色，需临时禁用后清理
-    db.execute_unprepared("ALTER TABLE users DISABLE TRIGGER trg_prevent_system_user_delete")
-        .await
-        .ok();
-    db.execute_unprepared("ALTER TABLE users DISABLE TRIGGER trg_prevent_system_role_change")
-        .await
-        .ok();
-    db.execute_unprepared("DELETE FROM users WHERE role = 'system'")
-        .await
-        .ok();
-    db.execute_unprepared("ALTER TABLE users ENABLE TRIGGER trg_prevent_system_user_delete")
-        .await
-        .ok();
-    db.execute_unprepared("ALTER TABLE users ENABLE TRIGGER trg_prevent_system_role_change")
-        .await
-        .ok();
+        .expect("Failed to initialize database schema");
 
     db
 }

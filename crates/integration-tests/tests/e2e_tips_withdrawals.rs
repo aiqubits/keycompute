@@ -67,17 +67,10 @@ impl TipWithdrawalTestEnv {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
 
-        // 运行数据库迁移（忽略 "already exists" 错误）
-        match keycompute_db::run_migrations(&pool).await {
-            Ok(_) => {}
-            Err(e) => {
-                let err_str = e.to_string();
-                if !err_str.contains("already exists") {
-                    return Err(anyhow::anyhow!("Failed to run migrations: {}", e));
-                }
-                tracing::warn!("Some tables already exist, skipping: {}", err_str);
-            }
-        }
+        // 初始化测试库结构；失败时直接终止，避免在不完整 schema 上运行测试。
+        integration_tests::db::initialize_test_schema(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize database schema: {}", e))?;
 
         // 清理历史测试数据
         Self::cleanup_test_data(&pool).await?;

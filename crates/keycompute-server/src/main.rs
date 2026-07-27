@@ -3,7 +3,7 @@
 //! 这是整个 KeyCompute 系统的可执行入口，负责：
 //! 1. 加载配置（环境变量 + 配置文件）
 //! 2. 初始化可观测性（日志、指标、追踪）
-//! 3. 建立数据库连接并运行迁移
+//! 3. 建立数据库连接并初始化新库结构
 //! 4. 初始化所有业务模块（Auth、RateLimit、Pricing、Routing、Gateway、Billing 等）
 //! 5. 初始化默认系统管理员（如果配置）
 //! 6. 启动 HTTP 服务器
@@ -98,13 +98,13 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    // 运行数据库迁移
-    info!("正在运行数据库迁移...");
-    if let Err(e) = db_manager.migrate().await {
-        error!("数据库迁移失败: {}", e);
+    // 系统只支持空库部署：结构变化时应重建数据库，不执行增量升级或数据迁移。
+    info!("正在初始化数据库结构...");
+    if let Err(e) = db_manager.initialize_schema().await {
+        error!("数据库结构初始化失败: {}", e);
         std::process::exit(1);
     }
-    info!("数据库迁移完成");
+    info!("数据库结构初始化完成");
 
     let pool = db_manager.into_router();
 
@@ -168,6 +168,18 @@ async fn main() -> anyhow::Result<()> {
 
     info!("应用状态初始化完成");
 
+    if app_state.payment.is_some() {
+        // 支付回调限流依赖可信代理覆盖的 X-Real-IP，未经代理直连时回调会被
+        // fail-closed 拒绝，启动时提前提醒部署前置条件。
+        info!(
+            "支付回调已启用：/api/v1/payments/notify/* 必须经过会覆盖 X-Real-IP 的可信反向代理，否则回调将被拒绝（503）"
+        );
+    }
+    // 不绑定支付是否启用：即使后续禁用支付，历史安全事件也应按期清理。
+    if let Some(pool) = app_state.pool.clone() {
+        spawn_payment_security_event_retention(pool);
+    }
+
     // ==================== 阶段 7: 启动服务器 ====================
     info!("准备启动服务器...");
 
@@ -196,6 +208,35 @@ async fn main() -> anyhow::Result<()> {
 
     info!("KeyCompute 服务器已停止");
     Ok(())
+}
+
+/// 启动支付安全事件的后台保留清理任务
+///
+/// 回调端点暴露于公网，payment_security_events 按拒绝事件持续追加；
+/// 每 24 小时清理一次 90 天前的事件，避免表无界增长。
+fn spawn_payment_security_event_retention(pool: std::sync::Arc<keycompute_db::DbRouter>) {
+    const RETENTION_DAYS: i64 = 90;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match keycompute_db::purge_expired_payment_security_events(
+                pool.write_conn(),
+                RETENTION_DAYS,
+            )
+            .await
+            {
+                Ok(removed) if removed > 0 => {
+                    info!(removed, "已清理过期的支付安全事件");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(%error, "支付安全事件保留清理失败，将在下个周期重试");
+                }
+            }
+        }
+    });
 }
 
 /// 设置优雅关闭信号处理器

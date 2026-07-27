@@ -522,8 +522,6 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("payments.no_recharge_records", "暂无充值记录");
     m.insert("payments.order_no", "订单号");
     m.insert("payments.subject", "主题");
-    m.insert("payments.usage_details", "用量明细");
-    m.insert("payments.no_usage_records", "暂无用量记录");
 
     // ── Payment Orders ──────────────────────────
     m.insert(
@@ -533,11 +531,18 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("payment_orders.subtitle_user", "查看您的充值和支付记录");
     m.insert("payment_orders.empty", "暂无订单记录");
     m.insert("payment_orders.col_user", "用户");
+    m.insert("payment_orders.provider_switch", "运营开关");
+    m.insert("payment_orders.provider_config", "配置状态");
+    m.insert("payment_orders.verify_provider", "验证渠道配置");
+    m.insert("payment_orders.verifying_provider", "验证中...");
+    m.insert("common.configured", "已配置");
+    m.insert("common.not_configured", "未配置");
     m.insert("payment_orders.pagination", "共 {total} 条");
     m.insert("payment_orders.filter_all", "全部");
     m.insert("payment_orders.filter_pending", "待支付");
     m.insert("payment_orders.filter_paid", "已支付");
     m.insert("payment_orders.filter_failed", "已失败");
+    m.insert("payment_orders.filter_closed", "已关闭");
 
     // ── Recharge ──────────────────────────────
     m.insert("recharge.title", "账户充值");
@@ -545,6 +550,10 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("recharge.payment_method", "支付方式");
     m.insert("recharge.alipay", "支付宝");
     m.insert("recharge.wechat_pay", "微信支付");
+    m.insert(
+        "recharge.no_payment_methods",
+        "当前暂无可用支付方式，请稍后再试或联系管理员",
+    );
     m.insert("recharge.amount_label", "充值金额（元）");
     m.insert("recharge.custom_amount", "或输入自定义金额");
     m.insert("recharge.creating_order", "订单创建中…");
@@ -568,10 +577,12 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("recharge.pay_wap", "📱 请在手机端打开支付链接完成付款");
     m.insert("recharge.pay_other", "请点击下方按钮完成支付");
     m.insert("recharge.scan_pay", "请使用支付宝或其他扫码工具完成支付");
+    m.insert("recharge.scan_wechat", "请使用微信扫描二维码完成支付");
+    m.insert("recharge.scan_alipay", "请使用支付宝扫描二维码完成支付");
     m.insert("recharge.qr_code_alt", "支付二维码");
     m.insert("recharge.qr_code_content", "二维码内容：");
     m.insert("recharge.confirm_paid", "已完成支付，点此确认");
-    m.insert("recharge.cancel_order", "取消订单");
+    m.insert("recharge.pay_later", "稍后支付");
     m.insert("recharge.success_title", "充值成功！");
     m.insert("recharge.success_desc", "余额已入账，可立即使用 API");
     m.insert("recharge.view_balance", "查看余额");
@@ -647,6 +658,21 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
         "影响后台金额展示、订单默认币种和部分前端文案。",
     );
     m.insert("settings.min_recharge_label", "最低充值金额");
+    m.insert("settings.max_recharge_label", "最高充值金额");
+    m.insert("settings.max_recharge_desc", "限制单笔充值金额上限。");
+    m.insert("settings.payment_title", "支付渠道");
+    m.insert(
+        "settings.payment_desc",
+        "运营开关只控制新订单；配置不完整的渠道不会向用户展示。",
+    );
+    m.insert(
+        "settings.alipay_enabled_desc",
+        "允许支付宝创建新的充值订单。",
+    );
+    m.insert(
+        "settings.wechatpay_enabled_desc",
+        "允许微信 Native 支付创建新的充值订单。",
+    );
     m.insert(
         "settings.min_recharge_desc",
         "限制单次充值的最低金额，避免异常小额订单进入支付链路。",

@@ -9,6 +9,7 @@ mod common;
 use common::{create_test_client, fixtures};
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn test_create_payment_order_success() {
     let (client, mock_server) = create_test_client().await;
     let payment_api = PaymentApi::new(&client);
@@ -47,6 +48,96 @@ async fn test_create_payment_order_success() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
+async fn test_create_payment_order_does_not_round_subcent_amount() {
+    let (client, mock_server) = create_test_client().await;
+    let payment_api = PaymentApi::new(&client);
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/payments/orders"))
+        .and(body_json(serde_json::json!({
+            "amount": "1.005",
+            "subject": "账户充值",
+            "body": null,
+            "payment_type": "page"
+        })))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "Invalid amount"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let request = CreatePaymentOrderRequest::new(1.005, "账户充值", "page");
+    let result = payment_api
+        .create_payment_order(&request, fixtures::TEST_ACCESS_TOKEN)
+        .await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_create_payment_order_accepts_dual_scene_compatibility_fields() {
+    let (client, mock_server) = create_test_client().await;
+    let payment_api = PaymentApi::new(&client);
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/payments/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "order_id": "order_dual_fields",
+            "out_trade_no": "PAY_DUAL_FIELDS",
+            "payment_method": "wechatpay",
+            "payment_scene": "native",
+            "payment_type": "native",
+            "pay_url": null,
+            "qr_code": "weixin://wxpay/example",
+            "qr_code_image_url": null,
+            "expired_at": "2026-07-26T11:00:00Z"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let req = CreatePaymentOrderRequest::new_for_method("10", "wechatpay", "native");
+    let order = payment_api
+        .create_payment_order(&req, fixtures::TEST_ACCESS_TOKEN)
+        .await
+        .unwrap();
+
+    assert_eq!(order.payment_method, "wechatpay");
+    assert_eq!(order.payment_type, "native");
+}
+
+#[tokio::test]
+async fn test_create_payment_order_rejects_conflicting_scene_compatibility_fields() {
+    let (client, mock_server) = create_test_client().await;
+    let payment_api = PaymentApi::new(&client);
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/payments/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "order_id": "order_conflicting_fields",
+            "out_trade_no": "PAY_CONFLICTING_FIELDS",
+            "payment_method": "wechatpay",
+            "payment_scene": "native",
+            "payment_type": "page",
+            "pay_url": null,
+            "qr_code": "weixin://wxpay/example",
+            "qr_code_image_url": null,
+            "expired_at": "2026-07-26T11:00:00Z"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let req = CreatePaymentOrderRequest::new_for_method("10", "wechatpay", "native");
+    let error = payment_api
+        .create_payment_order(&req, fixtures::TEST_ACCESS_TOKEN)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ClientError::Http(_)));
+}
+
+#[tokio::test]
+#[allow(deprecated)]
 async fn test_create_payment_order_with_description() {
     let (client, mock_server) = create_test_client().await;
     let payment_api = PaymentApi::new(&client);
@@ -84,6 +175,7 @@ async fn test_create_payment_order_with_description() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn test_create_payment_order_invalid_amount() {
     let (client, mock_server) = create_test_client().await;
     let payment_api = PaymentApi::new(&client);
@@ -231,7 +323,7 @@ async fn test_sync_payment_order_success() {
     let payment_api = PaymentApi::new(&client);
 
     Mock::given(method("POST"))
-        .and(path("/api/v1/payments/sync/PAY202401200001"))
+        .and(path("/api/v1/payments/orders/order_001/sync"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "order_id": "order_001",
             "out_trade_no": "PAY202401200001",
@@ -242,7 +334,7 @@ async fn test_sync_payment_order_success() {
         .await;
 
     let result = payment_api
-        .sync_payment_order("PAY202401200001", fixtures::TEST_ACCESS_TOKEN)
+        .sync_payment_order("order_001", fixtures::TEST_ACCESS_TOKEN)
         .await;
 
     assert!(result.is_ok());

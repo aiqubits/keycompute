@@ -3,8 +3,9 @@
 use crate::DbError;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// 订单状态
@@ -83,8 +84,10 @@ pub struct PaymentOrder {
     pub user_id: Uuid,
     /// 商户订单号（外部订单号）
     pub out_trade_no: String,
-    /// 支付宝交易号
+    /// 通用渠道交易号展示字段
     pub trade_no: Option<String>,
+    /// 支付渠道交易号
+    pub provider_trade_no: Option<String>,
     /// 订单金额（单位：元）
     pub amount: Decimal,
     /// 币种
@@ -93,6 +96,8 @@ pub struct PaymentOrder {
     pub status: String,
     /// 支付方式
     pub payment_method: String,
+    /// 支付场景
+    pub payment_scene: String,
     /// 商品标题
     pub subject: String,
     /// 商品描述
@@ -107,10 +112,37 @@ pub struct PaymentOrder {
     pub pay_url: Option<String>,
     /// 回调通知原始数据
     pub notify_data: Option<serde_json::Value>,
+    /// 支付渠道返回的非敏感展示数据
+    pub provider_payload: Option<serde_json::Value>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub last_synced_at: Option<DateTime<Utc>>,
     /// 备注信息
     pub remarks: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CreditPaidOrderError {
+    #[error(transparent)]
+    Database(#[from] DbError),
+    #[error("payment order disappeared")]
+    OrderNotFound,
+    #[error("provider event id was already used by a different notification")]
+    NotificationConflict,
+    #[error("provider transaction does not match the paid order")]
+    ProviderIdentityMismatch,
+    #[error("cannot pay order in state {0}")]
+    InvalidOrderStatus(String),
+    #[error("concurrent order transition")]
+    ConcurrentTransition,
+}
+
+#[derive(FromQueryResult)]
+struct PaymentNotificationIdentity {
+    order_id: Option<Uuid>,
+    payload_digest: String,
 }
 
 impl PaymentOrder {
@@ -141,13 +173,12 @@ pub struct CreatePaymentOrderRequest {
     pub subject: String,
     /// 商品描述
     pub body: Option<String>,
-    /// 过期时间（分钟），默认30分钟
-    #[serde(default = "default_expire_minutes")]
-    pub expire_minutes: i32,
-}
-
-fn default_expire_minutes() -> i32 {
-    30
+    /// 支付方式
+    pub payment_method: PaymentMethod,
+    /// 支付场景（page/wap/qr/native）
+    pub payment_scene: String,
+    /// 渠道订单与本地订单共享的绝对过期时间
+    pub expired_at: DateTime<Utc>,
 }
 
 impl PaymentOrder {
@@ -158,16 +189,15 @@ impl PaymentOrder {
         out_trade_no: &str,
         pay_url: &str,
     ) -> Result<PaymentOrder, DbError> {
-        let expired_at = Utc::now() + chrono::Duration::minutes(req.expire_minutes as i64);
         let stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
             r#"
             INSERT INTO payment_orders (
                 tenant_id, user_id, out_trade_no, amount,
-                currency, status, payment_method, subject, body,
+                currency, status, payment_method, payment_scene, subject, body,
                 expired_at, pay_url
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING *
             "#,
             [
@@ -177,10 +207,11 @@ impl PaymentOrder {
                 req.amount.into(),
                 "CNY".into(),
                 PaymentOrderStatus::Pending.as_str().into(),
-                PaymentMethod::Alipay.as_str().into(),
+                req.payment_method.as_str().into(),
+                req.payment_scene.as_str().into(),
                 req.subject.as_str().into(),
                 req.body.clone().into(),
-                expired_at.into(),
+                req.expired_at.into(),
                 pay_url.into(),
             ],
         );
@@ -232,6 +263,115 @@ impl PaymentOrder {
         );
         let order = PaymentOrder::find_by_statement(stmt).one(db).await?;
         Ok(order)
+    }
+
+    /// Atomically record a verified provider event, mark the order paid, and credit its balance.
+    pub async fn credit_paid(
+        db: &(impl ConnectionTrait + TransactionTrait),
+        order_id: Uuid,
+        provider_trade_no: &str,
+        provider_event_id: &str,
+        payload: serde_json::Value,
+        description: &str,
+    ) -> Result<bool, CreditPaidOrderError> {
+        let tx = db.begin().await.map_err(DbError::from)?;
+        let locked = Self::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT * FROM payment_orders WHERE id = $1 FOR UPDATE",
+            [order_id.into()],
+        ))
+        .one(&tx)
+        .await
+        .map_err(DbError::from)?
+        .ok_or(CreditPaidOrderError::OrderNotFound)?;
+        let payload_digest = hex::encode(Sha256::digest(
+            serde_json::to_vec(&payload).map_err(|error| DbError::Other(error.to_string()))?,
+        ));
+
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"INSERT INTO payment_notifications(payment_method, provider_event_id, order_id, out_trade_no, processing_status, payload_digest)
+               VALUES ($1, $2, $3, $4, 'received', $5)
+               ON CONFLICT(payment_method, provider_event_id) DO NOTHING"#,
+            [
+                locked.payment_method.as_str().into(),
+                provider_event_id.into(),
+                locked.id.into(),
+                locked.out_trade_no.as_str().into(),
+                payload_digest.as_str().into(),
+            ],
+        ))
+        .await
+        .map_err(DbError::from)?;
+        let notification = PaymentNotificationIdentity::find_by_statement(
+            Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT order_id, payload_digest FROM payment_notifications WHERE payment_method=$1 AND provider_event_id=$2 FOR UPDATE",
+                [locked.payment_method.as_str().into(), provider_event_id.into()],
+            ),
+        )
+        .one(&tx)
+        .await
+        .map_err(DbError::from)?
+        .ok_or(CreditPaidOrderError::NotificationConflict)?;
+        if notification.order_id != Some(locked.id) || notification.payload_digest != payload_digest
+        {
+            return Err(CreditPaidOrderError::NotificationConflict);
+        }
+
+        if locked.status == PaymentOrderStatus::Paid.as_str() {
+            if locked
+                .provider_trade_no
+                .as_deref()
+                .or(locked.trade_no.as_deref())
+                != Some(provider_trade_no)
+            {
+                return Err(CreditPaidOrderError::ProviderIdentityMismatch);
+            }
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE payment_notifications SET processing_status='processed', processed_at=COALESCE(processed_at, NOW()) WHERE payment_method=$1 AND provider_event_id=$2",
+                [locked.payment_method.as_str().into(), provider_event_id.into()],
+            ))
+            .await
+            .map_err(DbError::from)?;
+            tx.commit().await.map_err(DbError::from)?;
+            return Ok(false);
+        }
+        if locked.status != PaymentOrderStatus::Pending.as_str() {
+            return Err(CreditPaidOrderError::InvalidOrderStatus(locked.status));
+        }
+
+        let updated = tx
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"UPDATE payment_orders SET status='paid', trade_no=$1, provider_trade_no=$1, notify_data=$2, paid_at=NOW(), updated_at=NOW()
+                   WHERE id=$3 AND status='pending'"#,
+                [provider_trade_no.into(), payload.into(), locked.id.into()],
+            ))
+            .await
+            .map_err(DbError::from)?;
+        if updated.rows_affected() != 1 {
+            return Err(CreditPaidOrderError::ConcurrentTransition);
+        }
+        crate::UserBalance::recharge_in_tx(
+            &tx,
+            locked.user_id,
+            locked.tenant_id,
+            locked.amount,
+            Some(locked.id),
+            Some(description),
+        )
+        .await?;
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE payment_notifications SET processing_status='processed', processed_at=NOW() WHERE payment_method=$1 AND provider_event_id=$2",
+            [locked.payment_method.as_str().into(), provider_event_id.into()],
+        ))
+        .await
+        .map_err(DbError::from)?;
+        tx.commit().await.map_err(DbError::from)?;
+        Ok(true)
     }
 
     /// 查找用户的订单列表
@@ -296,10 +436,13 @@ impl PaymentOrder {
         match PaymentOrder::find_by_statement(stmt).one(db).await? {
             Some(o) => Ok(o),
             None => {
-                let existing = Self::find_by_id(db, id).await?;
-                match existing {
-                    Some(o) => Ok(o),
-                    None => Err(DbError::not_found("PaymentOrder", id.to_string())),
+                if let Some(existing) = Self::find_by_id(db, id).await? {
+                    Err(DbError::InvalidOrderStatus {
+                        expected: "pending".to_string(),
+                        actual: existing.status,
+                    })
+                } else {
+                    Err(DbError::not_found("PaymentOrder", id.to_string()))
                 }
             }
         }

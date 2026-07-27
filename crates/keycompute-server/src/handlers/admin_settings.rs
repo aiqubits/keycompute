@@ -12,7 +12,10 @@ use axum::{
     Json,
     extract::{Path, State},
 };
+use keycompute_auth::Permission;
 use keycompute_db::models::system_setting::setting_keys;
+use rust_decimal::Decimal;
+use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 
 // ==================== 系统设置 ====================
@@ -174,6 +177,36 @@ fn normalize_setting_update(key: &str, value: impl Into<String>) -> Result<Strin
 
     let value = value.into();
 
+    if matches!(
+        key,
+        setting_keys::ALIPAY_ENABLED | setting_keys::WECHATPAY_ENABLED
+    ) {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok("true".to_string()),
+            "false" | "0" | "no" => Ok("false".to_string()),
+            _ => Err(ApiError::BadRequest(format!(
+                "Setting {key} must be a valid boolean"
+            ))),
+        };
+    }
+
+    if matches!(
+        key,
+        setting_keys::MIN_RECHARGE_AMOUNT | setting_keys::MAX_RECHARGE_AMOUNT
+    ) {
+        let amount = value.parse::<Decimal>().map_err(|_| {
+            ApiError::BadRequest(format!("Setting {key} must be a valid decimal amount"))
+        })?;
+        let amount = amount.normalize();
+        let database_max = Decimal::new(999_999_999_999, 2);
+        if amount <= Decimal::ZERO || amount > database_max || amount.scale() > 2 {
+            return Err(ApiError::BadRequest(format!(
+                "Setting {key} must be positive, use at most two decimal places, and not exceed {database_max}"
+            )));
+        }
+        return Ok(amount.to_string());
+    }
+
     if key == setting_keys::DEFAULT_USER_QUOTA {
         let quota = value.parse::<f64>().map_err(|_| {
             ApiError::BadRequest("Setting default_user_quota must be a valid number".to_string())
@@ -221,6 +254,72 @@ fn normalize_settings_map(
         .collect()
 }
 
+async fn ensure_payment_amount_range(
+    db: &impl ConnectionTrait,
+    settings: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    if !settings.contains_key(setting_keys::MIN_RECHARGE_AMOUNT)
+        && !settings.contains_key(setting_keys::MAX_RECHARGE_AMOUNT)
+    {
+        return Ok(());
+    }
+
+    #[derive(FromQueryResult)]
+    struct AmountSettingRow {
+        key: String,
+        value: String,
+    }
+
+    // Lock both rows in the same transaction as the update. This prevents two
+    // concurrent partial updates from each validating against stale counterparts.
+    let rows = AmountSettingRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT key, value FROM system_settings WHERE key IN ($1, $2) ORDER BY key FOR UPDATE",
+        [
+            setting_keys::MIN_RECHARGE_AMOUNT.into(),
+            setting_keys::MAX_RECHARGE_AMOUNT.into(),
+        ],
+    ))
+    .all(db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "Failed to lock payment amount settings");
+        ApiError::Internal("Failed to validate payment settings".to_string())
+    })?;
+    let current = |key: &str, default: Decimal| -> Result<Decimal> {
+        match rows.iter().find(|row| row.key == key) {
+            Some(row) => row.value.parse::<Decimal>().map_err(|error| {
+                tracing::error!(%error, key, "Stored payment amount setting is invalid");
+                ApiError::Internal("Failed to validate payment settings".to_string())
+            }),
+            None => Ok(default),
+        }
+    };
+
+    let min = match settings.get(setting_keys::MIN_RECHARGE_AMOUNT) {
+        Some(value) => value
+            .parse::<Decimal>()
+            .map_err(|_| ApiError::BadRequest("Invalid minimum recharge amount".to_string()))?,
+        None => current(setting_keys::MIN_RECHARGE_AMOUNT, Decimal::ONE)?,
+    };
+    let max = match settings.get(setting_keys::MAX_RECHARGE_AMOUNT) {
+        Some(value) => value
+            .parse::<Decimal>()
+            .map_err(|_| ApiError::BadRequest("Invalid maximum recharge amount".to_string()))?,
+        None => current(setting_keys::MAX_RECHARGE_AMOUNT, Decimal::new(100_000, 0))?,
+    };
+    validate_payment_amount_range(min, max)
+}
+
+fn validate_payment_amount_range(min: Decimal, max: Decimal) -> Result<()> {
+    if min > max {
+        return Err(ApiError::BadRequest(
+            "min_recharge_amount must not exceed max_recharge_amount".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn is_truthy_setting(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -245,14 +344,23 @@ fn ensure_distribution_has_public_base_url(
     Ok(())
 }
 
-fn requires_system_role_for_setting(key: &str) -> bool {
+fn requires_protected_settings_permission(key: &str) -> bool {
     key == setting_keys::DISTRIBUTION_ENABLED
 }
 
+fn ensure_admin_permission(auth: &AuthExtractor) -> Result<()> {
+    if !auth.has_permission(&Permission::SystemAdmin) {
+        return Err(ApiError::Forbidden("Admin permission required".to_string()));
+    }
+    Ok(())
+}
+
 fn ensure_setting_update_allowed(auth: &AuthExtractor, key: &str) -> Result<()> {
-    if requires_system_role_for_setting(key) && auth.role != "system" {
+    if requires_protected_settings_permission(key)
+        && !auth.has_permission(&Permission::ManageSystemSettings)
+    {
         return Err(ApiError::Forbidden(
-            "Only system can update distribution_enabled".to_string(),
+            "Protected system setting permission required".to_string(),
         ));
     }
 
@@ -268,6 +376,11 @@ fn ensure_settings_update_allowed(
     }
 
     Ok(())
+}
+
+fn settings_internal_error(operation: &'static str, error: impl std::fmt::Display) -> ApiError {
+    tracing::error!(operation, %error, "System settings operation failed");
+    ApiError::Internal("System settings operation failed".to_string())
 }
 
 fn payload_to_settings_map(
@@ -304,9 +417,7 @@ pub async fn get_system_settings(
     auth: AuthExtractor,
     State(state): State<AppState>,
 ) -> Result<Json<std::collections::HashMap<String, serde_json::Value>>> {
-    if !auth.is_admin() {
-        return Err(ApiError::Auth("Admin permission required".to_string()));
-    }
+    ensure_admin_permission(&auth)?;
 
     let pool = state
         .pool
@@ -315,7 +426,7 @@ pub async fn get_system_settings(
 
     let settings = keycompute_db::SystemSetting::find_all(pool)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to query settings: {}", e)))?;
+        .map_err(|error| settings_internal_error("find_all", error))?;
 
     // 将设置列表转换为 HashMap<key, value>
     // value 根据 value_type 转换为对应的 JSON 类型
@@ -352,9 +463,7 @@ pub async fn update_system_settings(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
-    if !auth.is_admin() {
-        return Err(ApiError::Auth("Admin permission required".to_string()));
-    }
+    ensure_admin_permission(&auth)?;
 
     let pool = state
         .pool
@@ -364,11 +473,19 @@ pub async fn update_system_settings(
     let settings_map = normalize_settings_map(payload_to_settings_map(payload)?)?;
     ensure_settings_update_allowed(&auth, &settings_map)?;
     ensure_distribution_has_public_base_url(state.app_base_url.as_deref(), &settings_map)?;
-
-    // 批量更新设置
-    let updated = keycompute_db::SystemSetting::batch_update(pool, &settings_map)
+    let txn = pool
+        .begin()
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to update settings: {}", e)))?;
+        .map_err(|error| settings_internal_error("begin_batch_update", error))?;
+    ensure_payment_amount_range(&txn, &settings_map).await?;
+
+    // Validation and updates share one transaction and the payment rows remain locked.
+    let updated = keycompute_db::SystemSetting::batch_update_tx(&txn, &settings_map)
+        .await
+        .map_err(|error| settings_internal_error("batch_update", error))?;
+    txn.commit()
+        .await
+        .map_err(|error| settings_internal_error("commit_batch_update", error))?;
 
     tracing::info!(
         user_id = %auth.user_id,
@@ -391,9 +508,7 @@ pub async fn get_system_setting_by_key(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Result<Json<keycompute_db::SystemSettingResponse>> {
-    if !auth.is_admin() {
-        return Err(ApiError::Auth("Admin permission required".to_string()));
-    }
+    ensure_admin_permission(&auth)?;
 
     let pool = state
         .pool
@@ -406,7 +521,7 @@ pub async fn get_system_setting_by_key(
 
     let setting = keycompute_db::SystemSetting::find_by_key(pool, &key)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to query setting: {}", e)))?
+        .map_err(|error| settings_internal_error("find_by_key", error))?
         .ok_or_else(|| ApiError::NotFound(format!("Setting not found: {}", key)))?;
 
     Ok(Json(setting.into()))
@@ -421,9 +536,7 @@ pub async fn update_system_setting_by_key(
     Path(key): Path<String>,
     Json(payload): Json<keycompute_db::UpdateSystemSettingRequest>,
 ) -> Result<Json<keycompute_db::SystemSettingResponse>> {
-    if !auth.is_admin() {
-        return Err(ApiError::Auth("Admin permission required".to_string()));
-    }
+    ensure_admin_permission(&auth)?;
 
     let pool = state
         .pool
@@ -440,10 +553,18 @@ pub async fn update_system_setting_by_key(
     let mut settings_map = std::collections::HashMap::new();
     settings_map.insert(key.clone(), normalized_value.clone());
     ensure_distribution_has_public_base_url(state.app_base_url.as_deref(), &settings_map)?;
-
-    let setting = keycompute_db::SystemSetting::update_value(pool, &key, &normalized_value)
+    let txn = pool
+        .begin()
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to update setting: {}", e)))?;
+        .map_err(|error| settings_internal_error("begin_single_update", error))?;
+    ensure_payment_amount_range(&txn, &settings_map).await?;
+
+    let setting = keycompute_db::SystemSetting::update_value(&txn, &key, &normalized_value)
+        .await
+        .map_err(|error| settings_internal_error("single_update", error))?;
+    txn.commit()
+        .await
+        .map_err(|error| settings_internal_error("commit_single_update", error))?;
 
     tracing::info!(
         user_id = %auth.user_id,
@@ -560,6 +681,44 @@ mod tests {
     }
 
     #[test]
+    fn test_payment_toggles_require_real_boolean_values() {
+        assert_eq!(
+            normalize_setting_update(setting_keys::ALIPAY_ENABLED, "YES").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            normalize_setting_update(setting_keys::WECHATPAY_ENABLED, "0").unwrap(),
+            "false"
+        );
+        let error = normalize_setting_update(setting_keys::ALIPAY_ENABLED, "enabled").unwrap_err();
+        assert!(matches!(error, ApiError::BadRequest(message) if message.contains("boolean")));
+    }
+
+    #[test]
+    fn test_recharge_amount_settings_enforce_database_precision() {
+        assert_eq!(
+            normalize_setting_update(setting_keys::MIN_RECHARGE_AMOUNT, "1.2300").unwrap(),
+            "1.23"
+        );
+        for invalid in ["0", "-1", "1.001", "10000000000"] {
+            assert!(
+                normalize_setting_update(setting_keys::MAX_RECHARGE_AMOUNT, invalid).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recharge_minimum_cannot_exceed_maximum() {
+        assert!(validate_payment_amount_range(Decimal::new(1, 0), Decimal::new(10, 0)).is_ok());
+        let error =
+            validate_payment_amount_range(Decimal::new(11, 0), Decimal::new(10, 0)).unwrap_err();
+        assert!(
+            matches!(error, ApiError::BadRequest(message) if message.contains("must not exceed"))
+        );
+    }
+
+    #[test]
     fn test_payload_to_settings_map_ignores_null_default_user_quota() {
         let payload = serde_json::json!({
             "default_user_quota": null,
@@ -599,18 +758,51 @@ mod tests {
     }
 
     #[test]
-    fn test_distribution_toggle_requires_system_role() {
-        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "admin");
+    fn test_distribution_toggle_requires_protected_settings_permission() {
+        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "system")
+            .with_permissions(vec![Permission::SystemAdmin]);
 
         let err =
             ensure_setting_update_allowed(&auth, setting_keys::DISTRIBUTION_ENABLED).unwrap_err();
-        assert!(matches!(err, ApiError::Forbidden(msg) if msg.contains("Only system")));
+        assert!(matches!(err, ApiError::Forbidden(msg) if msg.contains("permission required")));
     }
 
     #[test]
-    fn test_distribution_toggle_allows_system_role() {
-        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "system");
+    fn test_distribution_toggle_allows_protected_settings_permission() {
+        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "admin")
+            .with_permissions(vec![Permission::ManageSystemSettings]);
 
         assert!(ensure_setting_update_allowed(&auth, setting_keys::DISTRIBUTION_ENABLED).is_ok());
+    }
+
+    #[test]
+    fn admin_settings_access_uses_permissions_instead_of_role() {
+        let role_only =
+            AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "system");
+        assert!(ensure_admin_permission(&role_only).is_err());
+
+        let permission_only =
+            AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "user")
+                .with_permissions(vec![Permission::SystemAdmin]);
+        assert!(ensure_admin_permission(&permission_only).is_ok());
+    }
+
+    #[tokio::test]
+    async fn settings_database_errors_are_hidden_from_responses() {
+        use axum::response::IntoResponse;
+
+        let response = settings_internal_error(
+            "test_operation",
+            "duplicate key violates constraint secret_table_key",
+        )
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("Internal server error"));
+        assert!(!body.contains("secret_table_key"));
+        assert!(!body.contains("duplicate key"));
     }
 }

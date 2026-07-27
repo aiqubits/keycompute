@@ -11,6 +11,9 @@ use rust_decimal::Decimal;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+    use tokio::task::JoinSet;
 
     /// 测试余额冻结：冻结后可用余额减少、冻结余额增加
     #[tokio::test]
@@ -325,6 +328,61 @@ mod tests {
             unfrozen.frozen_balance,
             Decimal::ZERO,
             "frozen balance should be zero after full unfreeze"
+        );
+    }
+
+    /// 并发首充必须串行化余额流水的 before/after，不能只保证最终余额。
+    #[tokio::test]
+    async fn concurrent_first_recharges_preserve_a_contiguous_audit_chain() {
+        const RECHARGE_COUNT: usize = 8;
+
+        let pool = create_test_pool().await;
+        let test_id = generate_test_id();
+        cleanup_test_data(&pool, &test_id)
+            .await
+            .expect("concurrent recharge cleanup should succeed");
+        let tenant = create_test_tenant(&pool, "recharge-race", &test_id).await;
+        let user = create_test_user(&pool, tenant.id, "recharge-race", &test_id).await;
+        let barrier = Arc::new(Barrier::new(RECHARGE_COUNT));
+        let mut tasks = JoinSet::new();
+
+        for _ in 0..RECHARGE_COUNT {
+            let service = BalanceService::new(DbRouter::single(pool.clone()));
+            let barrier = Arc::clone(&barrier);
+            tasks.spawn(async move {
+                barrier.wait().await;
+                service
+                    .recharge(
+                        user.id,
+                        tenant.id,
+                        Decimal::ONE,
+                        None,
+                        Some("concurrent first recharge"),
+                    )
+                    .await
+                    .expect("concurrent first recharge should succeed")
+            });
+        }
+
+        let mut transactions = Vec::with_capacity(RECHARGE_COUNT);
+        while let Some(result) = tasks.join_next().await {
+            let (_, transaction) = result.expect("recharge task should not panic");
+            transactions.push(transaction);
+        }
+        transactions.sort_by_key(|transaction| transaction.balance_before);
+
+        for (index, transaction) in transactions.iter().enumerate() {
+            let expected_before = Decimal::from(index);
+            assert_eq!(transaction.balance_before, expected_before);
+            assert_eq!(transaction.balance_after, expected_before + Decimal::ONE);
+        }
+        let final_balance = keycompute_db::UserBalance::find_by_user(&pool, user.id)
+            .await
+            .expect("final balance query should succeed")
+            .expect("final balance should exist");
+        assert_eq!(
+            final_balance.available_balance,
+            Decimal::from(RECHARGE_COUNT)
         );
     }
 }

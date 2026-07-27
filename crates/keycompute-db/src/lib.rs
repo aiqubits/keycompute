@@ -1,6 +1,6 @@
 //! KeyCompute 数据库访问层
 //!
-//! 提供 PostgreSQL 数据库连接池、ORM 模型和迁移支持
+//! 提供 PostgreSQL 数据库连接池、ORM 模型和新库结构初始化
 
 pub mod db_router;
 pub mod models;
@@ -17,6 +17,9 @@ pub use db_router::DbRouter;
 pub use models::*;
 pub use schema::*;
 
+/// 当前版本的完整数据库结构；只描述最终状态，不承载升级步骤。
+const DATABASE_SCHEMA: &str = include_str!("schema.sql");
+
 // ============================================================================
 // 错误类型定义
 // ============================================================================
@@ -28,9 +31,9 @@ pub enum DbError {
     #[error("database connection failed: {0}")]
     ConnectionError(String),
 
-    /// 迁移错误
-    #[error("migration failed: {0}")]
-    MigrationError(String),
+    /// 新库结构初始化错误
+    #[error("database schema initialization failed: {0}")]
+    SchemaInitializationError(String),
 
     /// 实体未找到
     #[error("{entity} not found: {id}")]
@@ -212,177 +215,98 @@ pub async fn init_pool(config: &DatabaseConfig) -> Result<DatabaseConnection, Db
     Ok(db)
 }
 
-/// 将 SQL 按顶层分号切分为独立语句
+/// 初始化一个全新的数据库结构。
 ///
-/// 正确处理以下场景：
-/// - `$$ ... $$` 美元引号块（PL/pgSQL 函数体等）
-/// - `'...'` 单引号字符串常量
-fn split_sql_statements(sql: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut in_single_quote = false;
-    let mut in_dollar_block = false;
-    let mut prev_char: Option<char> = None;
-
-    for ch in sql.chars() {
-        current.push(ch);
-
-        match ch {
-            '\'' if prev_char != Some('\\') && !in_dollar_block => {
-                in_single_quote = !in_single_quote;
-            }
-            '$' if prev_char == Some('$') && !in_single_quote && !in_dollar_block => {
-                // 完整匹配 $$，跳过已推入的 current
-                in_dollar_block = true;
-            }
-            '$' if prev_char == Some('$') && !in_single_quote && in_dollar_block => {
-                // 完整匹配关闭 $$
-                in_dollar_block = false;
-            }
-            ';' if !in_single_quote && !in_dollar_block => {
-                // 移除已推入的 ';'，它只是分隔符不属于语句内容
-                current.pop();
-                let trimmed = current.trim();
-                if !trimmed.is_empty() {
-                    statements.push(trimmed.to_string());
-                }
-                current.clear();
-            }
-            _ => {}
-        }
-
-        prev_char = Some(ch);
-    }
-
-    // 处理最后一个语句
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        statements.push(trimmed.to_string());
-    }
-
-    statements
-}
-
-/// Check if a database error is an expected "already exists" error for
-/// idempotent migration statements (CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS).
+/// 本项目不提供增量迁移或旧数据升级能力。部署时必须连接空数据库；结构变化后
+/// 应重建数据库再启动服务。整个 schema 在单个事务内执行，任一语句失败都会回滚，
+/// 防止服务在结构不完整的数据库上继续运行。
 ///
-/// This function ONLY matches DDL-level "already exists" errors:
-/// - PostgreSQL 42P07 (duplicate_table): table already exists
-/// - PostgreSQL 42710 (duplicate_object): index/function/type already exists
-///
-/// It does NOT match data-level errors like UniqueConstraintViolation (23505)
-/// because those indicate real data conflicts, not idempotent DDL re-execution.
-fn is_duplicate_table_or_index_error(err: &sea_orm::DbErr) -> bool {
-    // SqlErr only covers data-level constraint violations (23505, 23503, etc.),
-    // not DDL "already exists" errors (42P07, 42710). So we skip sql_err() matching
-    // entirely and rely on string-based detection for DDL-specific error codes.
+/// 执行完成后会验证哨兵列：由于 schema 全部使用 `IF NOT EXISTS`，误连接到
+/// 旧版结构的存量库时旧表会被静默跳过，哨兵校验把这种部署错误从运行期
+/// 故障提前为启动即失败。
+pub async fn initialize_schema(db: &DatabaseConnection) -> Result<(), DbError> {
+    let transaction = db
+        .begin()
+        .await
+        .map_err(|error| DbError::SchemaInitializationError(error.to_string()))?;
 
-    let msg = err.to_string().to_lowercase();
+    transaction
+        .execute_unprepared(DATABASE_SCHEMA)
+        .await
+        .map_err(|error| DbError::SchemaInitializationError(error.to_string()))?;
 
-    // Match PostgreSQL error codes for DDL "already exists" scenarios:
-    // - 42P07: duplicate_table (CREATE TABLE IF NOT EXISTS on existing table without IF NOT EXISTS)
-    // - 42710: duplicate_object (CREATE INDEX IF NOT EXISTS on existing index)
-    if msg.contains("42p07") || msg.contains("42710") {
-        return true;
-    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| DbError::SchemaInitializationError(error.to_string()))?;
 
-    // Fallback: match the generic "already exists" message, but only for DDL objects
-    if msg.contains("already exists") {
-        return msg.contains("relation")
-            || msg.contains("type")
-            || msg.contains("index")
-            || msg.contains("table");
-    }
+    verify_schema_sentinels(db).await?;
 
-    false
-}
-
-/// 运行数据库迁移
-///
-/// 使用纯 SQL 执行嵌入式迁移文件。
-/// 每个语句在独立的 savepoint 中执行，避免单条失败导致整个迁移中断。
-/// 通过 idempotent 检查（`IF NOT EXISTS` + 错误容忍）支持重复执行。
-///
-/// # 并发安全
-///
-/// 使用 PostgreSQL session-level advisory lock 防止多个连接并行执行迁移。
-/// 这在并行集成测试场景下是必要的——多个测试线程同时创建连接池并运行迁移时，
-/// `INSERT INTO system_settings` 等语句会产生 `tuple concurrently updated` 冲突。
-pub async fn run_migrations(db: &(impl ConnectionTrait + TransactionTrait)) -> Result<(), DbError> {
-    // 获取 session-level advisory lock，防止并发迁移
-    // 使用双 key 版本：pg_advisory_lock(key1 int, key2 int)
-    // key1 = hashtext('keycompute'), key2 = hashtext('db_migration')
-    // 锁在连接关闭时自动释放
-    db.execute_unprepared(
-        "SELECT pg_advisory_lock(hashtext('keycompute'), hashtext('db_migration'))",
-    )
-    .await
-    .map_err(|e| {
-        DbError::MigrationError(format!(
-            "Failed to acquire migration advisory lock (concurrent migration prevention): {}",
-            e
-        ))
-    })?;
-
-    let result = run_migrations_internal(db).await;
-
-    // 释放 advisory lock（最佳努力，连接关闭时也会自动释放）
-    db.execute_unprepared(
-        "SELECT pg_advisory_unlock(hashtext('keycompute'), hashtext('db_migration'))",
-    )
-    .await
-    .ok();
-
-    result
-}
-
-/// 迁移内部实现（被 `run_migrations` 的 advisory lock 保护）
-async fn run_migrations_internal(
-    db: &(impl ConnectionTrait + TransactionTrait),
-) -> Result<(), DbError> {
-    let sql = include_str!("migrations/001_init.sql");
-
-    for statement in split_sql_statements(sql) {
-        let trimmed = statement.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // 使用 savepoint 隔离每个语句，失败时不影响其他语句
-        let sp = db
-            .begin()
-            .await
-            .map_err(|e| DbError::MigrationError(e.to_string()))?;
-
-        match sp
-            .execute(Statement::from_string(
-                sp.get_database_backend(),
-                trimmed.to_string(),
-            ))
-            .await
-        {
-            Ok(_) => {
-                sp.commit()
-                    .await
-                    .map_err(|e| DbError::MigrationError(e.to_string()))?;
-            }
-            Err(e) => {
-                sp.rollback()
-                    .await
-                    .map_err(|e| DbError::MigrationError(e.to_string()))?;
-
-                if is_duplicate_table_or_index_error(&e) {
-                    tracing::warn!("Migration statement skipped (already exists): {}", trimmed);
-                } else {
-                    return Err(DbError::MigrationError(e.to_string()));
-                }
-            }
-        }
-    }
-
-    tracing::info!("Database migrations completed successfully");
-
+    tracing::info!("Database schema initialized successfully");
     Ok(())
+}
+
+/// 近期结构修订引入的哨兵列。旧版数据库缺少这些列，而 `IF NOT EXISTS`
+/// 不会为已存在的表补列，因此可用于识别“误部署到存量旧库”的场景。
+const SCHEMA_SENTINEL_COLUMNS: &[(&str, &str)] = &[
+    ("payment_orders", "payment_scene"),
+    ("payment_orders", "provider_trade_no"),
+    ("payment_notifications", "payload_digest"),
+    ("payment_provider_states", "circuit_state"),
+];
+
+/// 验证当前数据库包含最新 schema 的哨兵列，缺失时拒绝启动。
+pub async fn verify_schema_sentinels(db: &impl ConnectionTrait) -> Result<(), DbError> {
+    verify_required_columns(db, SCHEMA_SENTINEL_COLUMNS).await
+}
+
+/// 验证指定的 (表, 列) 对在当前 schema 中存在。
+pub async fn verify_required_columns(
+    db: &impl ConnectionTrait,
+    required: &[(&str, &str)],
+) -> Result<(), DbError> {
+    let mut missing = Vec::new();
+    for (table, column) in required {
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT 1 AS present FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
+            [(*table).into(), (*column).into()],
+        );
+        let found = db
+            .query_one(stmt)
+            .await
+            .map_err(|error| DbError::SchemaInitializationError(error.to_string()))?;
+        if found.is_none() {
+            missing.push(format!("{table}.{column}"));
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(DbError::SchemaInitializationError(format!(
+            "database is missing required columns [{}]; this deployment only supports \
+             an empty database; rebuild the database instead of reusing a legacy one",
+            missing.join(", ")
+        )))
+    }
+}
+
+/// 清理超过保留期的支付安全事件，返回删除的行数。
+///
+/// 回调端点暴露于公网，`payment_security_events` 按拒绝事件持续追加；
+/// 定期清理避免表无界增长。
+pub async fn purge_expired_payment_security_events(
+    db: &impl ConnectionTrait,
+    retention_days: i64,
+) -> Result<u64, DbError> {
+    let statement = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "DELETE FROM payment_security_events WHERE created_at < NOW() - make_interval(days => $1::int)",
+        [retention_days.into()],
+    );
+    let result = db.execute(statement).await?;
+    Ok(result.rows_affected())
 }
 
 // ============================================================================
@@ -454,9 +378,9 @@ impl Database {
         self.router.write_conn().begin().await
     }
 
-    /// 运行迁移
-    pub async fn migrate(&self) -> Result<(), DbError> {
-        run_migrations(self.router.write_conn()).await
+    /// 初始化空数据库结构；不负责升级已有数据库
+    pub async fn initialize_schema(&self) -> Result<(), DbError> {
+        initialize_schema(self.router.write_conn()).await
     }
 
     /// 测试连接
@@ -518,69 +442,12 @@ mod tests {
     }
 
     #[test]
-    fn test_split_sql_statements_simple() {
-        let sql = "SELECT 1; SELECT 2;";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
-        assert!(stmts[0].trim_start().starts_with("SELECT 1"));
-        assert!(stmts[1].trim_start().starts_with("SELECT 2"));
-    }
-
-    #[test]
-    fn test_split_sql_statements_no_semicolon() {
-        let sql = "SELECT 1";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 1);
-        assert!(stmts[0].trim_start().starts_with("SELECT 1"));
-    }
-
-    #[test]
-    fn test_split_sql_statements_preserves_dollar_block() {
-        let sql = "CREATE FUNCTION foo() RETURNS TRIGGER AS $$\nBEGIN\n    IF OLD.role = 'system' THEN\n        RAISE EXCEPTION 'cannot delete'\n    END IF;\n    RETURN OLD;\nEND;\n$$ LANGUAGE plpgsql;\n\nSELECT 1;";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2, "should produce exactly 2 statements");
-        assert!(
-            stmts[0].contains("$$"),
-            "first statement should contain $$ block"
-        );
-        assert!(
-            stmts[0].contains("LANGUAGE plpgsql"),
-            "first should be function"
-        );
-        assert!(
-            stmts[1].trim_start().starts_with("SELECT 1"),
-            "second should be SELECT"
-        );
-    }
-
-    #[test]
-    fn test_split_sql_statements_single_quotes() {
-        let sql = r#"INSERT INTO t VALUES ('foo;bar');SELECT 1;"#;
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
-        assert!(
-            stmts[0].contains("'foo;bar'"),
-            "semicolon inside quotes should be preserved"
-        );
-        assert!(stmts[1].trim_start().starts_with("SELECT 1"));
-    }
-
-    #[test]
-    fn test_split_sql_statements_empty_result() {
-        let stmts = split_sql_statements("");
-        assert!(stmts.is_empty());
-    }
-
-    #[test]
-    fn test_split_sql_statements_whitespace_only() {
-        let stmts = split_sql_statements("   ;   ;   ");
-        assert!(stmts.is_empty());
-    }
-
-    #[test]
-    fn test_split_sql_statements_mixed_newlines() {
-        let sql = "-- comment\nSELECT 1;\n\n-- another comment\nSELECT 2;";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
+    fn database_schema_contains_no_incremental_upgrade_steps() {
+        assert!(DATABASE_SCHEMA.contains("token_version INTEGER NOT NULL DEFAULT 0"));
+        assert!(DATABASE_SCHEMA.contains("CONSTRAINT uk_distribution_records_unique"));
+        assert!(DATABASE_SCHEMA.contains("CONSTRAINT uk_node_tips_usage_log_id UNIQUE"));
+        assert!(!DATABASE_SCHEMA.contains("ALTER TABLE"));
+        assert!(!DATABASE_SCHEMA.contains("\nUPDATE "));
+        assert!(!DATABASE_SCHEMA.contains("\nDELETE FROM "));
     }
 }

@@ -86,7 +86,7 @@ dx serve --package web --platform web --hot-reload true --addr 0.0.0.0
 
 Notes:
 
-- The backend automatically runs embedded SQLx migrations on startup. You do not need a separate migration binary for normal development.
+- The backend initializes the embedded schema on startup. Database upgrades are intentionally unsupported: recreate the database after schema changes.
 - `config.toml` is intended for local development. Environment variables override values from `config.toml`.
 - If you work on password reset emails or public invite links, set `APP_BASE_URL` explicitly.
 
@@ -96,7 +96,7 @@ Notes:
 keycompute/
 ├── crates/
 │   ├── keycompute-server/          # Axum HTTP service entrypoint
-│   ├── keycompute-db/              # Database access and embedded migrations
+│   ├── keycompute-db/              # Database access and new-database schema initialization
 │   ├── keycompute-auth/            # Authentication and authorization
 │   ├── keycompute-routing/         # Model and account routing
 │   ├── keycompute-billing/         # Billing and settlement
@@ -167,9 +167,10 @@ If your change touches `desktop` or `mobile`, run the relevant package commands 
 
 ### Database changes
 
-- Add new migration files under `crates/keycompute-db/src/migrations/`.
+- Update `crates/keycompute-db/src/schema.sql` with the complete final schema.
 - Update the relevant data models and query code in `crates/keycompute-db/src/models/`.
-- Verify the server still boots cleanly, because migrations run during startup.
+- Recreate the development database after schema changes; incremental migrations and old-data compatibility are not supported.
+- Verify the server can initialize an empty database and boot cleanly.
 
 ### Adding a new provider
 

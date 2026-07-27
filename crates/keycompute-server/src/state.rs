@@ -153,8 +153,8 @@ pub struct AppState {
     pub email_service: Arc<EmailService>,
     /// 公共注册 cookie 签名密钥
     pub public_auth_cookie_secret: Arc<String>,
-    /// 支付服务（可选）
-    pub payment: Option<Arc<keycompute_alipay::PaymentService>>,
+    /// 统一支付渠道注册表（可选）
+    pub payment: Option<Arc<crate::payment_registry::PaymentRegistry>>,
     /// 节点网关服务（可选）
     pub node_gateway: Option<Arc<NodeGatewayService>>,
     /// 统一缓存服务（Redis 不可用时自动降级为 no-op）
@@ -544,25 +544,10 @@ impl AppState {
         let public_auth_cookie_secret =
             Arc::new(format!("{}:public-auth-cookie", config.jwt.secret));
 
-        // 尝试初始化支付服务
-        let payment = match keycompute_alipay::AlipayConfig::from_env() {
-            Ok(alipay_config) => {
-                match keycompute_alipay::PaymentService::new(alipay_config, Arc::clone(&pool)) {
-                    Ok(service) => {
-                        tracing::info!("Payment service initialized successfully");
-                        Some(Arc::new(service))
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to initialize payment service: {}", e);
-                        None
-                    }
-                }
-            }
-            Err(_) => {
-                tracing::info!("Payment service not configured, skipping initialization");
-                None
-            }
-        };
+        // Registry 始终存在；每个 provider 独立完成配置校验和初始化。
+        let payment = Some(Arc::new(
+            crate::payment_registry::PaymentRegistry::from_env(Arc::clone(&pool)),
+        ));
 
         Self {
             app_base_url: config.app_base_url,

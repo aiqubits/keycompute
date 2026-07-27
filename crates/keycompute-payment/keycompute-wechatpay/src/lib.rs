@@ -1,14 +1,12 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! WeChat Pay API v3 client for Native payments.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod client;
+mod config;
+mod crypto;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use client::{
+    NativeOrderRequest, NativeOrderResponse, TradeAmount, TradeState, WechatPayClient,
+    WechatPayError, WechatTrade,
+};
+pub use config::{WechatPayCallbackKey, WechatPayConfig, WechatPayConfigError};
+pub use crypto::{NotifyHeaders, VerifiedNotify, WechatPayNotify};

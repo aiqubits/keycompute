@@ -3656,6 +3656,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -3973,6 +3974,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "base64",
  "bigdecimal",
  "bytes",
  "chrono",
@@ -4000,15 +4002,18 @@ dependencies = [
  "keycompute-runtime",
  "keycompute-types",
  "keycompute-vllm",
+ "keycompute-wechatpay",
  "llm-gateway",
  "node-gateway",
  "percent-encoding",
+ "qrcode",
  "reqwest",
  "rust_decimal",
  "sea-orm",
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-test",
@@ -4051,6 +4056,21 @@ dependencies = [
 [[package]]
 name = "keycompute-wechatpay"
 version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "chrono",
+ "rand 0.8.5",
+ "reqwest",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tracing",
+ "url",
+ "uuid",
+]
 
 [[package]]
 name = "kuchikiki"
@@ -5716,6 +5736,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6245,6 +6271,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.6.4",
+ "sha2",
  "signature",
  "spki",
  "subtle",
@@ -8320,6 +8347,7 @@ dependencies = [
  "client-api",
  "dioxus",
  "gloo-timers",
+ "rust_decimal",
  "serde",
  "serde_json",
  "ui",

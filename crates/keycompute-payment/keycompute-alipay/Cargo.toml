@@ -17,11 +17,11 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 
 # 加密和签名
 rsa = { version = "0.9", features = ["pem"] }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 base64 = "0.22"
 
 # 时间处理
@@ -47,6 +47,7 @@ keycompute-db = { workspace = true }
 
 # URL编码
 percent-encoding = "2"
+url = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"

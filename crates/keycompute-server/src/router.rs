@@ -18,7 +18,9 @@ use crate::{
         // 节点网关 token 审批（Admin）
         admin_list_pending_tokens,
         admin_list_pending_withdrawals,
+        admin_payment_providers,
         admin_update_tip_ratio,
+        admin_verify_payment_provider,
         alipay_notify,
         calculate_cost,
         change_password,
@@ -90,6 +92,7 @@ use crate::{
         list_my_api_keys,
         list_my_node_gateway_tokens,
         list_my_payment_orders,
+        list_payment_methods,
         // 定价管理
         list_pricing,
         list_tenants,
@@ -122,11 +125,12 @@ use crate::{
         update_user,
         update_user_balance,
         verify_reset_token_handler,
+        wechatpay_notify,
     },
     middleware::{
         admin_auth_middleware, cors_layer, maintenance_mode_middleware,
-        public_auth_rate_limit_middleware, rate_limit_middleware, request_logger,
-        trace_id_middleware,
+        payment_notify_rate_limit_middleware, public_auth_rate_limit_middleware,
+        rate_limit_middleware, request_logger, trace_id_middleware,
     },
     state::AppState,
 };
@@ -398,9 +402,14 @@ pub fn create_router(state: AppState) -> Router {
         )
         // 获取订单详情
         .route("/api/v1/payments/orders/{id}", get(get_payment_order))
+        .route("/api/v1/payments/methods", get(list_payment_methods))
         // 同步订单状态
         .route(
             "/api/v1/payments/sync/{out_trade_no}",
+            post(sync_payment_order),
+        )
+        .route(
+            "/api/v1/payments/orders/{id}/sync",
             post(sync_payment_order),
         )
         // 获取我的余额
@@ -408,16 +417,30 @@ pub fn create_router(state: AppState) -> Router {
         .layer(from_fn_with_state(state.clone(), rate_limit_middleware));
 
     // 支付宝异步通知（不需要认证）
-    let payment_notify_routes =
-        Router::new().route("/api/v1/payments/notify/alipay", post(alipay_notify));
+    let payment_notify_routes = Router::new()
+        .route("/api/v1/payments/notify/alipay", post(alipay_notify))
+        .route("/api/v1/payments/notify/wechatpay", post(wechatpay_notify))
+        .layer(from_fn_with_state(
+            state.clone(),
+            payment_notify_rate_limit_middleware,
+        ));
 
     // 管理员支付路由
     let admin_payment_routes = Router::new()
         .route(
+            "/api/v1/admin/payments/providers",
+            get(admin_payment_providers),
+        )
+        .route(
+            "/api/v1/admin/payments/providers/{method}/verify",
+            post(admin_verify_payment_provider),
+        )
+        .route(
             "/api/v1/admin/payments/orders",
             get(admin_list_payment_orders),
         )
-        .layer(from_fn_with_state(state.clone(), rate_limit_middleware));
+        .layer(from_fn_with_state(state.clone(), rate_limit_middleware))
+        .layer(from_fn_with_state(state.clone(), admin_auth_middleware));
 
     // ==================== 9. 健康检查（公开） ====================
     let health_routes = Router::new().route("/health", get(health_check));

@@ -269,7 +269,17 @@ impl User {
     ) -> Result<User, DbError> {
         let stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"UPDATE users SET name = COALESCE($1, name), role = COALESCE($2, role), updated_at = NOW() WHERE id = $3 RETURNING *"#,
+            r#"UPDATE users
+               SET name = COALESCE($1, name),
+                   role = COALESCE($2, role),
+                   token_version = CASE
+                       WHEN $2::text IS NOT NULL AND role IS DISTINCT FROM $2::text
+                           THEN token_version + 1
+                       ELSE token_version
+                   END,
+                   updated_at = NOW()
+               WHERE id = $3
+               RETURNING *"#,
             [
                 req.name.clone().into(),
                 req.role.as_ref().map(|role| role.as_str()).into(),

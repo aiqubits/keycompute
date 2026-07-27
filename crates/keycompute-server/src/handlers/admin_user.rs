@@ -11,6 +11,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
+use keycompute_auth::Permission;
 use keycompute_db::models::api_key::ProduceAiKey;
 use keycompute_db::models::tenant::Tenant;
 use keycompute_db::models::user::User;
@@ -66,16 +67,18 @@ fn default_page_size() -> i64 {
     20
 }
 
-/// 一阶保护：禁止非 system 角色对 system 用户执行任何修改操作。
+/// 一阶保护：禁止缺少受保护用户管理权限的调用方修改 system 用户。
 ///
-/// 无论是改名称、改角色还是余额操作，非 system caller 一律拒绝。
+/// 无论是改名称、改角色还是余额操作，未授权 caller 一律拒绝。
 /// 此校验与 `validate_role_change_request` 互补：
 /// - 本函数覆盖"是否能触碰 system 用户"的全局边界
 /// - `validate_role_change_request` 覆盖"角色变更"的精细规则
 fn validate_not_admin_modifying_system(auth: &AuthExtractor, target_user: &User) -> Result<()> {
-    if auth.role != UserRole::System.as_str() && target_user.role == UserRole::System.as_str() {
+    if !auth.has_permission(&Permission::ManageProtectedUsers)
+        && target_user.role == UserRole::System.as_str()
+    {
         return Err(ApiError::Forbidden(
-            "Only system role can modify system users".to_string(),
+            "Protected user management permission required".to_string(),
         ));
     }
     Ok(())
@@ -85,12 +88,12 @@ fn validate_not_admin_modifying_system(auth: &AuthExtractor, target_user: &User)
 ///
 /// 规则（按检查顺序）：
 /// 1. 未请求变更角色 → 直接通过
-/// 2. 仅 system 角色可变更他人角色
+/// 2. 仅有受保护用户管理权限的调用方可变更他人角色
 /// 3. system 角色不能变更自己的角色
 /// 4. system 角色的 role 字段不可被修改（即使 caller 是 system）
 ///
 /// 调用约定：必须和 `validate_not_admin_modifying_system` 搭配使用，
-/// 后者负责拦截非 system caller 对 system 用户的任何修改。
+/// 后者负责拦截未授权 caller 对 system 用户的任何修改。
 fn validate_role_change_request(
     auth: &AuthExtractor,
     target_user_id: Uuid,
@@ -101,9 +104,9 @@ fn validate_role_change_request(
         return Ok(());
     }
 
-    if auth.role != UserRole::System.as_str() {
+    if !auth.has_permission(&Permission::ManageProtectedUsers) {
         return Err(ApiError::Forbidden(
-            "Only system can change user roles".to_string(),
+            "Protected user management permission required".to_string(),
         ));
     }
 
@@ -137,9 +140,11 @@ fn validate_user_delete_request(
         ));
     }
 
-    if target_user.role == UserRole::Admin.as_str() && auth.role != UserRole::System.as_str() {
+    if target_user.role == UserRole::Admin.as_str()
+        && !auth.has_permission(&Permission::ManageProtectedUsers)
+    {
         return Err(ApiError::Forbidden(
-            "Only system can delete admin users".to_string(),
+            "Protected user management permission required".to_string(),
         ));
     }
 
@@ -756,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_role_change_request_requires_system() {
+    fn test_validate_role_change_request_requires_protected_user_permission() {
         let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "admin");
         let target = make_test_user(Uuid::new_v4(), "user");
         let err = validate_role_change_request(
@@ -766,13 +771,14 @@ mod tests {
             &Some(AssignableUserRole::Admin),
         )
         .unwrap_err();
-        assert!(matches!(err, ApiError::Forbidden(msg) if msg.contains("Only system")));
+        assert!(matches!(err, ApiError::Forbidden(msg) if msg.contains("permission required")));
     }
 
     #[test]
     fn test_validate_role_change_request_rejects_self_role_change() {
         let user_id = Uuid::new_v4();
-        let auth = AuthExtractor::new(user_id, Uuid::new_v4(), Uuid::new_v4(), "system");
+        let auth = AuthExtractor::new(user_id, Uuid::new_v4(), Uuid::new_v4(), "system")
+            .with_permissions(vec![Permission::ManageProtectedUsers]);
         let target = make_test_user(user_id, "system");
         let err = validate_role_change_request(
             &auth,
@@ -786,7 +792,8 @@ mod tests {
 
     #[test]
     fn test_validate_role_change_request_rejects_modifying_system_role() {
-        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "system");
+        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "system")
+            .with_permissions(vec![Permission::ManageProtectedUsers]);
         let target = make_test_user(Uuid::new_v4(), "system");
         let err = validate_role_change_request(
             &auth,
@@ -816,16 +823,17 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_user_delete_request_requires_system_for_admin_target() {
+    fn test_validate_user_delete_request_requires_protected_user_permission_for_admin_target() {
         let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "admin");
         let target = make_test_user(Uuid::new_v4(), "admin");
         let err = validate_user_delete_request(&auth, target.id, &target).unwrap_err();
-        assert!(matches!(err, ApiError::Forbidden(msg) if msg.contains("Only system")));
+        assert!(matches!(err, ApiError::Forbidden(msg) if msg.contains("permission required")));
     }
 
     #[test]
     fn test_validate_user_delete_request_allows_system_to_delete_admin_target() {
-        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "system");
+        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "user")
+            .with_permissions(vec![Permission::ManageProtectedUsers]);
         let target = make_test_user(Uuid::new_v4(), "admin");
         assert!(validate_user_delete_request(&auth, target.id, &target).is_ok());
     }

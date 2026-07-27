@@ -71,7 +71,7 @@ impl TenantDistributionRule {
     ) -> Result<TenantDistributionRule, DbError> {
         let txn = db.begin().await?;
 
-        // 事务级 advisory lock：双 key 版本（namespace + tenant），与 run_migrations 的锁风格一致。
+        // 事务级 advisory lock：双 key 分别隔离业务命名空间与租户。
         // hashtext 映射到 int4（2^32 空间），不同租户的 key 存在碰撞可能，但碰撞仅导致
         // 跨租户 upsert 被不必要地串行化（性能影响），不影响正确性——下方的查找与
         // 唯一性校验始终按 tenant_id 过滤。

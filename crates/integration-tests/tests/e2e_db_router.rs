@@ -20,15 +20,13 @@
 //!   DATABASE_READ_URLS=postgres://keycompute:change-me-strong-password@localhost:5433/keycompute,postgres://keycompute:change-me-strong-password@localhost:5434/keycompute
 
 use integration_tests::common::{VerificationChain, generate_test_id};
-use integration_tests::db::{cleanup_test_data, create_test_pool};
+use integration_tests::db::{cleanup_test_data, create_test_pool, initialize_test_schema};
 use keycompute_db::DbError;
 use keycompute_db::db_router::{
     DatabaseConfig as RouterDbConfig, DatabaseReadConfig as RouterReadConfig,
     DatabaseRoutingConfig as RouterRoutingConfig,
 };
-use keycompute_db::{
-    CreateTenantRequest, CreateUserRequest, DbRouter, Tenant, User, run_migrations,
-};
+use keycompute_db::{CreateTenantRequest, CreateUserRequest, DbRouter, Tenant, User};
 use keycompute_types::UserRole;
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 use std::sync::Arc;
@@ -235,14 +233,14 @@ async fn test_replica_read_write_routing() {
         true,
     );
 
-    // 2. 在主库上运行迁移
-    run_migrations(router.write_conn())
+    // 2. 在主库上初始化测试 schema
+    initialize_test_schema(router.write_conn())
         .await
-        .expect("Migration on primary should succeed");
+        .expect("Schema initialization on primary should succeed");
     chain.add_step(
         "keycompute-db",
-        "replica_run_migration",
-        "Migration executed on primary",
+        "replica_initialize_schema",
+        "Schema initialized on primary",
         true,
     );
 
@@ -437,9 +435,9 @@ async fn test_replica_transaction_routing() {
     )
     .await
     .expect("DbRouter creation should succeed");
-    run_migrations(router.write_conn())
+    initialize_test_schema(router.write_conn())
         .await
-        .expect("Migration should succeed");
+        .expect("Schema initialization should succeed");
 
     let test_id = generate_test_id();
     cleanup_test_data(router.write_conn(), &test_id)
@@ -573,9 +571,9 @@ async fn test_degenerate_single_db_mode() {
     );
 
     // 验证在退化模式下读写正常
-    run_migrations(router_single.write_conn())
+    initialize_test_schema(router_single.write_conn())
         .await
-        .expect("Migration should succeed");
+        .expect("Schema initialization should succeed");
     let tenant2 = Tenant::create(
         router_single.as_ref(),
         &CreateTenantRequest {

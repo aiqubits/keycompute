@@ -159,32 +159,48 @@ impl UserBalance {
         order_id: Option<Uuid>,
         description: Option<&str>,
     ) -> Result<(UserBalance, BalanceTransaction), DbError> {
+        // 先物化余额行，再加锁读取。如果两笔“首次充值”并发，
+        // 直接 SELECT FOR UPDATE 会让两个事务都读到空集，导致第二笔
+        // balance_transactions 的 balance_before/after 与实际余额不一致。
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"INSERT INTO user_balances
+               (user_id, tenant_id, available_balance, frozen_balance, total_recharged, total_consumed)
+               VALUES ($1, $2, 0, 0, 0, 0)
+               ON CONFLICT (user_id) DO NOTHING"#,
+            [user_id.into(), tenant_id.into()],
+        ))
+        .await?;
+
         // 获取当前余额（加锁）
         let lock_stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
             "SELECT * FROM user_balances WHERE user_id = $1 FOR UPDATE",
             [user_id.into()],
         );
-        let balance = UserBalance::find_by_statement(lock_stmt).one(tx).await?;
-
-        let balance_before = balance
-            .as_ref()
-            .map(|b| b.available_balance)
-            .unwrap_or(Decimal::ZERO);
-        let balance_after = balance_before + amount;
-
-        let effective_tenant_id = balance.as_ref().map(|b| b.tenant_id).unwrap_or(tenant_id);
-
-        // 更新或创建余额
-        let upsert_stmt = Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"INSERT INTO user_balances (user_id, tenant_id, available_balance, total_recharged) VALUES ($1, $2, $3, $3) ON CONFLICT (user_id) DO UPDATE SET available_balance = user_balances.available_balance + $3, total_recharged = user_balances.total_recharged + $3, updated_at = NOW() RETURNING *"#,
-            [user_id.into(), effective_tenant_id.into(), amount.into()],
-        );
-        let updated_balance = UserBalance::find_by_statement(upsert_stmt)
+        let balance = UserBalance::find_by_statement(lock_stmt)
             .one(tx)
             .await?
-            .ok_or_else(|| DbError::Other("recharge upsert failed".to_string()))?;
+            .ok_or_else(|| DbError::Other("recharge balance row disappeared".to_string()))?;
+
+        let balance_before = balance.available_balance;
+        let balance_after = balance_before + amount;
+
+        // 已持有行锁，直接更新即可得到与流水一致的前后余额。
+        let update_stmt = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"UPDATE user_balances
+               SET available_balance = available_balance + $1,
+                   total_recharged = total_recharged + $1,
+                   updated_at = NOW()
+               WHERE user_id = $2
+               RETURNING *"#,
+            [amount.into(), user_id.into()],
+        );
+        let updated_balance = UserBalance::find_by_statement(update_stmt)
+            .one(tx)
+            .await?
+            .ok_or_else(|| DbError::Other("recharge balance update failed".to_string()))?;
 
         // 记录交易
         let transaction = BalanceTransaction::create_internal(

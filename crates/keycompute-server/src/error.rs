@@ -81,7 +81,13 @@ impl IntoResponse for ApiError {
             ApiError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             ApiError::Verification(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
             ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+            ApiError::Internal(msg) => {
+                tracing::error!(error = %msg, "Internal API error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
+            }
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
@@ -250,5 +256,20 @@ mod tests {
             error_type(&ApiError::RateLimit("test".to_string())),
             "rate_limit_error"
         );
+    }
+
+    #[tokio::test]
+    async fn internal_error_response_hides_details() {
+        let response =
+            ApiError::Internal("duplicate key violates constraint secret_table_key".to_string())
+                .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("Internal server error"));
+        assert!(!body.contains("secret_table_key"));
+        assert!(!body.contains("duplicate key"));
     }
 }

@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 /// 认证提取器
 ///
-/// 从请求头中提取 API Key 并解析用户信息
+/// 从请求头中提取 JWT 或 API Key，并解析用户信息与权限
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthExtractor {
     /// 用户 ID
@@ -95,9 +95,15 @@ impl AuthExtractor {
         }
     }
 
-    /// 检查是否是管理员
+    /// 检查是否具有系统管理权限。
     pub fn is_admin(&self) -> bool {
-        self.role == "admin" || self.role == "system"
+        self.has_permission(&Permission::SystemAdmin)
+    }
+
+    /// 使用认证阶段根据 AuthType 构建的权限集合做授权判断。
+    /// API Key 即使归属于 admin 用户，也不会因 role 字符串获得后台权限。
+    pub fn has_permission(&self, permission: &Permission) -> bool {
+        self.permissions.contains(permission)
     }
 }
 
@@ -302,5 +308,16 @@ mod tests {
     fn test_request_id_new() {
         let id = RequestId::new();
         assert_ne!(id.0, Uuid::nil());
+    }
+
+    #[test]
+    fn admin_role_without_system_permission_is_not_authorized() {
+        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "admin");
+        assert!(!auth.has_permission(&Permission::SystemAdmin));
+        assert!(!auth.is_admin());
+
+        let jwt_admin = auth.with_permissions(vec![Permission::SystemAdmin]);
+        assert!(jwt_admin.has_permission(&Permission::SystemAdmin));
+        assert!(jwt_admin.is_admin());
     }
 }

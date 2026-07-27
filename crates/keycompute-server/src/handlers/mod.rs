@@ -115,8 +115,9 @@ pub use node_tips::{
 
 // 支付相关
 pub use payment::{
-    admin_list_payment_orders, alipay_notify, create_payment_order, get_my_balance,
-    get_payment_order, list_my_payment_orders, sync_payment_order,
+    admin_list_payment_orders, admin_payment_providers, admin_verify_payment_provider,
+    alipay_notify, create_payment_order, get_my_balance, get_payment_order, list_my_payment_orders,
+    list_payment_methods, sync_payment_order, wechatpay_notify,
 };
 
 fn normalize_public_base_url(base_url: &str) -> Option<String> {

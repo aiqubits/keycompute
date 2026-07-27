@@ -7,6 +7,7 @@ pub mod error;
 pub mod extractors;
 pub mod handlers;
 pub mod middleware;
+pub mod payment_registry;
 pub mod providers;
 pub mod router;
 pub mod state;

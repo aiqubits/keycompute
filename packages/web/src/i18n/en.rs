@@ -594,8 +594,6 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("payments.no_recharge_records", "No recharge records yet");
     m.insert("payments.order_no", "Order No.");
     m.insert("payments.subject", "Subject");
-    m.insert("payments.usage_details", "Usage Details");
-    m.insert("payments.no_usage_records", "No usage records yet");
 
     // ── Payment Orders ──────────────────────────
     m.insert(
@@ -608,11 +606,18 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     );
     m.insert("payment_orders.empty", "No payment orders yet");
     m.insert("payment_orders.col_user", "User");
+    m.insert("payment_orders.provider_switch", "Admin switch");
+    m.insert("payment_orders.provider_config", "Configuration");
+    m.insert("payment_orders.verify_provider", "Verify provider");
+    m.insert("payment_orders.verifying_provider", "Verifying...");
+    m.insert("common.configured", "Configured");
+    m.insert("common.not_configured", "Not configured");
     m.insert("payment_orders.pagination", "{total} items");
     m.insert("payment_orders.filter_all", "All");
     m.insert("payment_orders.filter_pending", "Pending");
     m.insert("payment_orders.filter_paid", "Paid");
     m.insert("payment_orders.filter_failed", "Failed");
+    m.insert("payment_orders.filter_closed", "Closed");
 
     // ── Recharge ──────────────────────────────
     m.insert("recharge.title", "Account Recharge");
@@ -620,6 +625,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("recharge.payment_method", "Payment Method");
     m.insert("recharge.alipay", "Alipay");
     m.insert("recharge.wechat_pay", "WeChat Pay");
+    m.insert("recharge.no_payment_methods", "No payment method is currently available. Please try again later or contact an administrator.");
     m.insert("recharge.amount_label", "Amount (CNY)");
     m.insert("recharge.custom_amount", "Or enter a custom amount");
     m.insert("recharge.creating_order", "Creating order...");
@@ -649,10 +655,18 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
         "recharge.scan_pay",
         "Please use Alipay or other scanner to complete payment",
     );
+    m.insert(
+        "recharge.scan_wechat",
+        "Scan the QR code with WeChat to complete payment",
+    );
+    m.insert(
+        "recharge.scan_alipay",
+        "Scan the QR code with Alipay to complete payment",
+    );
     m.insert("recharge.qr_code_alt", "Payment QR Code");
     m.insert("recharge.qr_code_content", "QR Code content:");
     m.insert("recharge.confirm_paid", "Confirm Paid");
-    m.insert("recharge.cancel_order", "Cancel Order");
+    m.insert("recharge.pay_later", "Pay Later");
     m.insert("recharge.success_title", "Recharge Successful!");
     m.insert(
         "recharge.success_desc",
@@ -740,6 +754,24 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
         "Affects amount display in the console, default order currency, and some frontend labels.",
     );
     m.insert("settings.min_recharge_label", "Minimum Recharge Amount");
+    m.insert("settings.max_recharge_label", "Maximum Recharge Amount");
+    m.insert(
+        "settings.max_recharge_desc",
+        "Limits the amount of a single recharge order.",
+    );
+    m.insert("settings.payment_title", "Payment Providers");
+    m.insert(
+        "settings.payment_desc",
+        "Admin switches only control new orders; misconfigured providers remain hidden from users.",
+    );
+    m.insert(
+        "settings.alipay_enabled_desc",
+        "Allow Alipay to create new recharge orders.",
+    );
+    m.insert(
+        "settings.wechatpay_enabled_desc",
+        "Allow WeChat Pay Native to create new recharge orders.",
+    );
     m.insert(
         "settings.min_recharge_desc",
         "Prevents extremely small recharge orders from entering the payment flow.",

@@ -156,7 +156,7 @@ pub async fn rate_limit_middleware(
     };
 
     // 使用 AuthService 验证 token 获取真实的用户信息
-    let (rate_key, tenant_id) = match state.auth.verify_api_key(token).await {
+    let (rate_key, tenant_id) = match state.auth.verify_token(token).await {
         Ok(auth_context) => {
             // 使用真实的 user_id, tenant_id, produce_ai_key_id 创建限流键
             (
@@ -305,13 +305,48 @@ pub async fn public_auth_rate_limit_middleware(
     response
 }
 
+/// 支付平台回调按可信代理提供的来源 IP 限流，避免无效验签请求放大为密码学和数据库压力。
+#[derive(Clone, Debug)]
+pub struct PaymentNotifyClientIp(pub String);
+
+pub async fn payment_notify_rate_limit_middleware(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let Some(identity) = extract_client_ip_from_headers(req.headers()) else {
+        // 支付回调必须经过会覆盖 X-Real-IP 的可信代理。缺失或非法时
+        // fail closed，避免直连应用的请求绕过限流。
+        tracing::error!("Payment callback has no valid trusted X-Real-IP");
+        return service_unavailable_response();
+    };
+    let scope = payment_notify_scope(req.uri().path());
+    let config = RateLimitConfig::new(3000, u32::MAX);
+    if let Err(response) = enforce_public_rate_limit(&state, scope, "ip", &identity, &config).await
+    {
+        return response;
+    }
+    req.extensions_mut().insert(PaymentNotifyClientIp(identity));
+    next.run(req).await
+}
+
+fn payment_notify_scope(path: &str) -> &'static str {
+    if path.ends_with("/alipay") {
+        "payment-notify-alipay"
+    } else if path.ends_with("/wechatpay") {
+        "payment-notify-wechatpay"
+    } else {
+        "payment-notify-unknown"
+    }
+}
+
 pub(crate) fn extract_client_ip_from_headers(headers: &HeaderMap) -> Option<String> {
     if let Some(real_ip) = headers.get("x-real-ip")
         && let Ok(value) = real_ip.to_str()
     {
         let ip = value.trim();
-        if !ip.is_empty() {
-            return Some(ip.to_string());
+        if let Ok(parsed) = ip.parse::<std::net::IpAddr>() {
+            return Some(parsed.to_string());
         }
     }
 
@@ -684,6 +719,8 @@ pub fn extract_auth_from_extensions(req: &Request) -> Option<AuthExtractor> {
 /// - /health - 健康检查
 /// - /api/v1/settings/public - 公开设置（前端需要获取维护状态）
 /// - /api/v1/auth/login - 登录（管理员需要登录）
+/// - /api/v1/auth/refresh-token - 刷新登录状态
+/// - /api/v1/payments/notify/* - 支付平台回调（仍由验签和专用限流保护）
 ///
 /// # 使用示例
 /// ```rust,ignore
@@ -699,14 +736,7 @@ pub async fn maintenance_mode_middleware(
 
     // 排除不需要维护模式检查的路径
     let path = req.uri().path();
-    let excluded_paths = [
-        "/health",
-        "/api/v1/settings/public",
-        "/api/v1/auth/login",
-        "/api/v1/auth/refresh-token",
-    ];
-
-    if excluded_paths.iter().any(|p| path.starts_with(p)) {
+    if is_maintenance_excluded_path(path) {
         return next.run(req).await;
     }
 
@@ -770,11 +800,26 @@ pub async fn maintenance_mode_middleware(
         .into_response()
 }
 
+fn is_maintenance_excluded_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/health"
+            | "/api/v1/settings/public"
+            | "/api/v1/auth/login"
+            | "/api/v1/auth/refresh-token"
+            | "/api/v1/payments/notify/alipay"
+            | "/api/v1/payments/notify/wechatpay"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use crate::state::{AppStateConfig, JwtConfig};
     use axum::http::Request;
+    use axum::{Router, body::Body, middleware::from_fn_with_state, routing::get};
+    use keycompute_auth::JwtValidator;
+    use tower::ServiceExt;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -802,7 +847,8 @@ mod tests {
     fn test_extract_auth_from_extensions_present() {
         // 测试从扩展中提取已注入的 AuthExtractor
         let mut req: Request<Body> = Request::new(Body::empty());
-        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "admin");
+        let auth = AuthExtractor::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "admin")
+            .with_permissions(vec![Permission::SystemAdmin]);
         req.extensions_mut().insert(auth.clone());
 
         let result = extract_auth_from_extensions(&req);
@@ -822,6 +868,149 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_client_ip_rejects_invalid_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-real-ip",
+            HeaderValue::from_static("attacker-controlled-bucket"),
+        );
+        assert!(extract_client_ip_from_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_payment_callbacks_use_separate_rate_limit_scopes() {
+        assert_eq!(
+            payment_notify_scope("/api/v1/payments/notify/alipay"),
+            "payment-notify-alipay"
+        );
+        assert_eq!(
+            payment_notify_scope("/api/v1/payments/notify/wechatpay"),
+            "payment-notify-wechatpay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_payment_notify_middleware_fails_closed_without_trusted_ip() {
+        let state = AppState::with_config(AppStateConfig::default());
+        let app = Router::new()
+            .route(
+                "/api/v1/payments/notify/alipay",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(from_fn_with_state(
+                state.clone(),
+                payment_notify_rate_limit_middleware,
+            ))
+            .with_state(state);
+
+        // 缺失 X-Real-IP：未经可信代理直连，必须 fail-closed 拒绝
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/payments/notify/alipay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // 非法 X-Real-IP（非 IP 字符串）：同样必须拒绝
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/payments/notify/alipay")
+                    .header("x-real-ip", "attacker-controlled-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // 可信代理注入的合法 IP：正常放行到 handler
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/payments/notify/alipay")
+                    .header("x-real-ip", "203.0.113.7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn test_payment_callbacks_bypass_maintenance_mode_by_exact_path() {
+        assert!(is_maintenance_excluded_path(
+            "/api/v1/payments/notify/alipay"
+        ));
+        assert!(is_maintenance_excluded_path(
+            "/api/v1/payments/notify/wechatpay"
+        ));
+        assert!(!is_maintenance_excluded_path(
+            "/api/v1/payments/notify/alipay/extra"
+        ));
+        assert!(!is_maintenance_excluded_path("/health-check"));
+    }
+
+    #[tokio::test]
+    async fn test_valid_jwt_requests_are_rate_limited() {
+        let secret = "middleware-rate-limit-test-secret";
+        let issuer = "keycompute-test";
+        let state = AppState::with_config(AppStateConfig {
+            jwt: JwtConfig {
+                secret: secret.to_string(),
+                issuer: issuer.to_string(),
+                expiry_secs: 3600,
+            },
+            ..AppStateConfig::default()
+        });
+        let token = JwtValidator::new(secret, issuer)
+            .generate_token(Uuid::new_v4(), Uuid::new_v4(), "user")
+            .unwrap();
+        let app = Router::new()
+            .route("/rate-limited", get(|| async { StatusCode::NO_CONTENT }))
+            .layer(from_fn_with_state(state.clone(), rate_limit_middleware))
+            .with_state(state);
+
+        for request_number in 1..=keycompute_ratelimit::DEFAULT_RPM_LIMIT {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/rate-limited")
+                        .header("Authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NO_CONTENT,
+                "request {request_number} should remain inside the RPM allowance"
+            );
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/rate-limited")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
     fn test_public_auth_cookie_signature_validation() {
         let secret = "super-secret";
         let cookie_value = sign_public_auth_cookie_value(secret, "identity-123");
@@ -831,5 +1020,69 @@ mod tests {
 
         let tampered = cookie_value.replacen("identity-123", "identity-456", 1);
         assert!(validate_public_auth_cookie_value(secret, &tampered).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_admin_auth_middleware_gates_admin_payment_routes_by_permission() {
+        let secret = "admin-route-permission-test-secret";
+        let issuer = "keycompute-test";
+        let state = AppState::with_config(AppStateConfig {
+            jwt: JwtConfig {
+                secret: secret.to_string(),
+                issuer: issuer.to_string(),
+                expiry_secs: 3600,
+            },
+            ..AppStateConfig::default()
+        });
+        let app = Router::new()
+            .route(
+                "/api/v1/admin/payments/orders",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(from_fn_with_state(state.clone(), admin_auth_middleware))
+            .with_state(state);
+        let request = |auth_header: Option<String>| {
+            let mut builder = Request::builder().uri("/api/v1/admin/payments/orders");
+            if let Some(value) = auth_header {
+                builder = builder.header("Authorization", value);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        let validator = JwtValidator::new(secret, issuer);
+
+        // 无认证：401
+        let response = app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 普通用户 JWT：无 SystemAdmin 权限，403
+        let user_token = validator
+            .generate_token(Uuid::new_v4(), Uuid::new_v4(), "user")
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(Some(format!("Bearer {user_token}"))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // API Key 格式凭据：无数据库可验证，认证失败 401（绝不放行）
+        let response = app
+            .clone()
+            .oneshot(request(Some(
+                "Bearer sk-0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // admin JWT：持有 SystemAdmin，放行到 handler
+        let admin_token = validator
+            .generate_token(Uuid::new_v4(), Uuid::new_v4(), "admin")
+            .unwrap();
+        let response = app
+            .oneshot(request(Some(format!("Bearer {admin_token}"))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 }

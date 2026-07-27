@@ -17,6 +17,7 @@ keycompute-observability = { workspace = true }
 keycompute-config = { workspace = true }
 keycompute-emailserver = { path = "../keycompute-emailserver" }
 keycompute-alipay = { path = "../keycompute-payment/keycompute-alipay" }
+keycompute-wechatpay = { workspace = true }
 keycompute-cache = { workspace = true }
 node-gateway = { path = "../node-gateway" }
 llm-gateway = { workspace = true }
@@ -46,9 +47,12 @@ tokio-stream = "0.1"
 async-trait = "0.1"
 async-stream = "0.3"
 anyhow = "1.0"
+thiserror = "2"
 percent-encoding = "2"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 url = "2"
 deadpool-redis = { version = "0.18", optional = true }
 

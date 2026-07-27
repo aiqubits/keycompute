@@ -4,15 +4,17 @@
 
 use crate::config::AlipayConfig;
 use crate::sign::{AlipaySigner, AlipayVerifier, sign_params, verify_params};
+use chrono::{DateTime, FixedOffset, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::value::RawValue;
 use std::collections::HashMap;
 
 /// 支付宝客户端
 pub struct AlipayClient {
     config: AlipayConfig,
     signer: AlipaySigner,
-    verifier: AlipayVerifier,
+    verifiers: Vec<AlipayVerifier>,
     http_client: Client,
 }
 
@@ -24,8 +26,13 @@ impl AlipayClient {
         let signer = AlipaySigner::from_pem(&config.private_key)
             .map_err(|e| ClientError::SignError(e.to_string()))?;
 
-        let verifier = AlipayVerifier::from_pem(&config.alipay_public_key)
-            .map_err(|e| ClientError::SignError(e.to_string()))?;
+        let verifiers = std::iter::once(&config.alipay_public_key)
+            .chain(config.previous_alipay_public_keys.iter())
+            .map(|public_key| {
+                AlipayVerifier::from_pem(public_key)
+                    .map_err(|e| ClientError::SignError(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let http_client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -35,7 +42,7 @@ impl AlipayClient {
         Ok(Self {
             config,
             signer,
-            verifier,
+            verifiers,
             http_client,
         })
     }
@@ -80,12 +87,12 @@ impl AlipayClient {
     }
 
     /// 发送API请求
-    async fn send_request<T: DeserializeOwned>(
+    async fn send_request(
         &self,
         method: &str,
         biz_content: &str,
         extra_params: Vec<(String, String)>,
-    ) -> Result<T, ClientError> {
+    ) -> Result<String, ClientError> {
         let params = self.build_signed_params(method, biz_content, extra_params)?;
 
         let response = self
@@ -96,13 +103,39 @@ impl AlipayClient {
             .await
             .map_err(ClientError::HttpError)?;
 
-        let text = response.text().await.map_err(ClientError::HttpError)?;
+        response.text().await.map_err(ClientError::HttpError)
+    }
 
-        // 解析响应
-        let result: T = serde_json::from_str(&text)
-            .map_err(|e| ClientError::ParseError(format!("{}: {}", e, text)))?;
-
-        Ok(result)
+    fn decode_signed_response<T: DeserializeOwned>(
+        &self,
+        text: &str,
+        response_key: &str,
+    ) -> Result<T, ClientError> {
+        let envelope: HashMap<String, Box<RawValue>> = serde_json::from_str(text)
+            .map_err(|e| ClientError::ParseError(format!("{e}: {text}")))?;
+        let response = envelope
+            .get(response_key)
+            .ok_or_else(|| ClientError::ParseError(format!("missing {response_key}")))?;
+        let sign_raw = envelope.get("sign").ok_or(ClientError::MissingSign)?;
+        let signature: String = serde_json::from_str(sign_raw.get())
+            .map_err(|e| ClientError::ParseError(format!("invalid response signature: {e}")))?;
+        let verified = self
+            .verifiers
+            .iter()
+            .try_fold(false, |verified, verifier| {
+                if verified {
+                    Ok(true)
+                } else {
+                    verifier
+                        .verify(response.get(), &signature)
+                        .map_err(|e| ClientError::SignError(e.to_string()))
+                }
+            })?;
+        if !verified {
+            return Err(ClientError::InvalidResponseSignature);
+        }
+        serde_json::from_str(response.get())
+            .map_err(|e| ClientError::ParseError(format!("{e}: {}", response.get())))
     }
 
     /// 验证异步通知签名
@@ -114,8 +147,14 @@ impl AlipayClient {
             .map(|(_, v)| v.as_str())
             .ok_or(ClientError::MissingSign)?;
 
-        verify_params(params, sign, &self.verifier)
-            .map_err(|e| ClientError::SignError(e.to_string()))
+        for verifier in &self.verifiers {
+            match verify_params(params, sign, verifier) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => return Err(ClientError::SignError(error.to_string())),
+            }
+        }
+        Ok(false)
     }
 
     /// 生成支付页面URL（电脑网站支付）
@@ -125,6 +164,7 @@ impl AlipayClient {
         total_amount: &str,
         subject: &str,
         body: Option<&str>,
+        expires_at: DateTime<Utc>,
     ) -> Result<String, ClientError> {
         let biz_content = PagePayBizContent {
             out_trade_no: out_trade_no.to_string(),
@@ -132,6 +172,7 @@ impl AlipayClient {
             subject: subject.to_string(),
             body: body.map(|s| s.to_string()),
             product_code: "FAST_INSTANT_TRADE_PAY".to_string(),
+            time_expire: format_alipay_time(expires_at, true),
         };
 
         let biz_json = serde_json::to_string(&biz_content)
@@ -157,6 +198,7 @@ impl AlipayClient {
         total_amount: &str,
         subject: &str,
         body: Option<&str>,
+        expires_at: DateTime<Utc>,
     ) -> Result<String, ClientError> {
         let biz_content = WapPayBizContent {
             out_trade_no: out_trade_no.to_string(),
@@ -164,6 +206,7 @@ impl AlipayClient {
             subject: subject.to_string(),
             body: body.map(|s| s.to_string()),
             product_code: "QUICK_WAP_WAY".to_string(),
+            time_expire: format_alipay_time(expires_at, false),
         };
 
         let biz_json = serde_json::to_string(&biz_content)
@@ -190,11 +233,10 @@ impl AlipayClient {
         let biz_json = serde_json::to_string(&biz_content)
             .map_err(|e| ClientError::ParseError(e.to_string()))?;
 
-        let response: QueryResponseWrapper = self
+        let response = self
             .send_request("alipay.trade.query", &biz_json, vec![])
             .await?;
-
-        Ok(response.alipay_trade_query_response)
+        self.decode_signed_response(&response, "alipay_trade_query_response")
     }
 
     /// 关闭订单
@@ -206,11 +248,10 @@ impl AlipayClient {
         let biz_json = serde_json::to_string(&biz_content)
             .map_err(|e| ClientError::ParseError(e.to_string()))?;
 
-        let response: CloseResponseWrapper = self
+        let response = self
             .send_request("alipay.trade.close", &biz_json, vec![])
             .await?;
-
-        Ok(response.alipay_trade_close_response)
+        self.decode_signed_response(&response, "alipay_trade_close_response")
     }
 
     /// 扫码支付（当面付）- 生成支付二维码
@@ -223,12 +264,14 @@ impl AlipayClient {
         total_amount: &str,
         subject: &str,
         body: Option<&str>,
+        timeout_minutes: i32,
     ) -> Result<PrecreateResponse, ClientError> {
         let biz_content = PrecreateBizContent {
             out_trade_no: out_trade_no.to_string(),
             total_amount: total_amount.to_string(),
             subject: subject.to_string(),
             body: body.map(|s| s.to_string()),
+            timeout_express: format!("{timeout_minutes}m"),
         };
 
         let biz_json = serde_json::to_string(&biz_content)
@@ -236,11 +279,10 @@ impl AlipayClient {
 
         let extra_params = vec![("notify_url".to_string(), self.config.notify_url.clone())];
 
-        let response: PrecreateResponseWrapper = self
+        let response = self
             .send_request("alipay.trade.precreate", &biz_json, extra_params)
             .await?;
-
-        Ok(response.alipay_trade_precreate_response)
+        self.decode_signed_response(&response, "alipay_trade_precreate_response")
     }
 
     /// 获取配置
@@ -257,6 +299,7 @@ struct PagePayBizContent {
     subject: String,
     body: Option<String>,
     product_code: String,
+    time_expire: String,
 }
 
 /// 手机网站支付业务参数
@@ -267,6 +310,7 @@ struct WapPayBizContent {
     subject: String,
     body: Option<String>,
     product_code: String,
+    time_expire: String,
 }
 
 /// 查询订单业务参数
@@ -288,12 +332,18 @@ struct PrecreateBizContent {
     total_amount: String,
     subject: String,
     body: Option<String>,
+    timeout_express: String,
 }
 
-/// 查询订单响应包装
-#[derive(Debug, Deserialize)]
-struct QueryResponseWrapper {
-    alipay_trade_query_response: QueryResponse,
+fn format_alipay_time(expires_at: DateTime<Utc>, include_seconds: bool) -> String {
+    let china_standard_time =
+        FixedOffset::east_opt(8 * 60 * 60).expect("China standard time offset is valid");
+    let expires_at = expires_at.with_timezone(&china_standard_time);
+    if include_seconds {
+        expires_at.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        expires_at.format("%Y-%m-%d %H:%M").to_string()
+    }
 }
 
 /// 查询订单响应
@@ -349,12 +399,6 @@ impl QueryResponse {
     }
 }
 
-/// 关闭订单响应包装
-#[derive(Debug, Deserialize)]
-struct CloseResponseWrapper {
-    alipay_trade_close_response: CloseResponse,
-}
-
 /// 关闭订单响应
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloseResponse {
@@ -370,12 +414,6 @@ impl CloseResponse {
     pub fn is_success(&self) -> bool {
         self.code == "10000"
     }
-}
-
-/// 扫码支付响应包装
-#[derive(Debug, Deserialize)]
-struct PrecreateResponseWrapper {
-    alipay_trade_precreate_response: PrecreateResponse,
 }
 
 /// 扫码支付响应
@@ -427,6 +465,8 @@ pub enum ClientError {
     ParseError(String),
     #[error("缺少签名参数")]
     MissingSign,
+    #[error("支付宝响应签名验证失败")]
+    InvalidResponseSignature,
 }
 
 impl From<crate::config::ConfigError> for ClientError {
@@ -456,6 +496,31 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sign::AlipaySigner;
+    use rsa::{
+        RsaPrivateKey,
+        pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
+        rand_core::OsRng,
+    };
+
+    fn signed_response_client() -> (AlipayClient, AlipaySigner) {
+        let merchant = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let platform = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let config = AlipayConfig {
+            app_id: "test-app".to_string(),
+            private_key: merchant.to_pkcs8_pem(LineEnding::LF).unwrap().to_string(),
+            alipay_public_key: platform
+                .to_public_key()
+                .to_public_key_pem(LineEnding::LF)
+                .unwrap(),
+            notify_url: "https://example.com/alipay-notify".to_string(),
+            ..AlipayConfig::default()
+        };
+        let signer =
+            AlipaySigner::from_pem(platform.to_pkcs8_pem(LineEnding::LF).unwrap().as_str())
+                .unwrap();
+        (AlipayClient::new(config).unwrap(), signer)
+    }
 
     #[test]
     fn test_query_response_is_success() {
@@ -475,5 +540,118 @@ mod tests {
 
         assert!(response.is_success());
         assert!(response.is_trade_success());
+    }
+
+    #[test]
+    fn verifies_raw_api_response_before_decoding() {
+        let (client, platform) = signed_response_client();
+        let raw = r#"{"code":"10000","msg":"Success","out_trade_no":"KC1","trade_status":"TRADE_SUCCESS","total_amount":"1.00"}"#;
+        let signature = platform.sign(raw).unwrap();
+        let envelope = format!(
+            r#"{{"alipay_trade_query_response":{raw},"sign":{}}}"#,
+            serde_json::to_string(&signature).unwrap()
+        );
+        let response: QueryResponse = client
+            .decode_signed_response(&envelope, "alipay_trade_query_response")
+            .unwrap();
+        assert_eq!(response.out_trade_no.as_deref(), Some("KC1"));
+
+        let tampered = envelope.replace("1.00", "9.00");
+        assert!(matches!(
+            client
+                .decode_signed_response::<QueryResponse>(&tampered, "alipay_trade_query_response"),
+            Err(ClientError::InvalidResponseSignature)
+        ));
+    }
+
+    #[test]
+    fn retained_public_key_verifies_delayed_response_after_rotation() {
+        let merchant = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let current_platform = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let previous_platform = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let config = AlipayConfig {
+            app_id: "test-app".to_string(),
+            private_key: merchant.to_pkcs8_pem(LineEnding::LF).unwrap().to_string(),
+            alipay_public_key: current_platform
+                .to_public_key()
+                .to_public_key_pem(LineEnding::LF)
+                .unwrap(),
+            previous_alipay_public_keys: vec![
+                previous_platform
+                    .to_public_key()
+                    .to_public_key_pem(LineEnding::LF)
+                    .unwrap(),
+            ],
+            notify_url: "https://example.com/alipay-notify".to_string(),
+            ..AlipayConfig::default()
+        };
+        let previous_signer = AlipaySigner::from_pem(
+            previous_platform
+                .to_pkcs8_pem(LineEnding::LF)
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+        let client = AlipayClient::new(config).unwrap();
+        let raw = r#"{"code":"10000","msg":"Success","out_trade_no":"KC-OLD"}"#;
+        let signature = previous_signer.sign(raw).unwrap();
+        let envelope = format!(
+            r#"{{"alipay_trade_query_response":{raw},"sign":{}}}"#,
+            serde_json::to_string(&signature).unwrap()
+        );
+
+        let response: QueryResponse = client
+            .decode_signed_response(&envelope, "alipay_trade_query_response")
+            .unwrap();
+        assert_eq!(response.out_trade_no.as_deref(), Some("KC-OLD"));
+
+        let mut notify_params = vec![
+            ("app_id".to_string(), "test-app".to_string()),
+            ("out_trade_no".to_string(), "KC-OLD".to_string()),
+            ("trade_status".to_string(), "TRADE_SUCCESS".to_string()),
+        ];
+        let notify_signature = sign_params(&notify_params, &previous_signer).unwrap();
+        notify_params.push(("sign".to_string(), notify_signature));
+        assert!(client.verify_notify(&notify_params).unwrap());
+    }
+
+    #[test]
+    fn all_payment_scenes_serialize_provider_expiration() {
+        let expires_at = DateTime::parse_from_rfc3339("2026-07-27T04:05:06Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let page = PagePayBizContent {
+            out_trade_no: "page-order".to_string(),
+            total_amount: "1.00".to_string(),
+            subject: "recharge".to_string(),
+            body: None,
+            product_code: "FAST_INSTANT_TRADE_PAY".to_string(),
+            time_expire: format_alipay_time(expires_at, true),
+        };
+        let wap = WapPayBizContent {
+            out_trade_no: "wap-order".to_string(),
+            total_amount: "1.00".to_string(),
+            subject: "recharge".to_string(),
+            body: None,
+            product_code: "QUICK_WAP_WAY".to_string(),
+            time_expire: format_alipay_time(expires_at, false),
+        };
+        let qr = PrecreateBizContent {
+            out_trade_no: "qr-order".to_string(),
+            total_amount: "1.00".to_string(),
+            subject: "recharge".to_string(),
+            body: None,
+            timeout_express: "30m".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(page).unwrap()["time_expire"],
+            "2026-07-27 12:05:06"
+        );
+        assert_eq!(
+            serde_json::to_value(wap).unwrap()["time_expire"],
+            "2026-07-27 12:05"
+        );
+        assert_eq!(serde_json::to_value(qr).unwrap()["timeout_express"], "30m");
     }
 }

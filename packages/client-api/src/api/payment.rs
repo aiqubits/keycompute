@@ -44,15 +44,19 @@ impl PaymentApi {
         } else {
             "/api/v1/payments/orders".to_string()
         };
-        // 后端返回 { orders: Vec<PaymentOrderItem>, total: i64 }
-        #[derive(Deserialize)]
-        struct PaymentOrderListResponse {
-            orders: Vec<PaymentOrderSummary>,
-            #[allow(dead_code)]
-            total: i64,
-        }
-        let resp: PaymentOrderListResponse = self.client.get_json(&path, Some(token)).await?;
+        let resp: PaymentOrderPage = self.client.get_json(&path, Some(token)).await?;
         Ok(resp.orders)
+    }
+
+    pub async fn list_my_payment_orders_page(
+        &self,
+        params: Option<&PaymentQueryParams>,
+        token: &str,
+    ) -> Result<PaymentOrderPage> {
+        let path = params
+            .map(|params| format!("/api/v1/payments/orders?{}", params.to_query_string()))
+            .unwrap_or_else(|| "/api/v1/payments/orders".to_string());
+        self.client.get_json(&path, Some(token)).await
     }
 
     /// 获取订单详情
@@ -65,12 +69,12 @@ impl PaymentApi {
     /// 同步订单状态
     pub async fn sync_payment_order(
         &self,
-        out_trade_no: &str,
+        order_id: &str,
         token: &str,
     ) -> Result<SyncPaymentOrderResponse> {
         self.client
             .post_json(
-                &format!("/api/v1/payments/sync/{}", out_trade_no),
+                &format!("/api/v1/payments/orders/{order_id}/sync"),
                 &serde_json::json!({}),
                 Some(token),
             )
@@ -83,6 +87,13 @@ impl PaymentApi {
             .get_json("/api/v1/payments/balance", Some(token))
             .await
     }
+
+    /// 获取当前可接受新订单的支付渠道。
+    pub async fn get_payment_methods(&self, token: &str) -> Result<PaymentMethodsResponse> {
+        self.client
+            .get_json("/api/v1/payments/methods", Some(token))
+            .await
+    }
 }
 
 /// 创建支付订单请求
@@ -91,16 +102,38 @@ pub struct CreatePaymentOrderRequest {
     pub amount: String,
     pub subject: String,
     pub body: Option<String>,
+    #[serde(skip_serializing_if = "is_default_alipay")]
+    pub payment_method: String,
     pub payment_type: String,
 }
 
+fn is_default_alipay(value: &String) -> bool {
+    value == "alipay"
+}
+
 impl CreatePaymentOrderRequest {
+    #[deprecated(note = "f64 无法精确表达两位小数金额，请改用 new_for_method 传入字符串金额")]
     pub fn new(amount: f64, subject: impl Into<String>, payment_type: impl Into<String>) -> Self {
         Self {
             amount: format_amount(amount),
             subject: subject.into(),
             body: None,
+            payment_method: "alipay".to_string(),
             payment_type: payment_type.into(),
+        }
+    }
+
+    pub fn new_for_method(
+        amount: impl Into<String>,
+        payment_method: impl Into<String>,
+        payment_scene: impl Into<String>,
+    ) -> Self {
+        Self {
+            amount: amount.into(),
+            subject: String::new(),
+            body: None,
+            payment_method: payment_method.into(),
+            payment_type: payment_scene.into(),
         }
     }
 
@@ -116,6 +149,8 @@ pub struct PaymentQueryParams {
     pub status: Option<String>,
     pub limit: Option<i32>,
     pub offset: Option<i32>,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
 }
 
 impl PaymentQueryParams {
@@ -138,6 +173,16 @@ impl PaymentQueryParams {
         self
     }
 
+    pub fn with_page(mut self, page: u32) -> Self {
+        self.page = Some(page);
+        self
+    }
+
+    pub fn with_page_size(mut self, page_size: u32) -> Self {
+        self.page_size = Some(page_size);
+        self
+    }
+
     pub fn to_query_string(&self) -> String {
         let mut params = Vec::new();
         if let Some(ref status) = self.status {
@@ -149,27 +194,161 @@ impl PaymentQueryParams {
         if let Some(offset) = self.offset {
             params.push(format!("offset={}", offset));
         }
+        if let Some(page) = self.page {
+            params.push(format!("page={page}"));
+        }
+        if let Some(page_size) = self.page_size {
+            params.push(format!("page_size={page_size}"));
+        }
         params.join("&")
     }
 }
 
 fn format_amount(amount: f64) -> String {
-    format!("{:.2}", amount)
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_string()
+    // Preserve the caller's value so the server can reject unsupported precision instead of
+    // silently creating an order for a rounded amount. Callers that require exact decimal input
+    // should prefer `new_for_method`, which accepts a string.
+    amount.to_string()
 }
 
 /// 创建支付订单响应
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CreatePaymentOrderResponse {
     pub order_id: String,
     pub out_trade_no: String,
+    pub payment_method: String,
     pub payment_type: String,
     pub pay_url: Option<String>,
     pub qr_code: Option<String>,
     pub qr_code_image_url: Option<String>,
     pub expired_at: String,
+}
+
+impl<'de> Deserialize<'de> for CreatePaymentOrderResponse {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireResponse {
+            order_id: String,
+            out_trade_no: String,
+            #[serde(default = "default_alipay_method")]
+            payment_method: String,
+            #[serde(default)]
+            payment_scene: Option<String>,
+            #[serde(default)]
+            payment_type: Option<String>,
+            pay_url: Option<String>,
+            qr_code: Option<String>,
+            qr_code_image_url: Option<String>,
+            expired_at: String,
+        }
+
+        let wire = WireResponse::deserialize(deserializer)?;
+        let payment_type = match (wire.payment_scene, wire.payment_type) {
+            (Some(scene), Some(legacy)) if scene != legacy => {
+                return Err(serde::de::Error::custom(
+                    "payment_scene and payment_type disagree",
+                ));
+            }
+            (Some(scene), _) => scene,
+            (_, Some(legacy)) => legacy,
+            (None, None) => return Err(serde::de::Error::missing_field("payment_scene")),
+        };
+        Ok(Self {
+            order_id: wire.order_id,
+            out_trade_no: wire.out_trade_no,
+            payment_method: wire.payment_method,
+            payment_type,
+            pay_url: wire.pay_url,
+            qr_code: wire.qr_code,
+            qr_code_image_url: wire.qr_code_image_url,
+            expired_at: wire.expired_at,
+        })
+    }
+}
+
+fn default_alipay_method() -> String {
+    "alipay".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaymentMethodsResponse {
+    pub methods: Vec<PaymentMethodInfo>,
+    pub min_amount: String,
+    pub max_amount: String,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PaymentMethodInfo {
+    pub code: String,
+    pub display_name: String,
+    pub scenes: Vec<String>,
+    pub recommended_scene: String,
+    pub sort_order: u16,
+    pub is_default: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CreatePaymentOrderRequest, CreatePaymentOrderResponse};
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_float_constructor_does_not_round_the_requested_amount() {
+        assert_eq!(
+            CreatePaymentOrderRequest::new(1.005, "recharge", "page").amount,
+            "1.005"
+        );
+        assert_eq!(
+            CreatePaymentOrderRequest::new(0.009, "recharge", "page").amount,
+            "0.009"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_float_constructor_leaves_invalid_values_for_server_validation() {
+        assert_eq!(
+            CreatePaymentOrderRequest::new(f64::NAN, "recharge", "page").amount,
+            "NaN"
+        );
+        assert_eq!(
+            CreatePaymentOrderRequest::new(f64::INFINITY, "recharge", "page").amount,
+            "inf"
+        );
+    }
+
+    #[test]
+    fn conflicting_scene_compatibility_fields_are_rejected() {
+        let error = serde_json::from_value::<CreatePaymentOrderResponse>(serde_json::json!({
+            "order_id": "order-conflict",
+            "out_trade_no": "PAY_CONFLICT",
+            "payment_method": "wechatpay",
+            "payment_scene": "native",
+            "payment_type": "page",
+            "pay_url": null,
+            "qr_code": null,
+            "qr_code_image_url": null,
+            "expired_at": "2026-07-26T11:00:00Z"
+        }))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("payment_scene and payment_type disagree")
+        );
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PaymentOrderPage {
+    pub orders: Vec<PaymentOrderSummary>,
+    #[serde(default)]
+    pub total: u64,
 }
 
 /// 支付订单响应

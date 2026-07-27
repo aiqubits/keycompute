@@ -12,7 +12,7 @@ use keycompute_auth::{
 };
 use keycompute_db::{
     CreateUserCredentialRequest, CreateUserRequest, DbRouter, UpdateUserCredentialRequest, User,
-    UserCredential,
+    UserCredential, models::user::UpdateUserRequest,
 };
 use keycompute_types::UserRole;
 use std::sync::Arc;
@@ -156,6 +156,87 @@ async fn test_user_token_version_model_methods() {
         .await
         .expect("query should succeed");
     assert_eq!(missing, None);
+
+    cleanup_test_data(&pool, &test_id).await.ok();
+}
+
+/// 角色承载授权边界；发生实际角色变化时必须原子递增 token_version，
+/// 仅修改名称或重复写入相同角色则不能无故注销用户。
+#[tokio::test]
+async fn test_role_change_invalidates_existing_jwt_only_when_role_changes() {
+    let pool = create_test_pool().await;
+    let test_id = generate_test_id();
+    cleanup_test_data(&pool, &test_id)
+        .await
+        .expect("cleanup should succeed");
+
+    let tenant = create_test_tenant(&pool, "tv-role", &test_id).await;
+    let user = User::create(
+        &pool,
+        &CreateUserRequest {
+            tenant_id: tenant.id,
+            email: format!("tv-role-{}@example.com", test_id),
+            name: Some("Role Token User".to_string()),
+            role: Some(UserRole::Admin),
+        },
+    )
+    .await
+    .expect("user should be created");
+    let router = DbRouter::single(pool.clone());
+    let auth = build_auth_service(Arc::clone(&router));
+    let jwt = auth
+        .get_jwt_validator()
+        .expect("jwt validator configured")
+        .clone();
+    let admin_token = jwt
+        .generate_token_with_version(user.id, user.tenant_id, &user.role, user.token_version)
+        .expect("admin token should be generated");
+
+    let renamed = user
+        .update(
+            &pool,
+            &UpdateUserRequest {
+                name: Some("Renamed Admin".to_string()),
+                role: None,
+            },
+        )
+        .await
+        .expect("name update should succeed");
+    assert_eq!(renamed.token_version, 0);
+    auth.verify_token(&admin_token)
+        .await
+        .expect("name-only update must not invalidate the token");
+
+    let unchanged_role = renamed
+        .update(
+            &pool,
+            &UpdateUserRequest {
+                name: None,
+                role: Some(keycompute_types::AssignableUserRole::Admin),
+            },
+        )
+        .await
+        .expect("same-role update should succeed");
+    assert_eq!(unchanged_role.token_version, 0);
+
+    let demoted = unchanged_role
+        .update(
+            &pool,
+            &UpdateUserRequest {
+                name: None,
+                role: Some(keycompute_types::AssignableUserRole::User),
+            },
+        )
+        .await
+        .expect("role update should succeed");
+    assert_eq!(demoted.role, UserRole::User.as_str());
+    assert_eq!(demoted.token_version, 1);
+
+    let error = auth
+        .verify_token(&admin_token)
+        .await
+        .expect_err("pre-demotion admin token must be invalidated");
+    assert!(error.to_string().contains("invalidated"));
 
     cleanup_test_data(&pool, &test_id).await.ok();
 }

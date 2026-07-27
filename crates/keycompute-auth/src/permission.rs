@@ -34,12 +34,18 @@ pub enum Permission {
     ManageTenant,
     /// 查看账单
     ViewBilling,
+    /// 管理当前用户自己的账单与支付订单
+    ManageOwnBilling,
     /// 管理账单
     ManageBilling,
     /// 管理定价
     ManagePricing,
     /// 管理 Provider 账号
     ManageProviders,
+    /// 管理受保护的全局系统设置
+    ManageSystemSettings,
+    /// 管理 system 用户、角色及其他受保护用户边界
+    ManageProtectedUsers,
     /// 系统管理员权限
     SystemAdmin,
 }
@@ -54,9 +60,12 @@ impl Permission {
             Permission::ManageUsers => "users:manage",
             Permission::ManageTenant => "tenant:manage",
             Permission::ViewBilling => "billing:view",
+            Permission::ManageOwnBilling => "billing:self_manage",
             Permission::ManageBilling => "billing:manage",
             Permission::ManagePricing => "pricing:manage",
             Permission::ManageProviders => "providers:manage",
+            Permission::ManageSystemSettings => "system_settings:manage",
+            Permission::ManageProtectedUsers => "protected_users:manage",
             Permission::SystemAdmin => "system:admin",
         }
     }
@@ -70,9 +79,12 @@ impl Permission {
             "users:manage" => Some(Permission::ManageUsers),
             "tenant:manage" => Some(Permission::ManageTenant),
             "billing:view" => Some(Permission::ViewBilling),
+            "billing:self_manage" => Some(Permission::ManageOwnBilling),
             "billing:manage" => Some(Permission::ManageBilling),
             "pricing:manage" => Some(Permission::ManagePricing),
             "providers:manage" => Some(Permission::ManageProviders),
+            "system_settings:manage" => Some(Permission::ManageSystemSettings),
+            "protected_users:manage" => Some(Permission::ManageProtectedUsers),
             "system:admin" => Some(Permission::SystemAdmin),
             _ => None,
         }
@@ -112,6 +124,7 @@ impl PermissionChecker {
                 | Permission::ViewUsage
                 | Permission::ManageApiKeys
                 | Permission::ViewBilling
+                | Permission::ManageOwnBilling
         )
     }
 }
@@ -158,24 +171,39 @@ fn build_api_key_permissions() -> Vec<Permission> {
 /// 根据用户角色分配相应的后台管理权限
 fn build_jwt_permissions(role: &str) -> Vec<Permission> {
     match role {
-        // 系统管理员：拥有所有权限
-        "admin" | "system" => vec![
+        "admin" => build_admin_permissions(),
+        // system 账号额外可修改受保护的全局系统设置。
+        "system" => {
+            let mut permissions = build_admin_permissions();
+            permissions.push(Permission::ManageSystemSettings);
+            permissions.push(Permission::ManageProtectedUsers);
+            permissions
+        }
+        // 普通用户：可查看用量并管理自己的账单与支付订单
+        "user" => vec![
             Permission::UseApi,
             Permission::ViewUsage,
-            Permission::ManageApiKeys,
-            Permission::ManageUsers,
-            Permission::ManageTenant,
-            Permission::ViewBilling,
-            Permission::ManageBilling,
-            Permission::ManagePricing,
-            Permission::ManageProviders,
-            Permission::SystemAdmin,
+            Permission::ManageOwnBilling,
         ],
-        // 普通用户：仅能查看用量
-        "user" => vec![Permission::UseApi, Permission::ViewUsage],
         // 未知角色：最小权限
         _ => vec![Permission::UseApi],
     }
+}
+
+fn build_admin_permissions() -> Vec<Permission> {
+    vec![
+        Permission::UseApi,
+        Permission::ViewUsage,
+        Permission::ManageApiKeys,
+        Permission::ManageUsers,
+        Permission::ManageTenant,
+        Permission::ViewBilling,
+        Permission::ManageOwnBilling,
+        Permission::ManageBilling,
+        Permission::ManagePricing,
+        Permission::ManageProviders,
+        Permission::SystemAdmin,
+    ]
 }
 
 /// 预定义的角色权限（用于 JWT 认证场景）
@@ -187,7 +215,11 @@ pub mod roles {
 
     /// 普通用户权限
     pub fn user() -> Vec<Permission> {
-        vec![Permission::UseApi, Permission::ViewUsage]
+        vec![
+            Permission::UseApi,
+            Permission::ViewUsage,
+            Permission::ManageOwnBilling,
+        ]
     }
 
     /// 系统管理员权限
@@ -199,9 +231,12 @@ pub mod roles {
             Permission::ManageUsers,
             Permission::ManageTenant,
             Permission::ViewBilling,
+            Permission::ManageOwnBilling,
             Permission::ManageBilling,
             Permission::ManagePricing,
             Permission::ManageProviders,
+            Permission::ManageSystemSettings,
+            Permission::ManageProtectedUsers,
             Permission::SystemAdmin,
         ]
     }
@@ -214,12 +249,33 @@ mod tests {
     #[test]
     fn test_permission_as_str() {
         assert_eq!(Permission::UseApi.as_str(), "api:use");
+        assert_eq!(Permission::ManageOwnBilling.as_str(), "billing:self_manage");
+        assert_eq!(
+            Permission::ManageSystemSettings.as_str(),
+            "system_settings:manage"
+        );
+        assert_eq!(
+            Permission::ManageProtectedUsers.as_str(),
+            "protected_users:manage"
+        );
         assert_eq!(Permission::SystemAdmin.as_str(), "system:admin");
     }
 
     #[test]
     fn test_permission_from_str() {
         assert_eq!(Permission::parse("api:use"), Some(Permission::UseApi));
+        assert_eq!(
+            Permission::parse("billing:self_manage"),
+            Some(Permission::ManageOwnBilling)
+        );
+        assert_eq!(
+            Permission::parse("system_settings:manage"),
+            Some(Permission::ManageSystemSettings)
+        );
+        assert_eq!(
+            Permission::parse("protected_users:manage"),
+            Some(Permission::ManageProtectedUsers)
+        );
         assert_eq!(Permission::parse("invalid"), None);
     }
 
@@ -294,9 +350,12 @@ mod tests {
         assert!(perms.contains(&Permission::ViewUsage));
         assert!(perms.contains(&Permission::ManageUsers));
         assert!(perms.contains(&Permission::ManageBilling));
+        assert!(perms.contains(&Permission::ManageOwnBilling));
         assert!(perms.contains(&Permission::ManagePricing));
         assert!(perms.contains(&Permission::ManageProviders));
         assert!(perms.contains(&Permission::SystemAdmin));
+        assert!(!perms.contains(&Permission::ManageSystemSettings));
+        assert!(!perms.contains(&Permission::ManageProtectedUsers));
     }
 
     #[test]
@@ -305,6 +364,8 @@ mod tests {
         let perms = build_permissions(AuthType::Jwt, "system");
         assert!(perms.contains(&Permission::SystemAdmin));
         assert!(perms.contains(&Permission::ManageProviders));
+        assert!(perms.contains(&Permission::ManageSystemSettings));
+        assert!(perms.contains(&Permission::ManageProtectedUsers));
     }
 
     #[test]
@@ -313,6 +374,7 @@ mod tests {
         let perms = build_permissions(AuthType::Jwt, "user");
         assert!(perms.contains(&Permission::UseApi));
         assert!(perms.contains(&Permission::ViewUsage));
+        assert!(perms.contains(&Permission::ManageOwnBilling));
         assert!(!perms.contains(&Permission::ManageUsers));
         assert!(!perms.contains(&Permission::ViewBilling));
     }

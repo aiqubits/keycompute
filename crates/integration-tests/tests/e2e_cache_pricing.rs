@@ -6,10 +6,9 @@
 //! - get_or_insert_with_lock 防击穿路径
 //! - 跨租户定价隔离（租户特定定价永不泄漏到 nil_tenant 共享 key）
 
+use integration_tests::db::initialize_test_schema;
 use keycompute_cache::CacheService;
-use keycompute_db::{
-    CreatePricingRequest, PricingModel, models::pricing_model::BillingDimension, run_migrations,
-};
+use keycompute_db::{CreatePricingRequest, PricingModel, models::pricing_model::BillingDimension};
 use keycompute_pricing::PricingService;
 use keycompute_types::PricingSnapshot;
 use std::str::FromStr;
@@ -219,10 +218,10 @@ async fn test_cross_tenant_pricing_isolation_with_db() {
     use bigdecimal::BigDecimal;
     use chrono::Utc;
 
-    // 2. 运行数据库迁移，确保表结构存在
-    run_migrations(&db)
+    // 2. 初始化测试数据库结构
+    initialize_test_schema(&db)
         .await
-        .expect("Migrations should succeed");
+        .expect("Schema initialization should succeed");
 
     // 3. 种子数据：默认定价 ¥0.10 input / ¥0.30 output（nil tenant）
     let default_pricing = PricingModel::create(

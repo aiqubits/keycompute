@@ -3667,6 +3667,32 @@ select.form-input:focus {
   margin-bottom: 20px;
 }
 
+.pay-method-card {
+  display: flex;
+  min-height: 76px;
+  padding: 16px;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-primary);
+  text-align: left;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+
+.pay-method-card:hover {
+  background: color-mix(in srgb, var(--bg-card) 88%, var(--color-primary));
+  border-color: color-mix(in srgb, var(--color-primary) 35%, var(--border-color));
+}
+
+.pay-method-card.active {
+  background: color-mix(in srgb, var(--bg-card) 92%, var(--color-primary));
+  border-color: var(--color-primary);
+  box-shadow: inset 2px 0 0 var(--color-primary);
+}
+
 .pay-method-icon {
   font-size: 24px;
 }
@@ -3674,6 +3700,57 @@ select.form-input:focus {
 .pay-method-label {
   color: var(--text-primary);
   font-weight: 600;
+}
+
+.payment-provider-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.payment-provider-card {
+  padding: 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+}
+
+.payment-provider-head,
+.payment-provider-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.payment-provider-name {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 15px;
+}
+
+.payment-provider-scenes,
+.payment-provider-message {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.payment-provider-action {
+    align-self: flex-start;
+    margin-top: 0.25rem;
+}
+
+.payment-provider-meta {
+  justify-content: flex-start;
+  margin-top: 14px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.payment-provider-message {
+  color: var(--color-warning);
 }
 
 .pay-qr-area,

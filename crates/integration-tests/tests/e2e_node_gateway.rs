@@ -119,9 +119,9 @@ impl NodeTestEnv {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
 
-        keycompute_db::run_migrations(&pool)
+        integration_tests::db::initialize_test_schema(&pool)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to run database migrations: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to initialize database schema: {}", e))?;
 
         // 清理历史测试数据（按 FK 依赖逆序删除，使用 E2E 专用的 email/slug 前缀模式匹配）
         pool.execute(Statement::from_sql_and_values(

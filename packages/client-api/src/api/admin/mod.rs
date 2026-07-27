@@ -9,11 +9,9 @@ mod payment;
 mod pricing;
 mod user;
 
+pub use super::common::MessageResponse;
 use crate::client::ApiClient;
 use crate::error::Result;
-use serde::Deserialize;
-
-pub use super::common::MessageResponse;
 
 // Re-export 各子模块的公共类型
 pub use account::{
@@ -28,7 +26,7 @@ pub use node_gateway::{
     NodeGatewayNodeStats, NodeGatewayOverviewResponse, NodeGatewayTaskInfo, NodeGatewayTaskStats,
     PendingTokenWithUser, RecoverNodeResponse, RevokeNodeRequest, RevokeNodeTokenResponse,
 };
-pub use payment::PaymentOrderInfo;
+pub use payment::{PaymentOrderInfo, PaymentOrderPage, PaymentProviderStatus};
 pub use pricing::{
     CalculateCostRequest, CostCalculationResponse, CreatePricingRequest, CreatePricingResponse,
     MakeDefaultPricingResponse, PricingInfo, SetDefaultPricingRequest, UpdatePricingRequest,
@@ -389,16 +387,42 @@ impl AdminApi {
         } else {
             "/api/v1/admin/payments/orders".to_string()
         };
-        // 后端返回 { orders: Vec<PaymentOrderInfo>, page: u32, page_size: u32 }
-        #[derive(Deserialize)]
-        struct AdminPaymentOrderListResponse {
-            orders: Vec<PaymentOrderInfo>,
-            #[allow(dead_code)]
-            page: u32,
-            #[allow(dead_code)]
-            page_size: u32,
-        }
-        let resp: AdminPaymentOrderListResponse = self.client.get_json(&path, Some(token)).await?;
+        let resp: PaymentOrderPage = self.client.get_json(&path, Some(token)).await?;
         Ok(resp.orders)
+    }
+
+    pub async fn list_payment_orders_page(
+        &self,
+        params: Option<&PaymentQueryParams>,
+        token: &str,
+    ) -> Result<PaymentOrderPage> {
+        let path = if let Some(params) = params {
+            format!("/api/v1/admin/payments/orders?{}", params.to_query_string())
+        } else {
+            "/api/v1/admin/payments/orders".to_string()
+        };
+        self.client.get_json(&path, Some(token)).await
+    }
+
+    /// 获取支付渠道的开关、配置和实际可用状态。
+    pub async fn get_payment_providers(&self, token: &str) -> Result<Vec<PaymentProviderStatus>> {
+        self.client
+            .get_json("/api/v1/admin/payments/providers", Some(token))
+            .await
+    }
+
+    /// 创建并关闭一笔真实小额订单，验证当前支付渠道配置。
+    pub async fn verify_payment_provider(
+        &self,
+        method: &str,
+        token: &str,
+    ) -> Result<MessageResponse> {
+        self.client
+            .post_json(
+                &format!("/api/v1/admin/payments/providers/{method}/verify"),
+                &serde_json::json!({}),
+                Some(token),
+            )
+            .await
     }
 }
