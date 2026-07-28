@@ -241,10 +241,18 @@ impl OpenAIMessage {
 /// OpenAI 流式响应
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIStreamResponse {
+    // 元信息字段全部宽容解析：部分 OpenAI 兼容上游（vLLM/中转代理）
+    // 的 chunk 会缺失其中某些字段，不应因此中断整条流
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub created: i64,
+    #[serde(default)]
     pub model: String,
+    /// 部分上游的 usage-only 末块会省略 choices 字段
+    #[serde(default)]
     pub choices: Vec<StreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
@@ -253,7 +261,9 @@ pub struct OpenAIStreamResponse {
 /// 流式选择结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChoice {
+    #[serde(default)]
     pub index: i32,
+    #[serde(default)]
     pub delta: DeltaMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,

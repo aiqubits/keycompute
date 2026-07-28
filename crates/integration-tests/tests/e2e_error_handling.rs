@@ -9,9 +9,9 @@
 use futures::StreamExt;
 use integration_tests::common::VerificationChain;
 use integration_tests::mocks::provider::MockProviderFactory;
-use keycompute_provider_trait::{ProviderAdapter, StreamEvent, UpstreamRequest};
 use keycompute_routing::{AccountStateStore, ProviderHealthStore, RoutingEngine};
 use keycompute_types::{PricingSnapshot, RequestContext};
+use llm_protocol_provider::{ProviderAdapter, StreamEvent, UpstreamRequest};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,13 +36,13 @@ async fn test_timeout_simulation() {
     );
 
     // 2. 发送请求
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
     let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
     let result = provider.stream_chat(&transport, request).await;
 
     // 3. 验证超时错误
     chain.add_step(
-        "keycompute-provider-trait",
+        "llm-protocol-provider",
         "ProviderAdapter::timeout_error",
         format!("Request failed: {}", result.is_err()),
         result.is_err(),
@@ -50,7 +50,7 @@ async fn test_timeout_simulation() {
 
     if let Err(e) = result {
         chain.add_step(
-            "keycompute-provider-trait",
+            "llm-protocol-provider",
             "ProviderAdapter::error_message",
             format!("Error message: {}", e),
             e.to_string().contains("timeout"),
@@ -76,7 +76,7 @@ async fn test_delayed_response() {
     );
 
     // 2. 测量响应时间
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
     let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
 
     let start = std::time::Instant::now();
@@ -93,7 +93,7 @@ async fn test_delayed_response() {
 
     // 4. 验证请求成功
     chain.add_step(
-        "keycompute-provider-trait",
+        "llm-protocol-provider",
         "ProviderAdapter::delayed_success",
         format!("Request succeeded: {}", result.is_ok()),
         result.is_ok(),
@@ -118,12 +118,12 @@ async fn test_slow_stream() {
     );
 
     // 2. 消费流
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
     let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
     let stream = provider.stream_chat(&transport, request).await;
 
     chain.add_step(
-        "keycompute-provider-trait",
+        "llm-protocol-provider",
         "ProviderAdapter::stream_created",
         "Stream created successfully",
         stream.is_ok(),
@@ -373,7 +373,7 @@ async fn test_flaky_provider_recovery() {
 
     // 1. 创建 Flaky Provider（前 3 次失败）
     let provider = MockProviderFactory::create_flaky(3);
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
     let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
 
     chain.add_step(
@@ -418,7 +418,7 @@ async fn test_stream_error_injection() {
 
     // 1. 创建在第二个 chunk 后注入错误的 Provider
     let provider = MockProviderFactory::create_with_stream_error(2);
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
     let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
 
     chain.add_step(
@@ -443,7 +443,7 @@ async fn test_stream_error_injection() {
                 StreamEvent::Error { message } => {
                     error_found = true;
                     chain.add_step(
-                        "keycompute-provider-trait",
+                        "llm-protocol-provider",
                         "StreamEvent::Error",
                         format!("Error message: {}", message),
                         message.contains("Simulated stream error"),
@@ -482,7 +482,7 @@ async fn test_stream_continue_after_error() {
 
     // 1. 创建在第三个 chunk 后注入错误的 Provider
     let provider = MockProviderFactory::create_with_stream_error(3);
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
     let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
 
     // 2. 消费流
@@ -550,7 +550,7 @@ async fn test_fallback_on_stream_error() {
     );
 
     // 2. 尝试主 Provider
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
     let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
 
     let primary_result = failing_provider
@@ -604,13 +604,13 @@ async fn test_empty_response() {
     // 1. 创建返回空内容的 Provider
     let provider = MockProviderFactory::create_openai().with_chunks(vec![]); // 空 chunks
 
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
     let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
 
     // 2. 消费流
     let stream = provider.stream_chat(&transport, request).await;
     chain.add_step(
-        "keycompute-provider-trait",
+        "llm-protocol-provider",
         "EmptyResponse::stream_created",
         "Stream created for empty response",
         stream.is_ok(),
@@ -657,7 +657,7 @@ async fn test_large_token_count() {
     // 1. 创建大 token 计数的 Provider
     let provider = MockProviderFactory::create_openai().with_tokens(u32::MAX, u32::MAX); // 最大值
 
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
     let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
 
     // 2. 消费流
@@ -710,7 +710,7 @@ async fn test_failure_count_reset() {
 
     // 1. 创建 Flaky Provider
     let provider = MockProviderFactory::create_flaky(2);
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
     let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
 
     // 2. 前 2 次失败
@@ -777,7 +777,7 @@ async fn test_concurrent_error_handling() {
 
     for _ in 0..5 {
         let p = success_provider.clone();
-        let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+        let transport = llm_protocol_provider::DefaultHttpTransport::new();
         tasks.spawn(async move {
             let request =
                 UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
@@ -787,7 +787,7 @@ async fn test_concurrent_error_handling() {
 
     for _ in 0..3 {
         let p = failing_provider.clone();
-        let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+        let transport = llm_protocol_provider::DefaultHttpTransport::new();
         tasks.spawn(async move {
             let request =
                 UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);
@@ -797,7 +797,7 @@ async fn test_concurrent_error_handling() {
 
     for _ in 0..2 {
         let p = flaky_provider.clone();
-        let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+        let transport = llm_protocol_provider::DefaultHttpTransport::new();
         tasks.spawn(async move {
             let request =
                 UpstreamRequest::new("http://test", "test-key", "gpt-4o").with_stream(true);

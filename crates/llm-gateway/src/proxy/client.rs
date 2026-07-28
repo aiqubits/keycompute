@@ -8,7 +8,7 @@ use crate::proxy::ProxyConfig;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use keycompute_provider_trait::{ByteStream, GetBinaryResponse, HttpTransport};
+use llm_protocol_provider::{ByteStream, GetBinaryResponse, HttpTransport};
 use reqwest::{Client, ClientBuilder, Proxy, RequestBuilder, Response};
 use std::time::Duration;
 

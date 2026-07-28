@@ -1,14 +1,18 @@
 //! Provider 定义模块
 //!
-//! 统一定义所有可用的 LLM Provider，作为系统的单一数据源。
+//! 统一定义所有可用的 LLM 协议 Provider，作为系统的单一数据源。
 //! Gateway 和 RoutingEngine 都从这里获取 Provider 列表，确保一致性。
+//!
+//! 系统仅支持两种协议（openai / anthropic），任何厂商（DeepSeek、Ollama、
+//! vLLM、Gemini 兼容层等）通过 `协议 + base_url + api_key` 接入，
+//! 不区分具体厂商实现。
 
-use keycompute_provider_trait::ProviderAdapter;
+use llm_protocol_provider::ProviderAdapter;
 use std::sync::Arc;
 
 /// Provider 定义
 pub struct ProviderDefinition {
-    /// Provider 名称（用于路由和日志）
+    /// Provider 名称（用于路由和日志，与 ProtocolType::as_str 一致）
     pub name: &'static str,
     /// Provider 描述
     pub description: &'static str,
@@ -19,37 +23,16 @@ pub struct ProviderDefinition {
 /// 所有可用的 Provider 列表
 ///
 /// 这是系统的单一数据源，Gateway 和 RoutingEngine 都从这里获取 Provider 列表。
-/// 添加新 Provider 时只需修改此处，无需同步修改其他模块。
 pub const AVAILABLE_PROVIDERS: &[ProviderDefinition] = &[
     ProviderDefinition {
         name: "openai",
-        description: "OpenAI GPT Models",
-        create_adapter: || Arc::new(keycompute_openai::OpenAIProvider::new()),
+        description: "OpenAI Chat Completions Protocol",
+        create_adapter: || Arc::new(llm_protocol_openai::OpenAIProvider::new()),
     },
     ProviderDefinition {
-        name: "deepseek",
-        description: "DeepSeek Models",
-        create_adapter: || Arc::new(keycompute_deepseek::DeepSeekProvider::new()),
-    },
-    ProviderDefinition {
-        name: "vllm",
-        description: "vLLM Self-hosted Models",
-        create_adapter: || Arc::new(keycompute_vllm::VllmProvider::new()),
-    },
-    ProviderDefinition {
-        name: "claude",
-        description: "Anthropic Claude Models",
-        create_adapter: || Arc::new(keycompute_claude::ClaudeProvider::new()),
-    },
-    ProviderDefinition {
-        name: "ollama",
-        description: "Ollama Local Models",
-        create_adapter: || Arc::new(keycompute_ollama::OllamaProvider::new()),
-    },
-    ProviderDefinition {
-        name: "gemini",
-        description: "Google Gemini Models",
-        create_adapter: || Arc::new(keycompute_gemini::GeminiProvider::new()),
+        name: "anthropic",
+        description: "Anthropic Messages Protocol",
+        create_adapter: || Arc::new(llm_protocol_anthropic::AnthropicProvider::new()),
     },
 ];
 
@@ -99,7 +82,10 @@ mod tests {
     #[test]
     fn test_is_provider_available() {
         assert!(is_provider_available("openai"));
-        assert!(is_provider_available("claude"));
+        assert!(is_provider_available("anthropic"));
+        // 厂商名不再是合法 Provider，厂商通过协议 + base_url 接入
+        assert!(!is_provider_available("claude"));
+        assert!(!is_provider_available("deepseek"));
         assert!(!is_provider_available("unknown"));
     }
 

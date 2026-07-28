@@ -1,18 +1,13 @@
 [package]
-name = "keycompute-openai"
+name = "llm-protocol-provider"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 keycompute-types = { workspace = true }
-keycompute-provider-trait = { workspace = true }
 async-trait = "0.1"
 bytes = "1"
 futures = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["sync"] }
-tokio-stream = "0.1"
-tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }

@@ -34,13 +34,9 @@ RUN mkdir -p crates/keycompute-types/src \
     crates/keycompute-emailserver/src \
     crates/keycompute-server/src \
     crates/llm-gateway/src \
-    crates/llm-provider/keycompute-provider-trait/src \
-    crates/llm-provider/keycompute-openai/src \
-    crates/llm-provider/keycompute-claude/src \
-    crates/llm-provider/keycompute-gemini/src \
-    crates/llm-provider/keycompute-ollama/src \
-    crates/llm-provider/keycompute-deepseek/src \
-    crates/llm-provider/keycompute-vllm/src \
+    crates/llm-protocol/provider/src \
+    crates/llm-protocol/openai/src \
+    crates/llm-protocol/anthropic/src \
     crates/keycompute-payment/keycompute-alipay/src \
     crates/keycompute-payment/keycompute-wechatpay/src \
     crates/integration-tests/src \
@@ -62,13 +58,9 @@ RUN mkdir -p crates/keycompute-types/src \
     crates/keycompute-server/src/lib.rs \
     crates/keycompute-server/src/main.rs \
     crates/llm-gateway/src/lib.rs \
-    crates/llm-provider/keycompute-provider-trait/src/lib.rs \
-    crates/llm-provider/keycompute-openai/src/lib.rs \
-    crates/llm-provider/keycompute-claude/src/lib.rs \
-    crates/llm-provider/keycompute-gemini/src/lib.rs \
-    crates/llm-provider/keycompute-ollama/src/lib.rs \
-    crates/llm-provider/keycompute-deepseek/src/lib.rs \
-    crates/llm-provider/keycompute-vllm/src/lib.rs \
+    crates/llm-protocol/provider/src/lib.rs \
+    crates/llm-protocol/openai/src/lib.rs \
+    crates/llm-protocol/anthropic/src/lib.rs \
     crates/keycompute-payment/keycompute-alipay/src/lib.rs \
     crates/keycompute-payment/keycompute-wechatpay/src/lib.rs \
     crates/integration-tests/src/lib.rs \

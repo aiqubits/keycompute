@@ -15,9 +15,11 @@ use keycompute_db::models::account::{
     Account, CreateAccountRequest as DbCreateAccountRequest,
     UpdateAccountRequest as DbUpdateAccountRequest,
 };
-use keycompute_provider_trait::{DefaultHttpTransport, HttpTransport};
+use keycompute_types::SensitiveString;
+use llm_protocol_provider::{DefaultHttpTransport, ProtocolType, normalize_base_url};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
+use tracing;
 use uuid::Uuid;
 
 /// Provider 账号信息
@@ -137,6 +139,30 @@ pub async fn create_account(
         .as_deref()
         .ok_or_else(|| ApiError::Internal("Database not configured".to_string()))?;
 
+    // 校验协议类型：系统仅支持 openai / anthropic 两种协议，
+    // 任何厂商（DeepSeek、Ollama、vLLM 等）通过协议 + base_url 接入
+    let protocol = ProtocolType::parse(&req.provider).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "Unsupported protocol '{}', expected one of: openai, anthropic",
+            req.provider
+        ))
+    })?;
+
+    // 校验模型列表：必须至少提供一个模型（不再提供默认值）
+    if req.models.is_empty() {
+        return Err(ApiError::BadRequest(
+            "At least one model must be specified for the channel account".to_string(),
+        ));
+    }
+
+    // 规范化 Base URL：去尾部 '/'，拒绝带协议路径的输入（路径由协议层拼接）；
+    // 空白输入视为未提供，使用协议默认端点（与 update 的空串重置语义一致）
+    let api_base = match req.api_base.as_deref() {
+        Some(url) if url.trim().is_empty() => None,
+        Some(url) => Some(normalize_base_url(url).map_err(ApiError::BadRequest)?),
+        None => None,
+    };
+
     // 加密 API Key（如果配置了加密密钥）
     let (encrypted_key, key_preview) =
         if let Some(_crypto) = keycompute_runtime::crypto::global_crypto() {
@@ -148,6 +174,10 @@ pub async fn create_account(
             )
         } else {
             // 未配置加密，直接存储明文
+            tracing::warn!(
+                "Global crypto key not set — storing upstream API key in plaintext. \
+                 This is acceptable for development but should be fixed in production."
+            );
             (
                 req.api_key.clone(),
                 format!("{}****", &req.api_key[..req.api_key.len().min(3)]),
@@ -156,9 +186,10 @@ pub async fn create_account(
 
     let db_req = DbCreateAccountRequest {
         tenant_id: auth.tenant_id,
-        provider: req.provider.clone(),
+        // 使用规范化后的协议名（小写），与路由/Gateway 注册键一致
+        provider: protocol.as_str().to_string(),
         name: req.name.clone(),
-        endpoint: req.api_base.clone().unwrap_or_default(),
+        endpoint: api_base.unwrap_or_default(),
         upstream_api_key_encrypted: encrypted_key,
         upstream_api_key_preview: key_preview,
         rpm_limit: req.rpm_limit,
@@ -236,6 +267,15 @@ pub async fn update_account(
         .map_err(|e| ApiError::Internal(format!("Failed to find account: {}", e)))?
         .ok_or_else(|| ApiError::NotFound(format!("Account not found: {}", account_id)))?;
 
+    // 规范化 Base URL（与 create 一致：只存 base，路径由协议层拼接）；
+    // 显式空串表示重置为协议默认端点（存空 endpoint，
+    // 与创建/路由的空 endpoint 回落语义一致），None 表示保持现状
+    let api_base = match req.api_base.as_deref() {
+        Some(url) if url.trim().is_empty() => Some(String::new()),
+        Some(url) => Some(normalize_base_url(url).map_err(ApiError::BadRequest)?),
+        None => None,
+    };
+
     // 处理 API Key 加密
     let (encrypted_key, key_preview) = if let Some(ref key) = req.api_key {
         if let Some(_crypto) = keycompute_runtime::crypto::global_crypto() {
@@ -260,7 +300,7 @@ pub async fn update_account(
     let db_req = DbUpdateAccountRequest {
         tenant_id: req.tenant_id,
         name: req.name.clone(),
-        endpoint: req.api_base.clone(),
+        endpoint: api_base,
         upstream_api_key_encrypted: encrypted_key,
         upstream_api_key_preview: key_preview,
         rpm_limit: req.rpm_limit,
@@ -283,7 +323,11 @@ pub async fn update_account(
         "name": updated.name,
         "provider": updated.provider,
         "api_key_preview": updated.upstream_api_key_preview,
-        "api_base": updated.endpoint,
+        "api_base": if updated.endpoint.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(updated.endpoint)
+        },
         "models": updated.models_supported,
         "rpm_limit": updated.rpm_limit,
         "current_rpm": 0,
@@ -360,9 +404,17 @@ pub async fn test_account(
     // 解密 API Key
     let api_key = decrypt_account_api_key(&account.upstream_api_key_encrypted)?;
 
-    // 构建 endpoint
+    // 解析账号协议（非法值是数据状态问题而非服务器故障，返回 409 提示重建账号）
+    let protocol = ProtocolType::parse(&account.provider).ok_or_else(|| {
+        ApiError::Conflict(format!(
+            "Account has unsupported protocol '{}'; please recreate it with 'openai' or 'anthropic'",
+            account.provider
+        ))
+    })?;
+
+    // 构建 endpoint（Base URL）
     let endpoint = if account.endpoint.is_empty() {
-        get_default_endpoint(&account.provider)
+        protocol.default_endpoint().to_string()
     } else {
         account.endpoint.clone()
     };
@@ -370,18 +422,10 @@ pub async fn test_account(
     // 创建 HTTP 传输层
     let transport = DefaultHttpTransport::new();
 
-    // 构建测试请求 - 使用简单的模型列表请求
-    let test_endpoint = format!(
-        "{}/models",
-        endpoint
-            .trim_end_matches('/')
-            .trim_end_matches("/chat/completions")
-    );
-
     let start = Instant::now();
 
-    // 尝试调用上游 API
-    let test_result = test_upstream_connection(&transport, &test_endpoint, &api_key).await;
+    // 按协议分发调用上游模型列表接口，验证 API Key 连通性
+    let test_result = fetch_upstream_models(protocol, &transport, &endpoint, &api_key).await;
 
     let latency_ms = start.elapsed().as_millis() as i64;
 
@@ -423,38 +467,26 @@ pub async fn test_account(
     }
 }
 
-/// 测试上游连接
-async fn test_upstream_connection(
+/// 按协议获取上游模型列表（兼作连通性验证）
+///
+/// 通过 Provider 注册表取对应协议的 adapter 调用 `list_models`，
+/// 认证方式由协议实现自行处理（openai: Bearer；anthropic: x-api-key），
+/// 避免在 handler 层重复协议认证逻辑
+async fn fetch_upstream_models(
+    protocol: ProtocolType,
     transport: &DefaultHttpTransport,
     endpoint: &str,
     api_key: &str,
 ) -> std::result::Result<Vec<String>, String> {
-    let headers = vec![
-        ("Authorization".to_string(), format!("Bearer {}", api_key)),
-        ("Content-Type".to_string(), "application/json".to_string()),
-    ];
+    let adapter = crate::providers::get_provider_definition(protocol.as_str())
+        .map(|def| (def.create_adapter)())
+        .ok_or_else(|| format!("Provider '{}' not registered", protocol))?;
 
-    let response = transport
-        .post_json(endpoint, headers, "{}".to_string())
+    let key = SensitiveString::new(api_key);
+    adapter
+        .list_models(transport, endpoint, &key)
         .await
-        .map_err(|e| e.to_string())?;
-
-    // 尝试解析模型列表
-    let parsed: serde_json::Value =
-        serde_json::from_str(&response).unwrap_or(serde_json::json!({}));
-
-    // 提取模型 ID 列表
-    let models = parsed
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(models)
+        .map_err(|e| e.to_string())
 }
 
 /// 刷新账号信息（重新获取模型列表等）
@@ -485,9 +517,17 @@ pub async fn refresh_account(
     // 解密 API Key
     let api_key = decrypt_account_api_key(&account.upstream_api_key_encrypted)?;
 
-    // 构建 endpoint
+    // 解析账号协议（非法值返回 409，与 test_account 一致）
+    let protocol = ProtocolType::parse(&account.provider).ok_or_else(|| {
+        ApiError::Conflict(format!(
+            "Account has unsupported protocol '{}'; please recreate it with 'openai' or 'anthropic'",
+            account.provider
+        ))
+    })?;
+
+    // 构建 endpoint（Base URL）
     let endpoint = if account.endpoint.is_empty() {
-        get_default_endpoint(&account.provider)
+        protocol.default_endpoint().to_string()
     } else {
         account.endpoint.clone()
     };
@@ -495,38 +535,17 @@ pub async fn refresh_account(
     // 创建 HTTP 传输层
     let transport = DefaultHttpTransport::new();
 
-    // 构建模型列表请求 endpoint
-    let models_endpoint = format!(
-        "{}/models",
-        endpoint
-            .trim_end_matches('/')
-            .trim_end_matches("/chat/completions")
-    );
-
-    // 调用上游 API 获取模型列表
-    let headers = vec![
-        ("Authorization".to_string(), format!("Bearer {}", api_key)),
-        ("Content-Type".to_string(), "application/json".to_string()),
-    ];
-
-    let response = transport
-        .post_json(&models_endpoint, headers, "{}".to_string())
+    // 按协议分发获取上游模型列表
+    let fetched_models = fetch_upstream_models(protocol, &transport, &endpoint, &api_key)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to fetch models: {}", e)))?;
 
-    // 解析模型列表
-    let parsed: serde_json::Value = serde_json::from_str(&response)
-        .map_err(|e| ApiError::Internal(format!("Failed to parse response: {}", e)))?;
-
-    let new_models: Vec<String> = parsed
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or(account.models_supported.clone());
+    // 上游未返回模型列表时保留现有配置
+    let new_models: Vec<String> = if fetched_models.is_empty() {
+        account.models_supported.clone()
+    } else {
+        fetched_models
+    };
 
     // 更新数据库
     let db_req = DbUpdateAccountRequest {
@@ -579,14 +598,17 @@ pub fn decrypt_account_api_key(encrypted_key: &str) -> Result<String> {
     Ok(encrypted_key.to_string())
 }
 
-/// 获取 Provider 的默认 endpoint
+/// 获取协议的默认 endpoint（Base URL）
 pub fn get_default_endpoint(provider: &str) -> String {
-    match provider.to_lowercase().as_str() {
-        "openai" => "https://api.openai.com/v1".to_string(),
-        "anthropic" | "claude" => "https://api.anthropic.com/v1".to_string(),
-        "deepseek" => "https://api.deepseek.com/v1".to_string(),
-        "gemini" | "google" => "https://generativelanguage.googleapis.com/v1".to_string(),
-        "ollama" => "http://ollama:11434/v1".to_string(),
-        _ => format!("https://api.{}.com/v1", provider),
-    }
+    ProtocolType::parse(provider)
+        .map(|p| p.default_endpoint().to_string())
+        // 非法协议名回退 openai 默认端点（创建入口已校验，此处仅防御）；
+        // 静默回落会掩盖数据问题，补充告警日志便于定位
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                provider = %provider,
+                "Unknown protocol, falling back to openai default endpoint"
+            );
+            ProtocolType::Openai.default_endpoint().to_string()
+        })
 }

@@ -7,25 +7,22 @@
 //! - `executor`: 核心执行器，管理请求生命周期
 //! - `proxy`: Internal HTTP Proxy Module，统一上游连接管理
 //! - `failover`: 故障转移管理
-//! - `normalize`: 请求标准化
 //! - `retry`: 重试策略
 //! - `streaming`: 流处理管道
 
 pub mod executor;
 pub mod failover;
-pub mod normalize;
 pub mod proxy;
 pub mod retry;
 pub mod streaming;
 
 pub use executor::GatewayExecutor;
 pub use failover::FailoverManager;
-pub use normalize::RequestNormalizer;
 pub use proxy::{HttpClient, HttpProxy, ProxyConfig, ProxyRequest, ProxySelector};
 pub use retry::RetryPolicy;
 pub use streaming::{StreamPipeline, StreamingContext};
 
-use keycompute_provider_trait::ProviderAdapter;
+use llm_protocol_provider::ProviderAdapter;
 use std::collections::HashMap;
 use std::sync::Arc;
 

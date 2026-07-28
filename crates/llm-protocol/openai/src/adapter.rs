@@ -1,6 +1,7 @@
-//! OpenAI Provider Adapter 实现
+//! OpenAI 协议适配器实现
 //!
-//! 实现 ProviderAdapter trait，提供 OpenAI API 的调用能力
+//! 实现 ProviderAdapter trait，提供 OpenAI Chat Completions 协议的调用能力，
+//! 适用于所有 OpenAI 兼容上游（OpenAI/DeepSeek/Ollama/vLLM/Gemini 兼容层等）。
 //! 支持 Chat Completions（含 Vision 多模态）、图片生成、图片编辑
 //!
 //! 使用统一 HTTP 传输层：
@@ -8,15 +9,16 @@
 //! - 支持连接池复用和代理出口
 //!
 //! # 重要说明
+//! - `endpoint` 为 Base URL（如 `https://api.openai.com/v1`），协议层负责拼接路径
 //! - `endpoint` 和 `upstream_api_key` 由调用方通过 `UpstreamRequest` 传入
 //! - 这些值通常从数据库 Account 表获取，而非配置文件
 //! - 管理员可通过前端界面动态配置，无需重启系统
 
 use async_trait::async_trait;
-use keycompute_provider_trait::{
+use keycompute_types::{KeyComputeError, Result};
+use llm_protocol_provider::{
     ByteStream, HttpTransport, ProviderAdapter, StreamBox, StreamEvent, UpstreamRequest,
 };
-use keycompute_types::{KeyComputeError, Result};
 use serde_json;
 
 use crate::protocol::{
@@ -55,6 +57,28 @@ impl OpenAIProvider {
     /// 创建新的 OpenAI Provider
     pub fn new() -> Self {
         Self
+    }
+
+    /// 拼接 Chat Completions URL
+    ///
+    /// `endpoint` 只存 Base URL（如 `https://api.openai.com/v1`），
+    /// 路径由协议层统一拼接，不做任何“已含路径”兼容检测。
+    fn chat_url(endpoint: &str) -> String {
+        format!("{}/chat/completions", endpoint.trim_end_matches('/'))
+    }
+
+    /// 判断是否为“可能由 stream_options 字段引发”的客户端错误
+    ///
+    /// 用于 stream_options 降级重试：部分 OpenAI 兼容上游（旧版 vLLM、
+    /// 某些中转代理）不识别 `stream_options` 字段会返回 400/422。
+    /// 有意排除 401/403/404/429 等与请求体无关的错误，
+    /// 避免对无效 Key / 限流场景重发注定失败的请求。
+    fn is_client_error(err: &KeyComputeError) -> bool {
+        matches!(
+            err,
+            KeyComputeError::ProviderError(msg)
+                if msg.contains("HTTP error (400") || msg.contains("HTTP error (422")
+        )
     }
 
     /// 构建 OpenAI 请求体（支持 Vision 多模态）
@@ -110,7 +134,7 @@ impl OpenAIProvider {
         ];
 
         let response_text = transport
-            .post_json(&request.endpoint, headers, body_json)
+            .post_json(&Self::chat_url(&request.endpoint), headers, body_json)
             .await?;
 
         let openai_response: OpenAIResponse =
@@ -150,9 +174,28 @@ impl OpenAIProvider {
             ("Accept".to_string(), "text/event-stream".to_string()),
         ];
 
-        let byte_stream: ByteStream = transport
-            .post_stream(&request.endpoint, headers, body_json)
-            .await?;
+        let url = Self::chat_url(&request.endpoint);
+        let byte_stream: ByteStream = match transport
+            .post_stream(&url, headers.clone(), body_json)
+            .await
+        {
+            Ok(stream) => stream,
+            // 部分 OpenAI 兼容上游不认识 stream_options 字段而返回 4xx，
+            // 去掉该字段重试一次（代价：收不到精确 Usage，计费退化为估算）
+            Err(e) if body.stream_options.is_some() && Self::is_client_error(&e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Upstream rejected stream_options, retrying without it"
+                );
+                let mut fallback_body = body;
+                fallback_body.stream_options = None;
+                let fallback_json = serde_json::to_string(&fallback_body).map_err(|e| {
+                    KeyComputeError::ProviderError(format!("Failed to serialize request: {}", e))
+                })?;
+                transport.post_stream(&url, headers, fallback_json).await?
+            }
+            Err(e) => return Err(e),
+        };
 
         // 转换字节流为 SSE 事件流
         Ok(parse_openai_stream(byte_stream))
@@ -580,9 +623,13 @@ impl ProviderAdapter for OpenAIProvider {
     }
 
     fn supported_models(&self) -> Vec<&'static str> {
-        vec![
-            "gpt-empty", // GPT 示例空模型名称
-        ]
+        // 协议层不维护模型白名单，模型由渠道账号的 models_supported 声明
+        Vec::new()
+    }
+
+    /// 协议层接受任意模型，路由层已按账号 models_supported 过滤
+    fn supports_model(&self, _model: &str) -> bool {
+        true
     }
 
     /// OpenAI 原生支持图片生成（DALL-E）
@@ -642,6 +689,123 @@ impl ProviderAdapter for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llm_protocol_provider::ByteStream;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Mock 传输层：首次 post_stream 返回指定 HTTP 错误，后续调用成功，
+    /// 并记录每次请求的 body 用于断言 stream_options 降级行为
+    #[derive(Debug)]
+    struct DegradingTransport {
+        /// 首次请求返回的错误消息
+        first_error: String,
+        /// 记录收到的请求 body
+        bodies: Mutex<Vec<String>>,
+    }
+
+    impl DegradingTransport {
+        fn new(first_error: impl Into<String>) -> Self {
+            Self {
+                first_error: first_error.into(),
+                bodies: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HttpTransport for DegradingTransport {
+        async fn post_json(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            _body: String,
+        ) -> Result<String> {
+            Err(KeyComputeError::ProviderError("not used".into()))
+        }
+
+        async fn post_stream(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            body: String,
+        ) -> Result<ByteStream> {
+            let mut bodies = self.bodies.lock().unwrap();
+            bodies.push(body);
+            if bodies.len() == 1 {
+                Err(KeyComputeError::ProviderError(self.first_error.clone()))
+            } else {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+
+        fn request_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn stream_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+    }
+
+    fn stream_request() -> UpstreamRequest {
+        UpstreamRequest::new("https://api.openai.com/v1", "sk-test", "gpt-4o")
+            .with_message("user", "Hello")
+            .with_stream(true)
+    }
+
+    #[tokio::test]
+    async fn test_stream_options_degradation_on_400() {
+        // 上游不认识 stream_options 返回 400 时，应去掉该字段重试一次
+        let provider = OpenAIProvider::new();
+        let transport =
+            DegradingTransport::new("HTTP error (400 Bad Request): unknown field stream_options");
+
+        let result = provider.stream_chat(&transport, stream_request()).await;
+        assert!(result.is_ok(), "degraded retry should succeed");
+
+        let bodies = transport.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "should retry exactly once");
+        assert!(
+            bodies[0].contains("stream_options"),
+            "first request should carry stream_options"
+        );
+        assert!(
+            !bodies[1].contains("stream_options"),
+            "retry request should drop stream_options"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_options_degradation_on_422() {
+        let provider = OpenAIProvider::new();
+        let transport = DegradingTransport::new(
+            "HTTP error (422 Unprocessable Entity): extra field stream_options",
+        );
+
+        let result = provider.stream_chat(&transport, stream_request()).await;
+        assert!(result.is_ok());
+        assert_eq!(transport.bodies.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_stream_options_no_retry_on_auth_or_ratelimit() {
+        // 401/429 与请求体无关，不应触发降级重试
+        for error in [
+            "HTTP error (401 Unauthorized): invalid api key",
+            "HTTP error (429 Too Many Requests): rate limited",
+        ] {
+            let provider = OpenAIProvider::new();
+            let transport = DegradingTransport::new(error);
+
+            let result = provider.stream_chat(&transport, stream_request()).await;
+            assert!(result.is_err(), "{error} should not be retried");
+            assert_eq!(
+                transport.bodies.lock().unwrap().len(),
+                1,
+                "{error} should only be sent once"
+            );
+        }
+    }
 
     #[test]
     fn test_openai_provider_name() {
@@ -650,33 +814,48 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_supported_models() {
+    fn test_openai_supported_models_empty() {
         let provider = OpenAIProvider::new();
-        let models = provider.supported_models();
-        assert!(models.contains(&"gpt-empty"));
-        assert_eq!(models.len(), 1);
+        // 协议层不维护模型白名单
+        assert!(provider.supported_models().is_empty());
     }
 
     #[test]
-    fn test_openai_supports_model() {
+    fn test_openai_supports_any_model() {
         let provider = OpenAIProvider::new();
-        assert!(provider.supports_model("gpt-empty"));
-        assert!(!provider.supports_model("unknown-model"));
+        assert!(provider.supports_model("gpt-4o"));
+        assert!(provider.supports_model("deepseek-chat"));
+        assert!(provider.supports_model("any-model"));
+    }
+
+    #[test]
+    fn test_chat_url_join() {
+        assert_eq!(
+            OpenAIProvider::chat_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            OpenAIProvider::chat_url("https://api.deepseek.com/v1/"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        // 空 endpoint 回落的协议默认 Base URL 必须能拼出完整请求 URL
+        assert_eq!(
+            OpenAIProvider::chat_url(
+                llm_protocol_provider::ProtocolType::Openai.default_endpoint()
+            ),
+            OPENAI_CHAT_ENDPOINT
+        );
     }
 
     #[test]
     fn test_build_request_body() {
         let provider = OpenAIProvider::new();
-        let request = UpstreamRequest::new(
-            "https://api.openai.com/v1/chat/completions",
-            "sk-test",
-            "gpt-4o",
-        )
-        .with_message("system", "You are helpful")
-        .with_message("user", "Hello")
-        .with_stream(true)
-        .with_max_tokens(100)
-        .with_temperature(0.7);
+        let request = UpstreamRequest::new("https://api.openai.com/v1", "sk-test", "gpt-4o")
+            .with_message("system", "You are helpful")
+            .with_message("user", "Hello")
+            .with_stream(true)
+            .with_max_tokens(100)
+            .with_temperature(0.7);
 
         let body = provider.build_request_body(&request);
 

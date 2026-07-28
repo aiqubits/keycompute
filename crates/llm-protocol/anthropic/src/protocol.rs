@@ -1,19 +1,19 @@
-//! Anthropic Claude API 协议类型
+//! Anthropic Messages API 协议类型
 //!
-//! Claude Messages API 的请求/响应结构定义
+//! Anthropic Messages API 的请求/响应结构定义
 //! 文档: https://docs.anthropic.com/claude/reference/messages_post
 
 use serde::{Deserialize, Serialize};
 
-/// Claude Messages API 请求
+/// Anthropic Messages API 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeRequest {
+pub struct AnthropicRequest {
     /// 模型名称，如 claude-3-5-sonnet-20241022
     pub model: String,
     /// 最大生成 token 数
     pub max_tokens: u32,
     /// 消息列表
-    pub messages: Vec<ClaudeMessage>,
+    pub messages: Vec<AnthropicMessage>,
     /// 系统提示词（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
@@ -31,22 +31,22 @@ pub struct ClaudeRequest {
     pub stop_sequences: Option<Vec<String>>,
     /// 元数据
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<ClaudeMetadata>,
+    pub metadata: Option<AnthropicMetadata>,
 }
 
-/// Claude 消息结构
+/// Anthropic 消息结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeMessage {
+pub struct AnthropicMessage {
     /// 角色: user, assistant
     pub role: String,
     /// 消息内容（可以是字符串或内容块列表）
-    pub content: ClaudeContent,
+    pub content: AnthropicContent,
 }
 
-/// Claude 内容类型
+/// Anthropic 内容类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum ClaudeContent {
+pub enum AnthropicContent {
     /// 纯文本内容
     Text(String),
     /// 内容块列表（支持多模态）
@@ -63,30 +63,44 @@ pub enum ContentBlock {
     /// 图片块（base64）
     #[serde(rename = "image")]
     Image { source: ImageSource },
+    /// 未知块类型（如 thinking、tool_use 等，解析时忽略）
+    #[serde(other)]
+    Unknown,
 }
 
 /// 图片来源
+///
+/// 支持 base64 内嵌数据与远程 URL 两种形式
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageSource {
-    /// 类型: base64
-    pub r#type: String,
-    /// 媒体类型: image/jpeg, image/png, image/gif, image/webp
-    pub media_type: String,
-    /// base64 编码的数据
-    pub data: String,
+#[serde(tag = "type")]
+pub enum ImageSource {
+    /// base64 内嵌图片
+    #[serde(rename = "base64")]
+    Base64 {
+        /// 媒体类型: image/jpeg, image/png, image/gif, image/webp
+        media_type: String,
+        /// base64 编码的数据
+        data: String,
+    },
+    /// 远程 URL 图片
+    #[serde(rename = "url")]
+    Url {
+        /// 图片 URL
+        url: String,
+    },
 }
 
 /// 请求元数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeMetadata {
+pub struct AnthropicMetadata {
     /// 用户标识（用于追踪）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
 }
 
-/// Claude Messages API 响应（非流式）
+/// Anthropic Messages API 响应（非流式）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeResponse {
+pub struct AnthropicResponse {
     /// 响应 ID
     pub id: String,
     /// 对象类型: message
@@ -104,12 +118,12 @@ pub struct ClaudeResponse {
     /// 内容列表
     pub content: Vec<ContentBlock>,
     /// 用量信息
-    pub usage: ClaudeUsage,
+    pub usage: AnthropicUsage,
 }
 
 /// 用量信息
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ClaudeUsage {
+pub struct AnthropicUsage {
     /// 输入 token 数
     #[serde(default)]
     pub input_tokens: u32,
@@ -118,13 +132,13 @@ pub struct ClaudeUsage {
     pub output_tokens: u32,
 }
 
-/// Claude 流式响应事件
+/// Anthropic 流式响应事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum ClaudeStreamEvent {
+pub enum AnthropicStreamEvent {
     /// 消息开始
     #[serde(rename = "message_start")]
-    MessageStart { message: ClaudeStreamMessage },
+    MessageStart { message: AnthropicStreamMessage },
     /// 内容块开始
     #[serde(rename = "content_block_start")]
     ContentBlockStart {
@@ -141,22 +155,28 @@ pub enum ClaudeStreamEvent {
     #[serde(rename = "message_delta")]
     MessageDelta {
         delta: MessageDeltaInfo,
-        usage: Option<ClaudeUsage>,
+        usage: Option<AnthropicUsage>,
     },
     /// 消息结束
     #[serde(rename = "message_stop")]
     MessageStop,
     /// 错误
     #[serde(rename = "error")]
-    Error { error: ClaudeError },
+    Error { error: AnthropicError },
     /// Ping（保持连接）
     #[serde(rename = "ping")]
     Ping,
+    /// 未知事件类型（如 thinking 系列、未来新增事件）
+    ///
+    /// Anthropic 官方要求客户端优雅忽略未知事件，
+    /// 不能因解析失败而中断整条流
+    #[serde(other)]
+    Unknown,
 }
 
 /// 流式消息信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeStreamMessage {
+pub struct AnthropicStreamMessage {
     /// 消息 ID
     pub id: String,
     /// 对象类型
@@ -172,7 +192,7 @@ pub struct ClaudeStreamMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
     /// 用量
-    pub usage: ClaudeUsage,
+    pub usage: AnthropicUsage,
 }
 
 /// 内容增量
@@ -182,6 +202,9 @@ pub enum ContentDelta {
     /// 文本增量
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
+    /// 未知增量类型（如 thinking_delta、input_json_delta 等，忽略）
+    #[serde(other)]
+    Unknown,
 }
 
 /// 消息增量信息
@@ -195,16 +218,16 @@ pub struct MessageDeltaInfo {
     pub stop_sequence: Option<String>,
 }
 
-/// Claude API 错误
+/// Anthropic API 错误
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeError {
+pub struct AnthropicError {
     /// 错误类型
     pub r#type: String,
     /// 错误消息
     pub message: String,
 }
 
-impl ClaudeRequest {
+impl AnthropicRequest {
     /// 创建新的请求
     pub fn new(model: impl Into<String>, max_tokens: u32) -> Self {
         Self {
@@ -222,18 +245,18 @@ impl ClaudeRequest {
 
     /// 添加用户消息
     pub fn add_user_message(mut self, content: impl Into<String>) -> Self {
-        self.messages.push(ClaudeMessage {
+        self.messages.push(AnthropicMessage {
             role: "user".to_string(),
-            content: ClaudeContent::Text(content.into()),
+            content: AnthropicContent::Text(content.into()),
         });
         self
     }
 
     /// 添加助手消息
     pub fn add_assistant_message(mut self, content: impl Into<String>) -> Self {
-        self.messages.push(ClaudeMessage {
+        self.messages.push(AnthropicMessage {
             role: "assistant".to_string(),
-            content: ClaudeContent::Text(content.into()),
+            content: AnthropicContent::Text(content.into()),
         });
         self
     }
@@ -263,12 +286,12 @@ impl ClaudeRequest {
     }
 }
 
-impl ClaudeMessage {
+impl AnthropicMessage {
     /// 创建用户消息
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".to_string(),
-            content: ClaudeContent::Text(content.into()),
+            content: AnthropicContent::Text(content.into()),
         }
     }
 
@@ -276,12 +299,12 @@ impl ClaudeMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: ClaudeContent::Text(content.into()),
+            content: AnthropicContent::Text(content.into()),
         }
     }
 }
 
-impl ClaudeResponse {
+impl AnthropicResponse {
     /// 提取文本内容
     pub fn extract_text(&self) -> String {
         self.content
@@ -301,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_claude_request_serialization() {
-        let request = ClaudeRequest::new("claude-3-5-sonnet-20241022", 1024)
+        let request = AnthropicRequest::new("claude-3-5-sonnet-20241022", 1024)
             .with_system("You are helpful")
             .add_user_message("Hello")
             .with_stream(true)
@@ -314,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_response_parsing() {
+    fn test_anthropic_response_parsing() {
         let json = r#"{
             "id": "msg_01XgYhR8f4h3n7sY3R4j4V3d",
             "type": "message",
@@ -325,7 +348,7 @@ mod tests {
             "usage": {"input_tokens": 10, "output_tokens": 20}
         }"#;
 
-        let response: ClaudeResponse = serde_json::from_str(json).unwrap();
+        let response: AnthropicResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.role, "assistant");
         assert_eq!(response.usage.input_tokens, 10);
         assert_eq!(response.extract_text(), "Hello! How can I help you today?");
@@ -335,23 +358,26 @@ mod tests {
     fn test_claude_stream_event_parsing() {
         // 消息开始事件
         let json = r#"{"type": "message_start", "message": {"id": "msg_01XgYhR8f4h3n7sY3R4j4V3d", "type": "message", "role": "assistant", "model": "claude-3-5-sonnet-20241022", "usage": {"input_tokens": 10, "output_tokens": 0}}}"#;
-        let event: ClaudeStreamEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ClaudeStreamEvent::MessageStart { .. }));
+        let event: AnthropicStreamEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, AnthropicStreamEvent::MessageStart { .. }));
 
         // 内容增量事件
         let json = r#"{"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}"#;
-        let event: ClaudeStreamEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ClaudeStreamEvent::ContentBlockDelta { .. }));
+        let event: AnthropicStreamEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event,
+            AnthropicStreamEvent::ContentBlockDelta { .. }
+        ));
 
         // 消息结束事件
         let json = r#"{"type": "message_stop"}"#;
-        let event: ClaudeStreamEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ClaudeStreamEvent::MessageStop));
+        let event: AnthropicStreamEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, AnthropicStreamEvent::MessageStop));
     }
 
     #[test]
     fn test_claude_usage() {
-        let usage = ClaudeUsage {
+        let usage = AnthropicUsage {
             input_tokens: 100,
             output_tokens: 50,
         };

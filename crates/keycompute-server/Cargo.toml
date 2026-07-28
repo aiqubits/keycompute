@@ -21,13 +21,9 @@ keycompute-wechatpay = { workspace = true }
 keycompute-cache = { workspace = true }
 node-gateway = { path = "../node-gateway" }
 llm-gateway = { workspace = true }
-keycompute-provider-trait = { workspace = true }
-keycompute-openai = { workspace = true }
-keycompute-deepseek = { workspace = true }
-keycompute-vllm = { workspace = true }
-keycompute-claude = { workspace = true }
-keycompute-ollama = { workspace = true }
-keycompute-gemini = { workspace = true }
+llm-protocol-provider = { workspace = true }
+llm-protocol-openai = { workspace = true }
+llm-protocol-anthropic = { workspace = true }
 
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }

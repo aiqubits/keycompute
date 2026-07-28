@@ -50,25 +50,67 @@ impl Default for GatewayConfigInfo {
     }
 }
 
+/// 从渠道账号一次性聚合各 Provider（协议）支持的模型列表
+///
+/// 协议层不再维护模型白名单，模型由各账号的 models_supported 声明，
+/// 此处全量加载启用账号后在内存中按 provider 分组去重，
+/// 避免逐 provider 重复查库（N+1）。
+///
+/// 注意：本模块是 Admin 调试接口（路由层有 admin_auth_middleware 保护），
+/// 故聚合不限租户；若未来复用到用户侧接口，必须改为按租户 +
+/// visibility 过滤（与路由选账号的可见性规则对齐）
+async fn aggregate_models_by_provider(state: &AppState) -> HashMap<String, Vec<String>> {
+    let Some(pool) = state.pool.as_deref() else {
+        return HashMap::new();
+    };
+    match keycompute_db::Account::find_enabled_all(pool).await {
+        Ok(accounts) => {
+            let mut map: HashMap<String, Vec<String>> = HashMap::new();
+            for account in accounts {
+                map.entry(account.provider)
+                    .or_default()
+                    .extend(account.models_supported);
+            }
+            for models in map.values_mut() {
+                models.sort();
+                models.dedup();
+            }
+            map
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to aggregate models from accounts"
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// 聚合单个 Provider（协议）支持的模型列表
+async fn aggregate_provider_models(state: &AppState, provider: &str) -> Vec<String> {
+    aggregate_models_by_provider(state)
+        .await
+        .remove(provider)
+        .unwrap_or_default()
+}
+
 /// 获取 Gateway 状态
 pub async fn get_gateway_status(
     State(state): State<AppState>,
 ) -> Result<Json<GatewayStatusResponse>> {
-    // 从 GatewayExecutor 获取 Provider 列表
-    let providers: Vec<ProviderInfo> = state
-        .gateway
-        .list_providers()
-        .into_iter()
-        .map(|name| {
-            let health = state.provider_health.get_health(&name);
-            let supported_models = state.gateway.get_provider_models(&name);
-            ProviderInfo {
-                name: name.clone(),
-                supported_models,
-                healthy: health.as_ref().map(|h| h.healthy).unwrap_or(true),
-            }
-        })
-        .collect();
+    // 从 GatewayExecutor 获取 Provider 列表，模型列表从渠道账号一次性聚合
+    let mut models_by_provider = aggregate_models_by_provider(&state).await;
+    let mut providers = Vec::new();
+    for name in state.gateway.list_providers() {
+        let health = state.provider_health.get_health(&name);
+        let supported_models = models_by_provider.remove(&name).unwrap_or_default();
+        providers.push(ProviderInfo {
+            name: name.clone(),
+            supported_models,
+            healthy: health.as_ref().map(|h| h.healthy).unwrap_or(true),
+        });
+    }
 
     Ok(Json(GatewayStatusResponse {
         available: !providers.is_empty(),
@@ -113,7 +155,7 @@ pub async fn check_provider_health(
     let configured = state.gateway.has_provider(&request.provider);
 
     if let Some(health) = health {
-        let models = state.gateway.get_provider_models(&request.provider);
+        let models = aggregate_provider_models(&state, &request.provider).await;
         Ok(Json(ProviderHealthResponse {
             provider: request.provider,
             healthy: health.healthy,
@@ -127,7 +169,7 @@ pub async fn check_provider_health(
         }))
     } else if configured {
         // Provider 已配置但还没有请求记录，默认健康
-        let models = state.gateway.get_provider_models(&request.provider);
+        let models = aggregate_provider_models(&state, &request.provider).await;
         Ok(Json(ProviderHealthResponse {
             provider: request.provider,
             healthy: true,

@@ -1184,23 +1184,15 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("accounts.channel_name", "渠道名称 *");
     m.insert("accounts.channel_name_placeholder", "如 OpenAI 官方");
     m.insert("accounts.provider", "Provider *");
-    m.insert(
-        "accounts.supported_models",
-        "支持模型（可选，留空使用默认）",
-    );
-    m.insert(
-        "accounts.models_hint",
-        "多个模型用逗号分隔，留空则使用该 Provider 的默认模型",
-    );
+    m.insert("accounts.supported_models", "支持模型 *");
+    m.insert("accounts.models_hint", "多个模型用逗号分隔");
     m.insert("accounts.api_key", "API Key *");
-    m.insert("accounts.custom_base_url", "自定义 Base URL（可选）");
+    m.insert("accounts.custom_base_url", "自定义 Base URL");
     m.insert("accounts.edit_title", "编辑 LLM 渠道");
     m.insert("accounts.new_api_key", "新 API Key（留空则不修改）");
     m.insert("accounts.new_api_key_placeholder", "留空不修改当前 Key");
-    m.insert(
-        "accounts.custom_base_url_optional",
-        "自定义 Base URL（留空则不修改）",
-    );
+    m.insert("accounts.custom_base_url_optional", "自定义 Base URL");
+    m.insert("accounts.reset_base_url", "重置为协议默认端点");
     m.insert("accounts.enable_channel", "启用渠道");
     m.insert("accounts.global_visibility", "全局可见");
     m.insert(

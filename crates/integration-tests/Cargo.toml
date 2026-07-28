@@ -18,10 +18,9 @@ keycompute-observability = { workspace = true }
 keycompute-server = { workspace = true }
 keycompute-cache = { workspace = true }
 keycompute-emailserver = { workspace = true }
-keycompute-provider-trait = { workspace = true }
-keycompute-openai = { workspace = true }
-keycompute-claude = { workspace = true }
-keycompute-ollama = { workspace = true }
+llm-protocol-provider = { workspace = true }
+llm-protocol-openai = { workspace = true }
+llm-protocol-anthropic = { workspace = true }
 llm-gateway = { workspace = true }
 node-gateway = { workspace = true }
 

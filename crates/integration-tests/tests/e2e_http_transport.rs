@@ -15,7 +15,7 @@ use integration_tests::mocks::http_transport::{
     MockHttpTransport, MockHttpTransportFactory, MockResponse, MockStreamConfig, ProxyConfig,
 };
 use integration_tests::mocks::provider::MockProviderFactory;
-use keycompute_provider_trait::{HttpTransport, ProviderAdapter, UpstreamRequest};
+use llm_protocol_provider::{HttpTransport, ProviderAdapter, UpstreamRequest};
 use std::time::Duration;
 
 // ============================================================================
@@ -38,14 +38,14 @@ async fn test_mock_transport_basic() {
 
     // 2. 验证默认超时
     chain.add_step(
-        "keycompute-provider-trait",
+        "llm-protocol-provider",
         "HttpTransport::request_timeout",
         format!("Default request timeout: {:?}", transport.request_timeout()),
         transport.request_timeout() == Duration::from_secs(120),
     );
 
     chain.add_step(
-        "keycompute-provider-trait",
+        "llm-protocol-provider",
         "HttpTransport::stream_timeout",
         format!("Default stream timeout: {:?}", transport.stream_timeout()),
         transport.stream_timeout() == Duration::from_secs(600),
@@ -75,7 +75,7 @@ async fn test_mock_transport_success_response() {
         .await;
 
     chain.add_step(
-        "keycompute-provider-trait",
+        "llm-protocol-provider",
         "HttpTransport::post_json",
         format!("Request succeeded: {}", result.is_ok()),
         result.is_ok(),
@@ -754,7 +754,7 @@ async fn test_provider_with_mock_transport() {
     let result = provider.stream_chat(&transport, request).await;
 
     chain.add_step(
-        "keycompute-provider-trait",
+        "llm-protocol-provider",
         "ProviderAdapter::stream_chat",
         format!("Stream created: {}", result.is_ok()),
         result.is_ok(),
@@ -770,7 +770,7 @@ async fn test_provider_with_mock_transport() {
         }
 
         chain.add_step(
-            "keycompute-provider-trait",
+            "llm-protocol-provider",
             "ProviderTransportIntegration::events",
             format!("Events received: {}", event_count),
             event_count > 0,

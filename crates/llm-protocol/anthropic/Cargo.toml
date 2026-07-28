@@ -1,0 +1,20 @@
+[package]
+name = "llm-protocol-anthropic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+keycompute-types = { workspace = true }
+llm-protocol-provider = { workspace = true }
+async-trait = "0.1"
+bytes = "1.5"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["sync", "rt"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-test = "0.4"

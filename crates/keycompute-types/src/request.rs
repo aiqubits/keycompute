@@ -24,6 +24,12 @@ pub struct RequestContext {
     pub provider: Option<String>,
     pub messages: Vec<Message>,
     pub stream: bool,
+    /// 客户端指定的最大生成 token 数（透传给上游协议层）
+    pub max_tokens: Option<u32>,
+    /// 客户端指定的温度参数（透传给上游协议层）
+    pub temperature: Option<f32>,
+    /// 客户端指定的 Top P 参数（透传给上游协议层）
+    pub top_p: Option<f32>,
     pub pricing_snapshot: PricingSnapshot, // 请求开始时固化
     usage: Arc<UsageAccumulator>,          // streaming 中累积（共享状态）
     pub started_at: DateTime<Utc>,
@@ -48,6 +54,9 @@ impl RequestContext {
             provider: None,
             messages,
             stream,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
             pricing_snapshot,
             usage: Arc::new(UsageAccumulator::new()),
             started_at: Utc::now(),

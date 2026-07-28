@@ -10,8 +10,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
-use keycompute_provider_trait::{ByteStream, GetBinaryResponse, HttpTransport};
 use keycompute_types::{KeyComputeError, Result};
+use llm_protocol_provider::{ByteStream, GetBinaryResponse, HttpTransport};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;

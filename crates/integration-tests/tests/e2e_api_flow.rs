@@ -30,7 +30,7 @@ async fn test_api_request_flow_requires_database() {
     providers.insert(
         "openai".to_string(),
         Arc::new(MockProviderFactory::create_openai())
-            as Arc<dyn keycompute_provider_trait::ProviderAdapter>,
+            as Arc<dyn llm_protocol_provider::ProviderAdapter>,
     );
     let state = AppState::with_providers(providers);
     let app = create_router(state);

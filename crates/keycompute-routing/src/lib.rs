@@ -46,6 +46,12 @@ const HEALTH_WEIGHT: f64 = 0.2;
 const UNHEALTHY_PENALTY: f64 = 100.0;
 const HIGH_LATENCY_THRESHOLD_MS: u64 = 1000;
 
+/// 每个 Provider（协议）最多选入执行计划的账号数
+///
+/// 协议收敛为两种后，同一协议下可能挂载多个厂商的账号（如 OpenAI 官方 +
+/// DeepSeek + Ollama），选入 top-N 账号作为 fallback 链，保持原多厂商回退能力
+const MAX_ACCOUNTS_PER_PROVIDER: usize = 3;
+
 /// 路由引擎
 ///
 /// 双层路由：Layer1 模型路由，Layer2 账号路由
@@ -219,37 +225,34 @@ impl RoutingEngine {
             "route: providers ranked"
         );
 
-        // Layer2: 账号路由 - 为每个 provider 选择租户专属的最优账号
-        // 关键改进：只选择支持请求模型的账号
+        // Layer2: 账号路由 - 为每个 provider 选择租户专属的最优账号（top-N）
+        // 关键改进：只选择支持请求模型的账号；同协议下多个账号（多厂商）
+        // 按优先级依次进入 fallback 链，保持原多厂商回退能力
         let mut targets = Vec::new();
         for provider in ranked_providers {
             // 传入 tenant_id 和 model 确保使用租户专属账号池且账号支持该模型
             tracing::info!(
                 request_id = %ctx.request_id,
                 provider = %provider,
-                "route: selecting account"
+                "route: selecting accounts"
             );
-            if let Some(target) = self
+            let provider_targets = self
                 .select_account_for_model(&provider, ctx.tenant_id, &ctx.model)
-                .await?
-            {
-                let endpoint = match &target {
-                    ExecutionTarget::ProviderAccount { endpoint, .. } => endpoint,
-                    ExecutionTarget::Node { .. } => "node",
-                };
-                tracing::info!(
-                    request_id = %ctx.request_id,
-                    provider = %provider,
-                    endpoint = %endpoint,
-                    "route: account selected"
-                );
-                targets.push(target);
-            } else {
+                .await?;
+            if provider_targets.is_empty() {
                 tracing::info!(
                     request_id = %ctx.request_id,
                     provider = %provider,
                     "route: no account found"
                 );
+            } else {
+                tracing::info!(
+                    request_id = %ctx.request_id,
+                    provider = %provider,
+                    accounts_count = provider_targets.len(),
+                    "route: accounts selected"
+                );
+                targets.extend(provider_targets);
             }
         }
 
@@ -416,8 +419,8 @@ impl RoutingEngine {
 
     /// Layer2: 账号路由（带模型过滤）
     ///
-    /// 为指定 Provider 选择支持特定模型的账号
-    /// 按优先级排序，选择第一个未冷却的账号
+    /// 为指定 Provider 选择支持特定模型的账号（top-N）
+    /// 按优先级排序，跳过冷却中的账号，最多返回 MAX_ACCOUNTS_PER_PROVIDER 个
     /// 注意：暂时不检查 Provider 健康状态，所有 Provider 都可以选择账号
     ///
     /// # 参数
@@ -429,7 +432,7 @@ impl RoutingEngine {
         provider: &str,
         tenant_id: Uuid,
         model: &str,
-    ) -> Result<Option<ExecutionTarget>> {
+    ) -> Result<Vec<ExecutionTarget>> {
         // 注意：暂时不检查 Provider 健康状态
         // 即使 Provider 不健康，仍然尝试选择其下的账号
         // 健康状态仅影响 Layer1 的路由排序
@@ -464,8 +467,8 @@ impl RoutingEngine {
             return self.select_fallback_account(provider).await;
         };
 
-        // 从账号列表中选择最优账号
-        self.select_best_account(provider, accounts).await
+        // 从账号列表中选择最优账号（top-N）
+        self.select_best_accounts(provider, accounts).await
     }
 
     /// 从数据库加载租户可见的账号（含本租户 + 全局可见）
@@ -547,30 +550,36 @@ impl RoutingEngine {
         Ok(provider_accounts)
     }
 
-    /// 选择账号
+    /// 选择账号（top-N）
     ///
-    /// 按优先级排序，选择第一个未冷却的账号
-    async fn select_best_account(
+    /// 按优先级排序，跳过冷却中的账号，最多返回 MAX_ACCOUNTS_PER_PROVIDER 个
+    /// 第一个为主选，其余作为同协议下的 fallback（多厂商回退）
+    async fn select_best_accounts(
         &self,
         provider: &str,
         accounts: Vec<Account>,
-    ) -> Result<Option<ExecutionTarget>> {
+    ) -> Result<Vec<ExecutionTarget>> {
         tracing::info!(
             provider = %provider,
             accounts_count = accounts.len(),
-            "select_best_account: starting"
+            "select_best_accounts: starting"
         );
 
         if accounts.is_empty() {
             tracing::warn!(provider = %provider, "No accounts available");
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         // 按优先级排序
         let mut sorted_accounts: Vec<_> = accounts.into_iter().collect();
         sorted_accounts.sort_by_key(|account| std::cmp::Reverse(account.priority));
 
+        let mut targets = Vec::new();
         for account in sorted_accounts {
+            if targets.len() >= MAX_ACCOUNTS_PER_PROVIDER {
+                break;
+            }
+
             // 检查账号是否在冷却中
             if self.account_states.is_cooling_down(&account.id) {
                 let remaining = self.account_states.get(&account.id).cooldown_remaining();
@@ -583,16 +592,39 @@ impl RoutingEngine {
                 continue;
             }
 
-            // 解密上游 API Key
+            // 解密上游 API Key：单个账号的坏密钥不应中止整条路由，
+            // 否则低优先级账号的脏数据会拖垂本可经健康账号成功的请求
             let upstream_api_key =
-                Self::decrypt_upstream_api_key(&account.upstream_api_key_encrypted)?;
+                match Self::decrypt_upstream_api_key(&account.upstream_api_key_encrypted) {
+                    Ok(key) => key,
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = %provider,
+                            account_id = %account.id,
+                            error = %e,
+                            "Failed to decrypt upstream API key, skipping account"
+                        );
+                        continue;
+                    }
+                };
 
-            let target = ExecutionTarget::new_provider(
-                provider.to_string(),
-                account.id,
-                account.endpoint,
-                upstream_api_key,
-            );
+            // 空 endpoint 表示使用协议默认端点（与创建/测试接口的语义保持一致，
+            // 否则默认预设创建的账号会在执行时因相对 URL 而失败）
+            let endpoint = if account.endpoint.is_empty() {
+                match llm_protocol_provider::ProtocolType::parse(provider) {
+                    Some(p) => p.default_endpoint().to_string(),
+                    None => {
+                        tracing::warn!(
+                            provider = %provider,
+                            account_id = %account.id,
+                            "Account has empty endpoint and unknown protocol, skipping"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                account.endpoint
+            };
 
             tracing::info!(
                 provider = %provider,
@@ -600,10 +632,15 @@ impl RoutingEngine {
                 "Account selected"
             );
 
-            return Ok(Some(target));
+            targets.push(ExecutionTarget::new_provider(
+                provider.to_string(),
+                account.id,
+                endpoint,
+                upstream_api_key,
+            ));
         }
 
-        Ok(None)
+        Ok(targets)
     }
 
     /// 解密上游 API Key
@@ -639,7 +676,7 @@ impl RoutingEngine {
     }
 
     /// 回退账号选择（无数据库时使用）
-    async fn select_fallback_account(&self, provider: &str) -> Result<Option<ExecutionTarget>> {
+    async fn select_fallback_account(&self, provider: &str) -> Result<Vec<ExecutionTarget>> {
         let account_id = Uuid::new_v4();
 
         // 检查账号是否在冷却中
@@ -651,18 +688,18 @@ impl RoutingEngine {
                 remaining_secs = remaining.map(|d| d.as_secs()),
                 "Account is cooling down, skipping"
             );
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
-        // 构建执行目标
+        // 构建执行目标（endpoint 为 Base URL，路径由协议层拼接）
         let target = ExecutionTarget::new_provider(
             provider.to_string(),
             account_id,
-            format!("https://api.{}.com/v1/chat/completions", provider),
+            format!("https://api.{}.com/v1", provider),
             "mock-api-key",
         );
 
-        Ok(Some(target))
+        Ok(vec![target])
     }
 
     /// 获取 Provider 健康状态存储（只读访问）
@@ -1092,6 +1129,122 @@ mod tests {
             }
             _ => panic!("Expected Internal error"),
         }
+    }
+
+    fn create_test_account(provider: &str, endpoint: &str, priority: i32) -> Account {
+        // 先确保全局加密密钥已设置（OnceLock 首次设置生效、重复调用静默忽略），
+        // 再存加密值，避免与并行测试中设置密钥的时序竞态
+        keycompute_runtime::set_global_crypto(&keycompute_runtime::ApiKeyCrypto::generate_key())
+            .expect("Failed to set global crypto");
+        let upstream_key = keycompute_runtime::encrypt_api_key("sk-test-plain")
+            .expect("Failed to encrypt test key")
+            .into_inner();
+        let now = chrono::Utc::now();
+        Account {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            provider: provider.to_string(),
+            name: format!("{}-account", provider),
+            endpoint: endpoint.to_string(),
+            upstream_api_key_encrypted: upstream_key,
+            upstream_api_key_preview: "sk-t****".to_string(),
+            rpm_limit: 60,
+            tpm_limit: 100_000,
+            priority,
+            enabled: true,
+            models_supported: vec!["gpt-4o".to_string()],
+            visibility: "tenant".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_best_accounts_empty_endpoint_uses_protocol_default() {
+        // 空 endpoint 的账号应回落到协议默认 Base URL，
+        // 而非带着空 endpoint 进入执行层导致相对 URL 失败
+        let engine = create_test_engine();
+        let accounts = vec![create_test_account("openai", "", 10)];
+
+        let targets = engine
+            .select_best_accounts("openai", accounts)
+            .await
+            .unwrap();
+
+        assert_eq!(targets.len(), 1);
+        match &targets[0] {
+            ExecutionTarget::ProviderAccount { endpoint, .. } => {
+                assert_eq!(
+                    endpoint,
+                    llm_protocol_provider::ProtocolType::Openai.default_endpoint()
+                );
+            }
+            _ => panic!("Expected ProviderAccount target"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_best_accounts_skips_undecryptable_account() {
+        // 单个账号密钥损坏不应中止整条路由，其余健康账号仍应入选
+        let engine = create_test_engine();
+        let healthy_high = create_test_account("openai", "https://high.example.com/v1", 100);
+        let mut broken = create_test_account("openai", "https://broken.example.com/v1", 50);
+        // 非 Base64/非合法密文，解密必失败（全局密钥已在 create_test_account 中设置）
+        broken.upstream_api_key_encrypted = "!!not-valid-ciphertext!!".to_string();
+        let healthy_low = create_test_account("openai", "https://low.example.com/v1", 1);
+
+        let targets = engine
+            .select_best_accounts("openai", vec![healthy_high, broken, healthy_low])
+            .await
+            .unwrap();
+
+        let endpoints: Vec<&str> = targets
+            .iter()
+            .map(|t| match t {
+                ExecutionTarget::ProviderAccount { endpoint, .. } => endpoint.as_str(),
+                _ => panic!("Expected ProviderAccount target"),
+            })
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec!["https://high.example.com/v1", "https://low.example.com/v1"],
+            "broken account should be skipped, healthy ones kept in priority order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_select_best_accounts_priority_order_and_top_n() {
+        // 同协议多账号按优先级降序选取，最多 MAX_ACCOUNTS_PER_PROVIDER 个
+        let engine = create_test_engine();
+        let accounts = vec![
+            create_test_account("openai", "https://low.example.com/v1", 1),
+            create_test_account("openai", "https://high.example.com/v1", 100),
+            create_test_account("openai", "https://mid.example.com/v1", 50),
+            create_test_account("openai", "https://lowest.example.com/v1", 0),
+        ];
+
+        let targets = engine
+            .select_best_accounts("openai", accounts)
+            .await
+            .unwrap();
+
+        // 截断到 top-N，且首选为最高优先级账号
+        assert_eq!(targets.len(), MAX_ACCOUNTS_PER_PROVIDER);
+        let endpoints: Vec<&str> = targets
+            .iter()
+            .map(|t| match t {
+                ExecutionTarget::ProviderAccount { endpoint, .. } => endpoint.as_str(),
+                _ => panic!("Expected ProviderAccount target"),
+            })
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec![
+                "https://high.example.com/v1",
+                "https://mid.example.com/v1",
+                "https://low.example.com/v1",
+            ]
+        );
     }
 
     #[tokio::test]

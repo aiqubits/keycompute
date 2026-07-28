@@ -5,10 +5,10 @@ members = [
     "packages/web",
     "packages/desktop",
     "packages/mobile",
-    "packages/client-api", "crates/keycompute-payment/keycompute-alipay", "crates/keycompute-payment/keycompute-wechatpay", "crates/keycompute-runtime", "crates/llm-gateway", "crates/llm-provider/keycompute-claude", "crates/llm-provider/keycompute-gemini", "crates/llm-provider/keycompute-ollama", "crates/llm-provider/keycompute-openai", "crates/keycompute-types", "crates/keycompute-db", "crates/keycompute-auth", "crates/keycompute-ratelimit", "crates/keycompute-pricing", "crates/keycompute-routing", "crates/llm-provider/keycompute-provider-trait", "crates/llm-provider/keycompute-deepseek", "crates/keycompute-billing", "crates/keycompute-distribution", "crates/keycompute-observability",
+    "packages/client-api", "crates/keycompute-payment/keycompute-alipay", "crates/keycompute-payment/keycompute-wechatpay", "crates/keycompute-runtime", "crates/llm-gateway", "crates/keycompute-types", "crates/keycompute-db", "crates/keycompute-auth", "crates/keycompute-ratelimit", "crates/keycompute-pricing", "crates/keycompute-routing", "crates/keycompute-billing", "crates/keycompute-distribution", "crates/keycompute-observability",
     "crates/keycompute-server",
-    "crates/integration-tests", "crates/llm-provider/keycompute-vllm", "crates/keycompute-config", "crates/keycompute-emailserver", "crates/node-gateway",
-    "crates/keycompute-cache",
+    "crates/integration-tests", "crates/keycompute-config", "crates/keycompute-emailserver", "crates/node-gateway",
+    "crates/keycompute-cache", "crates/llm-protocol/provider", "crates/llm-protocol/openai", "crates/llm-protocol/anthropic",
 ]
 
 [workspace.dependencies]
@@ -27,13 +27,9 @@ keycompute-auth = { path = "crates/keycompute-auth" }
 keycompute-ratelimit = { path = "crates/keycompute-ratelimit" }
 keycompute-pricing = { path = "crates/keycompute-pricing" }
 keycompute-routing = { path = "crates/keycompute-routing" }
-keycompute-provider-trait = { path = "crates/llm-provider/keycompute-provider-trait" }
-keycompute-openai = { path = "crates/llm-provider/keycompute-openai" }
-keycompute-deepseek = { path = "crates/llm-provider/keycompute-deepseek" }
-keycompute-vllm = { path = "crates/llm-provider/keycompute-vllm" }
-keycompute-claude = { path = "crates/llm-provider/keycompute-claude" }
-keycompute-gemini = { path = "crates/llm-provider/keycompute-gemini" }
-keycompute-ollama = { path = "crates/llm-provider/keycompute-ollama" }
+llm-protocol-provider = { path = "crates/llm-protocol/provider" }
+llm-protocol-openai = { path = "crates/llm-protocol/openai" }
+llm-protocol-anthropic = { path = "crates/llm-protocol/anthropic" }
 llm-gateway = { path = "crates/llm-gateway" }
 keycompute-billing = { path = "crates/keycompute-billing" }
 keycompute-distribution = { path = "crates/keycompute-distribution" }

@@ -2,7 +2,7 @@
 //!
 //! 流处理管道：chunk 转发、token 累积、SSE 编码。
 
-use keycompute_provider_trait::StreamEvent;
+use llm_protocol_provider::StreamEvent;
 use uuid::Uuid;
 
 /// 流处理上下文

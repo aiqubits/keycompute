@@ -12,10 +12,10 @@
 use futures::StreamExt;
 use integration_tests::common::VerificationChain;
 use integration_tests::mocks::provider::MockProviderFactory;
-use keycompute_provider_trait::{ProviderAdapter, UpstreamRequest};
 use keycompute_ratelimit::{RateLimitKey, RateLimitService};
 use keycompute_routing::{AccountStateStore, ProviderHealthStore, RoutingEngine};
 use keycompute_types::{ExecutionTarget, PricingSnapshot, RequestContext};
+use llm_protocol_provider::{ProviderAdapter, UpstreamRequest};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -376,7 +376,7 @@ async fn test_concurrent_provider_requests() {
 
     // 1. 创建 Provider
     let provider = Arc::new(MockProviderFactory::create_openai());
-    let transport = Arc::new(keycompute_provider_trait::DefaultHttpTransport::new());
+    let transport = Arc::new(llm_protocol_provider::DefaultHttpTransport::new());
 
     chain.add_step(
         "integration-tests::mocks",
@@ -433,7 +433,7 @@ async fn test_concurrent_provider_requests() {
 
     // 4. 验证
     chain.add_step(
-        "keycompute-provider-trait",
+        "llm-protocol-provider",
         "ConcurrentProvider::success_rate",
         format!(
             "Success: {}/{}, Errors: {}",
@@ -443,7 +443,7 @@ async fn test_concurrent_provider_requests() {
     );
 
     chain.add_step(
-        "keycompute-provider-trait",
+        "llm-protocol-provider",
         "ConcurrentProvider::events_per_request",
         format!(
             "Total events: {}, Avg per request: {:.1}",
@@ -469,7 +469,7 @@ async fn test_concurrent_mixed_providers() {
     let timeout_provider = Arc::new(MockProviderFactory::create_timeout());
     let flaky_provider = Arc::new(MockProviderFactory::create_flaky(2));
 
-    let transport = Arc::new(keycompute_provider_trait::DefaultHttpTransport::new());
+    let transport = Arc::new(llm_protocol_provider::DefaultHttpTransport::new());
 
     // 2. 并发请求（每种类型 15 个）
     let mut tasks = JoinSet::new();
@@ -748,7 +748,7 @@ async fn test_full_chain_concurrent_pressure() {
     // 1. 创建所有组件
     let engine = Arc::new(create_test_engine());
     let provider = Arc::new(MockProviderFactory::create_openai());
-    let transport = Arc::new(keycompute_provider_trait::DefaultHttpTransport::new());
+    let transport = Arc::new(llm_protocol_provider::DefaultHttpTransport::new());
 
     chain.add_step(
         "integration-tests",
@@ -875,7 +875,7 @@ async fn test_burst_traffic_handling() {
 
     // 1. 创建组件
     let provider = Arc::new(MockProviderFactory::create_openai());
-    let transport = Arc::new(keycompute_provider_trait::DefaultHttpTransport::new());
+    let transport = Arc::new(llm_protocol_provider::DefaultHttpTransport::new());
 
     // 2. 分批发送请求模拟突发流量
     let batches = 5;
@@ -963,7 +963,7 @@ async fn test_sustained_high_load() {
 
     // 1. 创建组件
     let provider = Arc::new(MockProviderFactory::create_openai());
-    let transport = Arc::new(keycompute_provider_trait::DefaultHttpTransport::new());
+    let transport = Arc::new(llm_protocol_provider::DefaultHttpTransport::new());
 
     // 2. 持续发送请求
     let total_requests = duration_secs * target_rps;

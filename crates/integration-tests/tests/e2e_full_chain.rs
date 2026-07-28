@@ -10,9 +10,9 @@ use integration_tests::mocks::database::{MockDatabase, MockDistributionRecord, M
 use integration_tests::mocks::provider::MockProviderFactory;
 
 use keycompute_billing::calculate_amount;
-use keycompute_provider_trait::ProviderAdapter;
 use keycompute_routing::AccountStateStore;
 use keycompute_types::{Message, PricingSnapshot, RequestContext, UsageAccumulator};
+use llm_protocol_provider::ProviderAdapter;
 
 use futures::StreamExt;
 use rust_decimal::Decimal;
@@ -75,12 +75,12 @@ async fn test_full_request_chain() {
 
     // 4. 执行 Provider 请求（模拟 Gateway 行为）
     let upstream_request =
-        keycompute_provider_trait::UpstreamRequest::new("http://mock-openai", "mock-key", "gpt-4o")
+        llm_protocol_provider::UpstreamRequest::new("http://mock-openai", "mock-key", "gpt-4o")
             .with_stream(true)
             .with_message("user", "Hello");
 
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
-    let mut stream: keycompute_provider_trait::StreamBox = provider
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
+    let mut stream: llm_protocol_provider::StreamBox = provider
         .stream_chat(&transport, upstream_request)
         .await
         .unwrap();
@@ -89,19 +89,19 @@ async fn test_full_request_chain() {
 
     while let Some(event) = stream.next().await {
         match event.unwrap() {
-            keycompute_provider_trait::StreamEvent::Delta { content, .. } => {
+            llm_protocol_provider::StreamEvent::Delta { content, .. } => {
                 delta_count += 1;
                 // 模拟 Token 累积
                 request_context.add_output_tokens(estimate_tokens(&content));
             }
-            keycompute_provider_trait::StreamEvent::Usage {
+            llm_protocol_provider::StreamEvent::Usage {
                 input_tokens,
                 output_tokens,
             } => {
                 request_context.set_input_tokens(input_tokens);
                 usage_event = Some((input_tokens, output_tokens));
             }
-            keycompute_provider_trait::StreamEvent::Done => break,
+            llm_protocol_provider::StreamEvent::Done => break,
             _ => {}
         }
     }
@@ -219,12 +219,12 @@ async fn test_fallback_chain() {
 
     // 2. 模拟 Primary Provider 失败
     let upstream_request =
-        keycompute_provider_trait::UpstreamRequest::new("http://mock", "mock-key", "gpt-4o");
+        llm_protocol_provider::UpstreamRequest::new("http://mock", "mock-key", "gpt-4o");
 
     // 使用默认 HTTP 传输层
-    let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+    let transport = llm_protocol_provider::DefaultHttpTransport::new();
 
-    let primary_result: Result<keycompute_provider_trait::StreamBox, _> = failing_provider
+    let primary_result: Result<llm_protocol_provider::StreamBox, _> = failing_provider
         .stream_chat(&transport, upstream_request.clone())
         .await;
     chain.add_step(
@@ -235,7 +235,7 @@ async fn test_fallback_chain() {
     );
 
     // 3. 模拟 Fallback 到备用 Provider
-    let fallback_result: Result<keycompute_provider_trait::StreamBox, _> = success_provider
+    let fallback_result: Result<llm_protocol_provider::StreamBox, _> = success_provider
         .stream_chat(&transport, upstream_request)
         .await;
     chain.add_step(
@@ -247,7 +247,7 @@ async fn test_fallback_chain() {
 
     // 4. 验证 Fallback 成功后的流处理
     if let Ok(stream) = fallback_result {
-        let mut stream: keycompute_provider_trait::StreamBox = stream;
+        let mut stream: llm_protocol_provider::StreamBox = stream;
         let mut event_count = 0;
         while let Some(event) = stream.next().await {
             if event.is_ok() {

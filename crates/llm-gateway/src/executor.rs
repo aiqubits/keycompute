@@ -14,12 +14,12 @@
 
 use crate::{GatewayConfig, HttpProxy, streaming::StreamPipeline};
 use futures::StreamExt;
-use keycompute_provider_trait::{
+use keycompute_routing::{AccountStateStore, ProviderHealthStore};
+use keycompute_types::{ExecutionPlan, ExecutionTarget, KeyComputeError, RequestContext, Result};
+use llm_protocol_provider::{
     DefaultHttpTransport, HttpTransport, ProviderAdapter, StreamEvent, UpstreamMessage,
     UpstreamRequest,
 };
-use keycompute_routing::{AccountStateStore, ProviderHealthStore};
-use keycompute_types::{ExecutionPlan, ExecutionTarget, KeyComputeError, RequestContext, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -180,10 +180,17 @@ impl GatewayExecutor {
         let mut last_error = None;
         let _start_time = Instant::now();
         let mut is_primary = true;
+        // 是否已向客户端转发过内容：一旦发出过 Delta，
+        // 流中途失败后不可再 fallback，否则客户端会收到
+        // 「前一段部分内容 + 新一遍完整内容」的重复拼接输出
+        let mut sent_content = false;
 
         for target in targets {
             let target_start = Instant::now();
-            match self.try_execute(&ctx, &target, tx.clone()).await {
+            match self
+                .try_execute(&ctx, &target, tx.clone(), &mut sent_content)
+                .await
+            {
                 Ok(()) => {
                     // 成功：标记账号状态
                     if let ExecutionTarget::ProviderAccount { account_id, .. } = &target {
@@ -234,6 +241,16 @@ impl GatewayExecutor {
                         error = %e,
                         "Request failed, trying fallback"
                     );
+                    // 内容已部分送达客户端：不再 fallback，直接上报错误
+                    //（execute 外层会向客户端发送 Error 事件）
+                    if sent_content {
+                        tracing::warn!(
+                            request_id = %ctx.request_id,
+                            provider = %provider_name,
+                            "Stream failed after content was sent, skipping fallback to avoid duplicated output"
+                        );
+                        return Err(e);
+                    }
                     last_error = Some(e);
                 }
             }
@@ -246,11 +263,15 @@ impl GatewayExecutor {
     }
 
     /// 尝试执行单个 target
+    ///
+    /// `sent_content` 在首次向客户端转发 Delta 时置为 true，
+    /// 调用方据此判断流中途失败后能否安全 fallback
     async fn try_execute(
         &self,
         ctx: &RequestContext,
         target: &ExecutionTarget,
         tx: mpsc::Sender<StreamEvent>,
+        sent_content: &mut bool,
     ) -> Result<()> {
         // 只处理 ProviderAccount 变体
         let (provider, endpoint, upstream_api_key) = match target {
@@ -306,9 +327,11 @@ impl GatewayExecutor {
             model: ctx.model.clone(),
             messages: upstream_messages,
             stream: ctx.stream,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
+            // 透传客户端采样参数（Anthropic 协议的 max_tokens 为必填字段，
+            // 未指定时由协议层使用默认值）
+            max_tokens: ctx.max_tokens,
+            temperature: ctx.temperature,
+            top_p: ctx.top_p,
         };
 
         tracing::info!(
@@ -368,6 +391,7 @@ impl GatewayExecutor {
                     tx.send(event)
                         .await
                         .map_err(|_| KeyComputeError::Internal("Send error".into()))?;
+                    *sent_content = true;
 
                     if finish_reason.is_some() {
                         tracing::debug!(
@@ -534,7 +558,7 @@ mod tests {
             &self,
             _transport: &dyn HttpTransport,
             _request: UpstreamRequest,
-        ) -> Result<keycompute_provider_trait::StreamBox> {
+        ) -> Result<llm_protocol_provider::StreamBox> {
             let mut events: Vec<Result<StreamEvent>> = (0..self.chunks)
                 .map(|_| {
                     Ok(StreamEvent::Delta {
@@ -550,6 +574,64 @@ mod tests {
             }));
             events.push(Ok(StreamEvent::Done));
 
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingProvider;
+
+    #[async_trait]
+    impl ProviderAdapter for FailingProvider {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+
+        fn supported_models(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        async fn stream_chat(
+            &self,
+            _transport: &dyn HttpTransport,
+            _request: UpstreamRequest,
+        ) -> Result<llm_protocol_provider::StreamBox> {
+            Err(KeyComputeError::ProviderError("upstream down".into()))
+        }
+    }
+
+    /// 先发几个 Delta 后流中途报错的 Provider（模拟上游断连/限流）
+    #[derive(Debug)]
+    struct MidStreamFailProvider {
+        deltas_before_error: usize,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for MidStreamFailProvider {
+        fn name(&self) -> &'static str {
+            "mid-stream-fail"
+        }
+
+        fn supported_models(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        async fn stream_chat(
+            &self,
+            _transport: &dyn HttpTransport,
+            _request: UpstreamRequest,
+        ) -> Result<llm_protocol_provider::StreamBox> {
+            let mut events: Vec<Result<StreamEvent>> = (0..self.deltas_before_error)
+                .map(|_| {
+                    Ok(StreamEvent::Delta {
+                        content: "partial".to_string(),
+                        finish_reason: None,
+                    })
+                })
+                .collect();
+            events.push(Err(KeyComputeError::ProviderError(
+                "connection reset mid-stream".into(),
+            )));
             Ok(Box::pin(futures::stream::iter(events)))
         }
     }
@@ -724,5 +806,153 @@ mod tests {
             .expect("channel should stay open");
 
         assert!(matches!(first_event, StreamEvent::Delta { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_execute_falls_back_to_next_target_on_primary_failure() {
+        // 主选 provider 失败时，应回落到 fallback 链的下一个 target
+        // 并记录 fallback 计数（跨协议/跨账号回退能力的单元级验证）
+        let config = GatewayConfig::default();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "failing".to_string(),
+            Arc::new(FailingProvider) as Arc<dyn ProviderAdapter>,
+        );
+        providers.insert(
+            "many-chunks".to_string(),
+            Arc::new(ManyChunksProvider { chunks: 2 }) as Arc<dyn ProviderAdapter>,
+        );
+        let executor = GatewayExecutor::new(config, providers);
+
+        let ctx = Arc::new(create_test_context());
+        let fallback_account_id = Uuid::new_v4();
+        let plan = ExecutionPlan {
+            primary: ExecutionTarget::new_provider(
+                "failing",
+                Uuid::new_v4(),
+                "http://primary",
+                "mock-key",
+            ),
+            fallback_chain: vec![ExecutionTarget::new_provider(
+                "many-chunks",
+                fallback_account_id,
+                "http://fallback",
+                "mock-key",
+            )],
+        };
+
+        let account_states = Arc::new(AccountStateStore::new());
+        let provider_health = Arc::new(ProviderHealthStore::new());
+
+        let mut rx = executor
+            .execute(
+                ctx,
+                plan,
+                Arc::clone(&account_states),
+                Some(Arc::clone(&provider_health)),
+            )
+            .await
+            .expect("execute should return receiver");
+
+        // 收集全部事件：应来自 fallback provider（Delta ×2 + Done）而非错误
+        let mut deltas = 0;
+        let mut saw_done = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("stream should produce events")
+        {
+            match event {
+                StreamEvent::Delta { .. } => deltas += 1,
+                StreamEvent::Done => {
+                    saw_done = true;
+                    break;
+                }
+                StreamEvent::Error { message } => {
+                    panic!("should not receive error after successful fallback: {message}")
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(deltas, 2, "fallback provider deltas should be forwarded");
+        assert!(saw_done, "stream should complete with Done");
+        // fallback 成功后应记录 fallback 计数与账号成功状态
+        assert_eq!(provider_health.get_fallback_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_no_fallback_after_content_sent() {
+        // 流中途失败且已向客户端转发过内容时，不得再 fallback，
+        // 否则客户端会收到「部分内容 + 新一遍完整内容」的重复输出
+        let config = GatewayConfig::default();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "mid-stream-fail".to_string(),
+            Arc::new(MidStreamFailProvider {
+                deltas_before_error: 2,
+            }) as Arc<dyn ProviderAdapter>,
+        );
+        providers.insert(
+            "many-chunks".to_string(),
+            Arc::new(ManyChunksProvider { chunks: 3 }) as Arc<dyn ProviderAdapter>,
+        );
+        let executor = GatewayExecutor::new(config, providers);
+
+        let ctx = Arc::new(create_test_context());
+        let plan = ExecutionPlan {
+            primary: ExecutionTarget::new_provider(
+                "mid-stream-fail",
+                Uuid::new_v4(),
+                "http://primary",
+                "mock-key",
+            ),
+            fallback_chain: vec![ExecutionTarget::new_provider(
+                "many-chunks",
+                Uuid::new_v4(),
+                "http://fallback",
+                "mock-key",
+            )],
+        };
+
+        let account_states = Arc::new(AccountStateStore::new());
+        let provider_health = Arc::new(ProviderHealthStore::new());
+
+        let mut rx = executor
+            .execute(
+                ctx,
+                plan,
+                Arc::clone(&account_states),
+                Some(Arc::clone(&provider_health)),
+            )
+            .await
+            .expect("execute should return receiver");
+
+        let mut deltas = 0;
+        let mut saw_error = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("stream should produce events")
+        {
+            match event {
+                StreamEvent::Delta { .. } => deltas += 1,
+                StreamEvent::Error { .. } => {
+                    saw_error = true;
+                    break;
+                }
+                StreamEvent::Done => {
+                    panic!("should not complete via fallback after partial content")
+                }
+                _ => {}
+            }
+        }
+
+        // 只有主选的 2 个 partial Delta，fallback 的 3 个 chunk 不应出现
+        assert_eq!(deltas, 2, "fallback content must not be appended");
+        assert!(saw_error, "client should receive an error event");
+        assert_eq!(
+            provider_health.get_fallback_count(),
+            0,
+            "fallback must not be attempted after content was sent"
+        );
     }
 }

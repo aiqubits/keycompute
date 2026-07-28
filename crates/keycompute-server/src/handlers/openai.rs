@@ -41,6 +41,9 @@ pub struct ChatCompletionRequest {
     /// 最大生成 token 数
     #[serde(rename = "max_tokens")]
     pub max_tokens: Option<u32>,
+    /// 最大生成 token 数（OpenAI 新版字段，与 max_tokens 等效；
+    /// 两者同时提供时 max_tokens 优先）
+    pub max_completion_tokens: Option<u32>,
     /// 温度参数 (0-2)
     pub temperature: Option<f32>,
     /// 核采样参数 (0-1)
@@ -75,6 +78,41 @@ pub struct ChatCompletionRequest {
 
 fn default_n() -> Option<u32> {
     Some(1)
+}
+
+impl ChatCompletionRequest {
+    /// 生效的最大生成 token 数（max_tokens 优先，回退 max_completion_tokens）
+    fn effective_max_tokens(&self) -> Option<u32> {
+        self.max_tokens.or(self.max_completion_tokens)
+    }
+
+    /// 校验采样参数范围
+    ///
+    /// 越界参数在 handler 层直接返回 400，避免确定性的上游 400
+    /// 级联整条 fallback 链（浪费上游调用）并污染 Provider 健康评分。
+    /// 注：NaN 不在任何区间内，同样会被拒绝
+    fn validate_sampling_params(&self) -> Result<()> {
+        if self.effective_max_tokens() == Some(0) {
+            return Err(ApiError::BadRequest(
+                "max_tokens must be greater than 0".to_string(),
+            ));
+        }
+        if let Some(temperature) = self.temperature
+            && !(0.0..=2.0).contains(&temperature)
+        {
+            return Err(ApiError::BadRequest(
+                "temperature must be between 0.0 and 2.0".to_string(),
+            ));
+        }
+        if let Some(top_p) = self.top_p
+            && !(0.0..=1.0).contains(&top_p)
+        {
+            return Err(ApiError::BadRequest(
+                "top_p must be between 0.0 and 1.0".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Chat Completion 消息
@@ -301,7 +339,10 @@ pub async fn chat_completions(
     request_id: RequestId,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<axum::response::Response> {
-    // 0. 余额预检查
+    // 0. 采样参数范围校验（越界直接 400，不进入路由/上游调用）
+    request.validate_sampling_params()?;
+
+    // 1. 余额预检查
     // 如果余额低于阈值（0.1元），直接拒绝请求
     if let Some(balance_service) = state.billing.balance_service() {
         balance_service
@@ -343,7 +384,7 @@ pub async fn chat_completions(
         .collect();
 
     // 4. 构建 RequestContext
-    let mut ctx = Arc::new(RequestContext::new(
+    let mut request_ctx = RequestContext::new(
         auth.user_id,
         auth.tenant_id,
         auth.produce_ai_key_id,
@@ -351,7 +392,13 @@ pub async fn chat_completions(
         messages,
         request.stream,
         pricing,
-    ));
+    );
+    // 透传客户端采样参数（协议层构建上游请求时使用，
+    // Anthropic 协议的 max_tokens 为必填字段，不透传会被默认值硬截断）
+    request_ctx.max_tokens = request.effective_max_tokens();
+    request_ctx.temperature = request.temperature;
+    request_ctx.top_p = request.top_p;
+    let mut ctx = Arc::new(request_ctx);
 
     // 5. 智能路由
     let plan = state
@@ -391,7 +438,7 @@ pub async fn chat_completions(
                     model: model.clone(), // 使用去掉 node: 前缀的实际模型名
                     messages: ctx.messages.clone(),
                     stream: Some(request.stream), // 传递 stream 标志
-                    max_tokens: request.max_tokens,
+                    max_tokens: request.effective_max_tokens(),
                     temperature: request.temperature,
                     top_p: request.top_p,
                     n: request.n,
@@ -626,7 +673,7 @@ pub async fn chat_completions(
 
 /// 创建 OpenAI 格式的非流式响应（纯文本快速路径）
 async fn create_openai_response(
-    mut rx: tokio::sync::mpsc::Receiver<keycompute_provider_trait::StreamEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
     ctx: Arc<RequestContext>,
     model: String,
     provider_name: String,
@@ -794,10 +841,10 @@ impl StreamCollector {
     /// - `Err(message)` — 流异常（收到 Error 事件），调用者负责执行计费并决定错误输出方式
     fn process_event(
         &mut self,
-        event: keycompute_provider_trait::StreamEvent,
+        event: llm_protocol_provider::StreamEvent,
     ) -> std::result::Result<bool, String> {
         match event {
-            keycompute_provider_trait::StreamEvent::Delta {
+            llm_protocol_provider::StreamEvent::Delta {
                 content: delta,
                 finish_reason: reason,
             } => {
@@ -807,16 +854,16 @@ impl StreamCollector {
                 }
                 Ok(true)
             }
-            keycompute_provider_trait::StreamEvent::Done => {
+            llm_protocol_provider::StreamEvent::Done => {
                 self.completed = true;
                 Ok(false)
             }
-            keycompute_provider_trait::StreamEvent::Error { message } => {
+            llm_protocol_provider::StreamEvent::Error { message } => {
                 self.status = "error".to_string();
                 Err(message)
             }
-            keycompute_provider_trait::StreamEvent::Usage { .. }
-            | keycompute_provider_trait::StreamEvent::Raw { .. } => Ok(true),
+            llm_protocol_provider::StreamEvent::Usage { .. }
+            | llm_protocol_provider::StreamEvent::Raw { .. } => Ok(true),
         }
     }
 
@@ -865,7 +912,7 @@ fn generate_completion_id() -> String {
 /// （如 DNS 解析失败、TLS 握手超时等）保留一个窗口期。上游 Provider
 /// 的连接错误通常在数秒内暴露，10s 间隔足以覆盖绝大多数场景。
 fn create_non_streaming_json_with_keepalive(
-    mut rx: tokio::sync::mpsc::Receiver<keycompute_provider_trait::StreamEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
     ctx: Arc<RequestContext>,
     model: String,
     provider_name: String,
@@ -1150,7 +1197,7 @@ fn make_usage_chunk_data(
 
 /// 创建 OpenAI 格式的 SSE 流
 fn create_openai_stream(
-    mut rx: tokio::sync::mpsc::Receiver<keycompute_provider_trait::StreamEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
     ctx: Arc<RequestContext>,
     model: String,
     provider_name: String,
@@ -1167,7 +1214,7 @@ fn create_openai_stream(
 
         while let Some(event) = rx.recv().await {
             match event {
-                keycompute_provider_trait::StreamEvent::Delta { content, finish_reason } => {
+                llm_protocol_provider::StreamEvent::Delta { content, finish_reason } => {
                     let data = make_delta_chunk_data(
                         content, &finish_reason, &mut first_chunk,
                         &completion_id, created, &model, &provider_name,
@@ -1197,7 +1244,7 @@ fn create_openai_stream(
                         break;
                     }
                 }
-                keycompute_provider_trait::StreamEvent::Done => {
+                llm_protocol_provider::StreamEvent::Done => {
                     // 流正常结束
                     completed = true;
                     let _ = billing.finalize_and_trigger_distribution(
@@ -1217,7 +1264,7 @@ fn create_openai_stream(
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
-                keycompute_provider_trait::StreamEvent::Error { message } => {
+                llm_protocol_provider::StreamEvent::Error { message } => {
                     completed = true;
                     status = "error".to_string();
                     let _ = billing.finalize_and_trigger_distribution(
@@ -1235,8 +1282,8 @@ fn create_openai_stream(
                     yield Ok(Event::default().data(error_chunk.to_string()));
                     break;
                 }
-                keycompute_provider_trait::StreamEvent::Usage { .. }
-                | keycompute_provider_trait::StreamEvent::Raw { .. } => {
+                llm_protocol_provider::StreamEvent::Usage { .. }
+                | llm_protocol_provider::StreamEvent::Raw { .. } => {
                     // Usage 由 executor 层通过 ctx.set_*_tokens() 消费，
                     // Raw 为 provider 原始事件不需要透传
                 }
@@ -1266,7 +1313,7 @@ fn create_openai_stream(
 /// SSE 空事件（`data:\\n\\n`）对 OpenAI 兼容客户端透明，
 /// 客户端 parser 会忽略空 data 字段。
 fn create_openai_stream_with_keepalive(
-    mut rx: tokio::sync::mpsc::Receiver<keycompute_provider_trait::StreamEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
     ctx: Arc<RequestContext>,
     model: String,
     provider_name: String,
@@ -1324,7 +1371,7 @@ fn create_openai_stream_with_keepalive(
                 event = rx.recv() => {
                     match event {
                         Some(event) => match event {
-                            keycompute_provider_trait::StreamEvent::Delta { content, finish_reason } => {
+                            llm_protocol_provider::StreamEvent::Delta { content, finish_reason } => {
                                 let data = make_delta_chunk_data(
                                     content, &finish_reason, &mut first_chunk,
                                     &completion_id, created, &model, &provider_name,
@@ -1349,7 +1396,7 @@ fn create_openai_stream_with_keepalive(
                                     return;
                                 }
                             }
-                            keycompute_provider_trait::StreamEvent::Done => {
+                            llm_protocol_provider::StreamEvent::Done => {
                                 let _ = billing.finalize_and_trigger_distribution(
                                     &ctx, &provider_name, account_id, &status, ctx.user_id
                                 ).await;
@@ -1366,7 +1413,7 @@ fn create_openai_stream_with_keepalive(
                                 yield Ok(Event::default().data("[DONE]"));
                                 return;
                             }
-                            keycompute_provider_trait::StreamEvent::Error { message } => {
+                            llm_protocol_provider::StreamEvent::Error { message } => {
                                 status = "error".to_string();
                                 let _ = billing.finalize_and_trigger_distribution(
                                     &ctx, &provider_name, account_id, &status, ctx.user_id
@@ -1384,8 +1431,8 @@ fn create_openai_stream_with_keepalive(
                                 yield Ok(Event::default().data("[DONE]"));
                                 return;
                             }
-                            keycompute_provider_trait::StreamEvent::Usage { .. }
-                            | keycompute_provider_trait::StreamEvent::Raw { .. } => {
+                            llm_protocol_provider::StreamEvent::Usage { .. }
+                            | llm_protocol_provider::StreamEvent::Raw { .. } => {
                                 // Usage 由 executor 层通过 ctx.set_*_tokens() 消费，
                                 // Raw 为 provider 原始事件不需要透传
                             }
@@ -1653,6 +1700,62 @@ mod tests {
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert!(req.stream);
         assert!(req.stream_options.unwrap().include_usage);
+    }
+
+    fn minimal_request(extra: &str) -> ChatCompletionRequest {
+        let json = format!(
+            r#"{{
+                "model": "gpt-4o",
+                "messages": [{{"role": "user", "content": "Hello"}}]{}{}
+            }}"#,
+            if extra.is_empty() { "" } else { "," },
+            extra
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn test_validate_sampling_params_in_range() {
+        assert!(minimal_request("").validate_sampling_params().is_ok());
+        assert!(
+            minimal_request(r#""max_tokens": 100, "temperature": 2.0, "top_p": 1.0"#)
+                .validate_sampling_params()
+                .is_ok()
+        );
+        assert!(
+            minimal_request(r#""temperature": 0.0, "top_p": 0.0"#)
+                .validate_sampling_params()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_sampling_params_out_of_range() {
+        // 越界参数应在 handler 层拒绝，不进入路由/上游调用
+        for extra in [
+            r#""max_tokens": 0"#,
+            r#""max_completion_tokens": 0"#,
+            r#""temperature": -0.1"#,
+            r#""temperature": 2.1"#,
+            r#""top_p": -0.1"#,
+            r#""top_p": 1.5"#,
+        ] {
+            assert!(
+                minimal_request(extra).validate_sampling_params().is_err(),
+                "{extra} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_max_completion_tokens_alias() {
+        // 新版字段 max_completion_tokens 作为 max_tokens 的回退别名
+        let req = minimal_request(r#""max_completion_tokens": 256"#);
+        assert_eq!(req.effective_max_tokens(), Some(256));
+
+        // 两者同时提供时 max_tokens 优先
+        let req = minimal_request(r#""max_tokens": 100, "max_completion_tokens": 256"#);
+        assert_eq!(req.effective_max_tokens(), Some(100));
     }
 
     #[test]

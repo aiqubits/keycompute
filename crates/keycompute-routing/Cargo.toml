@@ -7,6 +7,7 @@ edition = "2024"
 keycompute-types = { workspace = true }
 keycompute-runtime = { workspace = true }
 keycompute-db = { workspace = true }
+llm-protocol-provider = { workspace = true }
 async-trait = "0.1"
 chrono = "0.4"
 dashmap = "6"

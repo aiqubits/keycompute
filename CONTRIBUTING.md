@@ -106,7 +106,7 @@ keycompute/
 │   ├── keycompute-observability/   # Logging and metrics
 │   ├── keycompute-emailserver/     # Email delivery
 │   ├── llm-gateway/                # Provider execution gateway
-│   └── llm-provider/               # Provider adapters
+│   └── llm-protocol/               # Protocol adapters (openai / anthropic)
 ├── packages/
 │   ├── web/                        # Dioxus web app
 │   ├── ui/                         # Shared UI components
@@ -174,12 +174,18 @@ If your change touches `desktop` or `mobile`, run the relevant package commands 
 
 ### Adding a new provider
 
-When adding a new LLM provider:
+Most vendors (DeepSeek, Ollama, vLLM, Gemini OpenAI-compat, etc.) do NOT need
+new code: create a channel account with the matching protocol (`openai` or
+`anthropic`) plus the vendor's base URL and API key.
 
-1. Create or update the provider crate under `crates/llm-provider/`.
-2. Implement the traits from `keycompute-provider-trait`.
-3. Register the provider in `llm-gateway` and any required server wiring.
-4. Add tests for request mapping, error handling, and any provider-specific behavior.
+Only when integrating a genuinely new wire protocol:
+
+1. Create a protocol crate under `crates/llm-protocol/`.
+2. Implement the `ProviderAdapter` trait from `llm-protocol-provider`.
+3. Add the protocol to `ProtocolType` and register it in `keycompute-server`
+   (`providers.rs`) and any required routing wiring.
+4. Add tests for request mapping, stream parsing, error handling, and any
+   protocol-specific behavior.
 
 ## Commits
 

@@ -3389,21 +3389,20 @@ dependencies = [
  "keycompute-auth",
  "keycompute-billing",
  "keycompute-cache",
- "keycompute-claude",
  "keycompute-db",
  "keycompute-distribution",
  "keycompute-emailserver",
  "keycompute-observability",
- "keycompute-ollama",
- "keycompute-openai",
  "keycompute-pricing",
- "keycompute-provider-trait",
  "keycompute-ratelimit",
  "keycompute-routing",
  "keycompute-runtime",
  "keycompute-server",
  "keycompute-types",
  "llm-gateway",
+ "llm-protocol-anthropic",
+ "llm-protocol-openai",
+ "llm-protocol-provider",
  "node-gateway",
  "once_cell",
  "reqwest",
@@ -3717,22 +3716,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keycompute-claude"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "keycompute-provider-trait",
- "keycompute-types",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tokio-test",
-]
-
-[[package]]
 name = "keycompute-config"
 version = "0.1.0"
 dependencies = [
@@ -3771,23 +3754,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keycompute-deepseek"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "keycompute-openai",
- "keycompute-provider-trait",
- "keycompute-types",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "keycompute-distribution"
 version = "0.1.0"
 dependencies = [
@@ -3820,21 +3786,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keycompute-gemini"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "keycompute-provider-trait",
- "keycompute-types",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "keycompute-observability"
 version = "0.1.0"
 dependencies = [
@@ -3847,42 +3798,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "keycompute-ollama"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "bytes",
- "futures",
- "keycompute-openai",
- "keycompute-provider-trait",
- "keycompute-types",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tokio-test",
-]
-
-[[package]]
-name = "keycompute-openai"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "keycompute-provider-trait",
- "keycompute-types",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -3901,19 +3816,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "keycompute-provider-trait"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "keycompute-types",
- "reqwest",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -3942,6 +3844,7 @@ dependencies = [
  "keycompute-db",
  "keycompute-runtime",
  "keycompute-types",
+ "llm-protocol-provider",
  "rust_decimal",
  "sea-orm",
  "tokio",
@@ -3985,25 +3888,21 @@ dependencies = [
  "keycompute-auth",
  "keycompute-billing",
  "keycompute-cache",
- "keycompute-claude",
  "keycompute-config",
  "keycompute-db",
- "keycompute-deepseek",
  "keycompute-distribution",
  "keycompute-emailserver",
- "keycompute-gemini",
  "keycompute-observability",
- "keycompute-ollama",
- "keycompute-openai",
  "keycompute-pricing",
- "keycompute-provider-trait",
  "keycompute-ratelimit",
  "keycompute-routing",
  "keycompute-runtime",
  "keycompute-types",
- "keycompute-vllm",
  "keycompute-wechatpay",
  "llm-gateway",
+ "llm-protocol-anthropic",
+ "llm-protocol-openai",
+ "llm-protocol-provider",
  "node-gateway",
  "percent-encoding",
  "qrcode",
@@ -4034,23 +3933,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
-]
-
-[[package]]
-name = "keycompute-vllm"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "keycompute-openai",
- "keycompute-provider-trait",
- "keycompute-types",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4272,10 +4154,10 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
- "keycompute-provider-trait",
  "keycompute-routing",
  "keycompute-runtime",
  "keycompute-types",
+ "llm-protocol-provider",
  "reqwest",
  "rust_decimal",
  "serde",
@@ -4285,6 +4167,53 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "llm-protocol-anthropic"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "keycompute-types",
+ "llm-protocol-provider",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
+name = "llm-protocol-openai"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "keycompute-types",
+ "llm-protocol-provider",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "llm-protocol-provider"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "keycompute-types",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

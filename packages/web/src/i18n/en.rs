@@ -1416,16 +1416,13 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
         "For example: OpenAI Official",
     );
     m.insert("accounts.provider", "Provider *");
-    m.insert(
-        "accounts.supported_models",
-        "Supported Models (Optional, defaults if blank)",
-    );
+    m.insert("accounts.supported_models", "Supported Models *");
     m.insert(
         "accounts.models_hint",
-        "Separate multiple models with commas. Leave blank to use provider defaults.",
+        "Separate multiple models with commas",
     );
     m.insert("accounts.api_key", "API Key *");
-    m.insert("accounts.custom_base_url", "Custom Base URL (Optional)");
+    m.insert("accounts.custom_base_url", "Custom Base URL");
     m.insert("accounts.edit_title", "Edit LLM Channel");
     m.insert(
         "accounts.new_api_key",
@@ -1435,9 +1432,10 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
         "accounts.new_api_key_placeholder",
         "Leave blank to keep the current key",
     );
+    m.insert("accounts.custom_base_url_optional", "Custom Base URL");
     m.insert(
-        "accounts.custom_base_url_optional",
-        "Custom Base URL (leave blank to keep current)",
+        "accounts.reset_base_url",
+        "Reset to protocol default endpoint",
     );
     m.insert("accounts.enable_channel", "Enable channel");
     m.insert("accounts.global_visibility", "Global Visibility");

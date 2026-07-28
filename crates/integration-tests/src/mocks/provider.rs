@@ -8,10 +8,10 @@
 
 use async_trait::async_trait;
 use futures::stream;
-use keycompute_provider_trait::{
+use keycompute_types::KeyComputeError;
+use llm_protocol_provider::{
     HttpTransport, ProviderAdapter, StreamBox, StreamEvent, UpstreamRequest,
 };
-use keycompute_types::KeyComputeError;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -358,8 +358,8 @@ mod tests {
         let provider = MockProviderFactory::create_openai();
         let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o");
 
-        let transport = keycompute_provider_trait::DefaultHttpTransport::new();
-        let mut stream: keycompute_provider_trait::StreamBox =
+        let transport = llm_protocol_provider::DefaultHttpTransport::new();
+        let mut stream: llm_protocol_provider::StreamBox =
             provider.stream_chat(&transport, request).await.unwrap();
         let mut events = Vec::new();
 
@@ -376,8 +376,8 @@ mod tests {
         let provider = MockProviderFactory::create_failing();
         let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o");
 
-        let transport = keycompute_provider_trait::DefaultHttpTransport::new();
-        let result: Result<keycompute_provider_trait::StreamBox, _> =
+        let transport = llm_protocol_provider::DefaultHttpTransport::new();
+        let result: Result<llm_protocol_provider::StreamBox, _> =
             provider.stream_chat(&transport, request).await;
         assert!(result.is_err());
     }
@@ -387,7 +387,7 @@ mod tests {
         let provider = MockProviderFactory::create_with_stream_error(2);
         let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o");
 
-        let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+        let transport = llm_protocol_provider::DefaultHttpTransport::new();
         let mut stream = provider.stream_chat(&transport, request).await.unwrap();
         let mut events = Vec::new();
 
@@ -407,7 +407,7 @@ mod tests {
         let provider = MockProviderFactory::create_flaky(3);
         let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o");
 
-        let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+        let transport = llm_protocol_provider::DefaultHttpTransport::new();
 
         // 前 3 次失败
         for i in 1..=3 {
@@ -426,7 +426,7 @@ mod tests {
         let provider = MockProviderFactory::create_delayed(100);
         let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o");
 
-        let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+        let transport = llm_protocol_provider::DefaultHttpTransport::new();
 
         let start = std::time::Instant::now();
         let _ = provider.stream_chat(&transport, request).await;
@@ -440,7 +440,7 @@ mod tests {
         let provider = MockProviderFactory::create_timeout();
         let request = UpstreamRequest::new("http://test", "test-key", "gpt-4o");
 
-        let transport = keycompute_provider_trait::DefaultHttpTransport::new();
+        let transport = llm_protocol_provider::DefaultHttpTransport::new();
         let result = provider.stream_chat(&transport, request).await;
 
         assert!(result.is_err());
