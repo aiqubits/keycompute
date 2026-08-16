@@ -16,5 +16,6 @@ tokio-stream = "0.1"
 tracing = "0.1"
 
 [dev-dependencies]
+llm-protocol-provider = { path = "../provider", features = ["test-support"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-test = "0.4"

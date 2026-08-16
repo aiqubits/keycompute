@@ -104,13 +104,16 @@ pub fn AppShell(
         let val = theme();
         #[cfg(target_arch = "wasm32")]
         {
-            if let Some(window) = web_sys::window() {
-                if let Some(doc) = window.document() {
-                    if let Some(html) = doc.document_element() {
-                        let _ = html.set_attribute("data-theme", &val);
-                    }
-                }
-            }
+            let Some(window) = web_sys::window() else {
+                return;
+            };
+            let Some(doc) = window.document() else {
+                return;
+            };
+            let Some(html) = doc.document_element() else {
+                return;
+            };
+            let _ = html.set_attribute("data-theme", &val);
         }
         #[cfg(not(target_arch = "wasm32"))]
         let _ = val;

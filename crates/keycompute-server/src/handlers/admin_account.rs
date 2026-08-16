@@ -16,7 +16,9 @@ use keycompute_db::models::account::{
     UpdateAccountRequest as DbUpdateAccountRequest,
 };
 use keycompute_types::SensitiveString;
-use llm_protocol_provider::{DefaultHttpTransport, ProtocolType, normalize_base_url};
+use llm_protocol_provider::{
+    DefaultHttpTransport, HttpTransport, ProtocolType, normalize_base_url,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tracing;
@@ -433,37 +435,70 @@ pub async fn test_account(
         Ok(models) => {
             // 测试成功：清除错误计数
             state.account_states.clear_cooldown(account_id);
-
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "message": "Account connection test passed",
-                "account_id": account_id,
-                "test_result": {
-                    "is_healthy": true,
-                    "latency_ms": latency_ms,
-                    "available_models": models,
-                    "provider": account.provider,
-                    "endpoint": endpoint,
-                }
-            })))
+            Ok(Json(account_test_response(
+                account_id,
+                &account.provider,
+                &endpoint,
+                latency_ms,
+                Some(models),
+            )))
         }
-        Err(e) => {
+        Err(_) => {
             // 测试失败：标记错误（仅管理员测试时触发）
             state.account_states.mark_error(account_id);
-
-            Ok(Json(serde_json::json!({
-                "success": false,
-                "message": "Account connection test failed",
-                "account_id": account_id,
-                "test_result": {
-                    "is_healthy": false,
-                    "latency_ms": latency_ms,
-                    "error": e,
-                    "provider": account.provider,
-                    "endpoint": endpoint,
-                }
-            })))
+            // 上游响应可能包含供应商内部详情或凭据回显；不记录或返回其原始内容。
+            tracing::warn!(
+                account_id = %account_id,
+                provider = %account.provider,
+                "Account connection test failed"
+            );
+            Ok(Json(account_test_response(
+                account_id,
+                &account.provider,
+                &endpoint,
+                latency_ms,
+                None,
+            )))
         }
+    }
+}
+
+fn account_test_response(
+    account_id: Uuid,
+    provider: &str,
+    endpoint: &str,
+    latency_ms: i64,
+    models: Option<Vec<String>>,
+) -> serde_json::Value {
+    // Keep the summary at the response root: AccountTestResponse is shared by
+    // dashboard clients and deliberately does not need to parse test_result.
+    match models {
+        Some(models) => serde_json::json!({
+            "success": true,
+            "message": "Account connection test passed",
+            "account_id": account_id,
+            "latency_ms": latency_ms,
+            "test_result": {
+                "is_healthy": true,
+                "latency_ms": latency_ms,
+                "available_models": models,
+                "provider": provider,
+                "endpoint": endpoint,
+            }
+        }),
+        None => serde_json::json!({
+            "success": false,
+            "message": "Account connection test failed",
+            "account_id": account_id,
+            "latency_ms": latency_ms,
+            "test_result": {
+                "is_healthy": false,
+                "latency_ms": latency_ms,
+                "error": "Upstream connection test failed",
+                "provider": provider,
+                "endpoint": endpoint,
+            }
+        }),
     }
 }
 
@@ -474,7 +509,7 @@ pub async fn test_account(
 /// 避免在 handler 层重复协议认证逻辑
 async fn fetch_upstream_models(
     protocol: ProtocolType,
-    transport: &DefaultHttpTransport,
+    transport: &dyn HttpTransport,
     endpoint: &str,
     api_key: &str,
 ) -> std::result::Result<Vec<String>, String> {
@@ -540,27 +575,8 @@ pub async fn refresh_account(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to fetch models: {}", e)))?;
 
-    // 上游未返回模型列表时保留现有配置
-    let new_models: Vec<String> = if fetched_models.is_empty() {
-        account.models_supported.clone()
-    } else {
-        fetched_models
-    };
-
     // 更新数据库
-    let db_req = DbUpdateAccountRequest {
-        tenant_id: None,
-        name: None,
-        endpoint: None,
-        upstream_api_key_encrypted: None,
-        upstream_api_key_preview: None,
-        rpm_limit: None,
-        tpm_limit: None,
-        priority: None,
-        enabled: None,
-        models_supported: Some(new_models.clone()),
-        visibility: None,
-    };
+    let db_req = refresh_models_update_request(fetched_models);
 
     let updated = account
         .update(pool, &db_req)
@@ -577,24 +593,41 @@ pub async fn refresh_account(
     })))
 }
 
+/// Build the targeted update used after a successful upstream model refresh.
+///
+/// A valid empty `/models` response is persisted as an empty list so routing
+/// cannot continue selecting models that the account no longer exposes.
+fn refresh_models_update_request(models_supported: Vec<String>) -> DbUpdateAccountRequest {
+    DbUpdateAccountRequest {
+        tenant_id: None,
+        name: None,
+        endpoint: None,
+        upstream_api_key_encrypted: None,
+        upstream_api_key_preview: None,
+        rpm_limit: None,
+        tpm_limit: None,
+        priority: None,
+        enabled: None,
+        models_supported: Some(models_supported),
+        visibility: None,
+    }
+}
+
 /// 解密账号的 API Key
 pub fn decrypt_account_api_key(encrypted_key: &str) -> Result<String> {
-    // 尝试使用全局密钥解密
-    if let Some(_crypto) = keycompute_runtime::crypto::global_crypto() {
-        match keycompute_runtime::crypto::decrypt_api_key(
+    // 生产环境配置了全局加密器后，存储值必须是有效密文。将解密失败的密文
+    // 当作明文继续使用会掩盖密钥轮换/数据损坏，并可能把无效内容发给上游。
+    if keycompute_runtime::crypto::global_crypto().is_some() {
+        return keycompute_runtime::crypto::decrypt_api_key(
             &keycompute_runtime::EncryptedApiKey::from(encrypted_key),
-        ) {
-            Ok(decrypted) => return Ok(decrypted),
-            Err(e) => {
-                // 解密失败，可能是明文存储，尝试直接使用
-                tracing::warn!(
-                    error = %e,
-                    "Failed to decrypt API key, trying as plaintext"
-                );
-            }
-        }
+        )
+        .map_err(|e| {
+            tracing::warn!(error = %e, "Failed to decrypt account API key");
+            ApiError::Internal("Failed to decrypt stored account API key".to_string())
+        });
     }
-    // 无加密或解密失败，直接返回原值
+
+    // 仅在未配置全局加密器的开发环境中允许旧的明文存储。
     Ok(encrypted_key.to_string())
 }
 
@@ -611,4 +644,118 @@ pub fn get_default_endpoint(provider: &str) -> String {
             );
             ProtocolType::Openai.default_endpoint().to_string()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm_protocol_provider::test_support::RecordingGetTransport;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn fetch_upstream_models_rejects_invalid_models_payload() {
+        let transport = RecordingGetTransport::new(br#"{"data": "invalid"}"#.to_vec());
+
+        let error = fetch_upstream_models(
+            ProtocolType::Openai,
+            &transport,
+            "https://provider.example/v1/",
+            "test-key",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("Invalid /models response"));
+        assert_eq!(
+            transport.requests(),
+            vec![(
+                "https://provider.example/v1/models".to_string(),
+                vec![("Authorization".to_string(), "Bearer test-key".to_string())],
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_upstream_models_accepts_empty_models_payload() {
+        let transport = RecordingGetTransport::new(br#"{"data": []}"#.to_vec());
+
+        let models = fetch_upstream_models(
+            ProtocolType::Anthropic,
+            &transport,
+            "https://provider.example/v1/",
+            "test-key",
+        )
+        .await
+        .unwrap();
+
+        assert!(models.is_empty());
+        assert_eq!(
+            transport.requests(),
+            vec![(
+                "https://provider.example/v1/models".to_string(),
+                vec![
+                    ("x-api-key".to_string(), "test-key".to_string()),
+                    (
+                        "anthropic-version".to_string(),
+                        llm_protocol_anthropic::ANTHROPIC_API_VERSION.to_string(),
+                    ),
+                ],
+            )]
+        );
+    }
+
+    #[test]
+    fn account_test_responses_include_root_latency_for_shared_clients() {
+        let account_id = Uuid::nil();
+        let success = account_test_response(
+            account_id,
+            "openai",
+            "https://provider.example/v1",
+            42,
+            Some(vec!["model-a".to_string()]),
+        );
+        let failure = account_test_response(
+            account_id,
+            "openai",
+            "https://provider.example/v1",
+            42,
+            None,
+        );
+        let empty_models = account_test_response(
+            account_id,
+            "openai",
+            "https://provider.example/v1",
+            42,
+            Some(Vec::new()),
+        );
+
+        assert_eq!(success["success"], json!(true));
+        assert_eq!(failure["success"], json!(false));
+        assert_eq!(success["latency_ms"], json!(42));
+        assert_eq!(failure["latency_ms"], json!(42));
+        assert_eq!(empty_models["success"], json!(true));
+        assert_eq!(empty_models["test_result"]["available_models"], json!([]));
+        assert_eq!(
+            failure["test_result"]["error"],
+            "Upstream connection test failed"
+        );
+    }
+
+    #[test]
+    fn encrypted_mode_rejects_invalid_stored_api_keys() {
+        let key = keycompute_runtime::ApiKeyCrypto::generate_key();
+        keycompute_runtime::set_global_crypto(&key).unwrap();
+
+        assert!(matches!(
+            decrypt_account_api_key("not-a-valid-encrypted-api-key"),
+            Err(ApiError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn refresh_persists_a_valid_empty_model_list() {
+        let request = refresh_models_update_request(Vec::new());
+
+        assert_eq!(request.models_supported, Some(Vec::new()));
+    }
 }

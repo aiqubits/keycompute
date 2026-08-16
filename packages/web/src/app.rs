@@ -135,14 +135,17 @@ fn read_local_storage(key: &str) -> Option<String> {
 
 #[cfg(target_arch = "wasm32")]
 fn apply_theme_to_html(theme: &str) {
-    if let Some(window) = web_sys::window() {
-        if let Some(document) = window.document() {
-            if let Some(root) = document.document_element() {
-                let _ = root.set_attribute("data-theme", theme);
-                let _ = root.set_attribute("data-build", &build_tag());
-            }
-        }
-    }
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    let Some(root) = document.document_element() else {
+        return;
+    };
+    let _ = root.set_attribute("data-theme", theme);
+    let _ = root.set_attribute("data-build", &build_tag());
 }
 
 /// 前端构建标识：命名空间前缀 + 版本号，用于缓存排障与构建溯源

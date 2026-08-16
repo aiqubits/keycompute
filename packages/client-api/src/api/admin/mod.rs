@@ -15,8 +15,8 @@ use crate::error::Result;
 
 // Re-export 各子模块的公共类型
 pub use account::{
-    AccountInfo, AccountQueryParams, AccountTestResponse, CreateAccountRequest,
-    UpdateAccountRequest,
+    AccountInfo, AccountQueryParams, AccountRefreshResponse, AccountTestResponse,
+    CreateAccountRequest, UpdateAccountRequest,
 };
 pub use monitoring::{
     MonitoringNodeHealth, MonitoringOverviewResponse, MonitoringSummary, MonitoringTraceEntry,
@@ -205,7 +205,7 @@ impl AdminApi {
     }
 
     /// 刷新账号
-    pub async fn refresh_account(&self, id: &str, token: &str) -> Result<AccountInfo> {
+    pub async fn refresh_account(&self, id: &str, token: &str) -> Result<AccountRefreshResponse> {
         self.client
             .post_json(
                 &format!("/api/v1/accounts/{}/refresh", id),

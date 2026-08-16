@@ -57,5 +57,6 @@ default = ["redis"]
 redis = ["keycompute-ratelimit/redis", "keycompute-runtime/redis", "dep:deadpool-redis"]
 
 [dev-dependencies]
+llm-protocol-provider = { path = "../llm-protocol/provider", features = ["test-support"] }
 tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json"] }

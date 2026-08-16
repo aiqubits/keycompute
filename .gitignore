@@ -38,3 +38,4 @@ CLAUDE.md
 .env.local
 .env.production
 config.toml
+sub2/

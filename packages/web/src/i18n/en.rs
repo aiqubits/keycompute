@@ -380,7 +380,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("home.sponsors.title", "Community Sponsors");
     m.insert(
         "home.sponsors.subtitle",
-        "Special thanks to our sponsors for their generous support 🙏",
+        "Thanks to the following friends for their generous support 🙏 (in no particular order)",
     );
 
     // ── Requirement Collection ──────────────────────
@@ -1409,6 +1409,8 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("accounts.test_success", "Connection test succeeded");
     m.insert("accounts.test_failed", "Connection test failed");
     m.insert("accounts.test", "Test");
+    m.insert("accounts.refresh_success", "Model list refreshed");
+    m.insert("accounts.refresh_failed", "Failed to refresh model list");
     m.insert("accounts.create_title", "Create LLM Channel");
     m.insert("accounts.channel_name", "Channel Name *");
     m.insert(
@@ -1416,6 +1418,27 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
         "For example: OpenAI Official",
     );
     m.insert("accounts.provider", "Provider *");
+    m.insert("accounts.provider_openai_compatible", "OpenAI Compatible");
+    m.insert(
+        "accounts.provider_anthropic_compatible",
+        "Anthropic Compatible",
+    );
+    m.insert(
+        "accounts.provider_deepseek_openai_compatible",
+        "DeepSeek (OpenAI Compatible)",
+    );
+    m.insert(
+        "accounts.provider_gemini_openai_compatible",
+        "Google Gemini (OpenAI Compatible)",
+    );
+    m.insert(
+        "accounts.provider_vllm_openai_compatible",
+        "vLLM (OpenAI Compatible)",
+    );
+    m.insert(
+        "accounts.provider_ollama_openai_compatible",
+        "Ollama (OpenAI Compatible)",
+    );
     m.insert("accounts.supported_models", "Supported Models *");
     m.insert(
         "accounts.models_hint",

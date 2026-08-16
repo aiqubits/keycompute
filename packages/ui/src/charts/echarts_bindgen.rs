@@ -43,11 +43,13 @@ pub fn render_chart(container_id: &str, width: u32, height: u32, option: &serde_
     };
 
     // 调用 instance.setOption(option, true) — 第二参数 true 表示 notMerge
-    if let Ok(set_option_fn) = js_sys::Reflect::get(&instance, &"setOption".into()) {
-        if let Some(f) = set_option_fn.dyn_ref::<js_sys::Function>() {
-            let _ = f.call2(&instance, &option_js, &wasm_bindgen::JsValue::TRUE);
-        }
-    }
+    let Ok(set_option_fn) = js_sys::Reflect::get(&instance, &"setOption".into()) else {
+        return;
+    };
+    let Some(f) = set_option_fn.dyn_ref::<js_sys::Function>() else {
+        return;
+    };
+    let _ = f.call2(&instance, &option_js, &wasm_bindgen::JsValue::TRUE);
 }
 
 /// 获取或初始化 ECharts 实例
@@ -65,19 +67,18 @@ fn get_or_init_instance(
         .call1(echarts, dom)
         .ok();
 
-    if let Some(ref inst) = existing {
-        if !inst.is_undefined() && !inst.is_null() {
-            // 复用已有实例，调整尺寸
-            if let Ok(resize_fn) = js_sys::Reflect::get(inst, &"resize".into()) {
-                if let Some(f) = resize_fn.dyn_ref::<js_sys::Function>() {
-                    let opts = js_sys::Object::new();
-                    let _ = js_sys::Reflect::set(&opts, &"width".into(), &(width as f64).into());
-                    let _ = js_sys::Reflect::set(&opts, &"height".into(), &(height as f64).into());
-                    let _ = f.call1(inst, &opts);
-                }
-            }
-            return Some(inst.clone());
+    if let Some(inst) = existing.filter(|inst| !inst.is_undefined() && !inst.is_null()) {
+        // 复用已有实例，调整尺寸
+        if let Some(f) = js_sys::Reflect::get(&inst, &"resize".into())
+            .ok()
+            .and_then(|resize_fn| resize_fn.dyn_ref::<js_sys::Function>().cloned())
+        {
+            let opts = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&opts, &"width".into(), &(width as f64).into());
+            let _ = js_sys::Reflect::set(&opts, &"height".into(), &(height as f64).into());
+            let _ = f.call1(&inst, &opts);
         }
+        return Some(inst);
     }
 
     // echarts.init(dom, null, { width, height })
@@ -127,9 +128,11 @@ pub fn dispose_chart(container_id: &str) {
         return;
     }
 
-    if let Ok(dispose_fn) = js_sys::Reflect::get(&instance, &"dispose".into()) {
-        if let Some(dispose) = dispose_fn.dyn_ref::<js_sys::Function>() {
-            let _ = dispose.call0(&instance);
-        }
-    }
+    let Ok(dispose_fn) = js_sys::Reflect::get(&instance, &"dispose".into()) else {
+        return;
+    };
+    let Some(dispose) = dispose_fn.dyn_ref::<js_sys::Function>() else {
+        return;
+    };
+    let _ = dispose.call0(&instance);
 }

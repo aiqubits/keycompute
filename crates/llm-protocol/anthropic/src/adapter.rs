@@ -318,14 +318,14 @@ impl ProviderAdapter for AnthropicProvider {
             ),
         ];
         let response = transport.get_binary(&url, headers).await?;
-        Ok(llm_protocol_provider::parse_models_response(&response.body))
+        llm_protocol_provider::parse_models_response(&response.body)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_protocol_provider::UpstreamMessage;
+    use llm_protocol_provider::{UpstreamMessage, test_support::RecordingGetTransport};
 
     #[test]
     fn test_anthropic_provider_name() {
@@ -338,6 +338,33 @@ mod tests {
         let provider = AnthropicProvider::new();
         // 协议层不维护模型白名单
         assert!(provider.supported_models().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_models_propagates_invalid_response_with_anthropic_auth() {
+        let transport = RecordingGetTransport::new(br#"{"data": "invalid"}"#.to_vec());
+        let provider = AnthropicProvider::new();
+        let api_key = SensitiveString::new("test-key");
+
+        let error = provider
+            .list_models(&transport, "https://provider.example/v1/", &api_key)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, KeyComputeError::ProviderError(_)));
+        assert_eq!(
+            transport.requests(),
+            vec![(
+                "https://provider.example/v1/models".to_string(),
+                vec![
+                    ("x-api-key".to_string(), "test-key".to_string()),
+                    (
+                        "anthropic-version".to_string(),
+                        ANTHROPIC_API_VERSION.to_string(),
+                    ),
+                ],
+            )]
+        );
     }
 
     #[test]

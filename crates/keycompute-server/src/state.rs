@@ -97,30 +97,45 @@ impl AppStateConfig {
 ///
 /// # 参数
 /// - `config`: 应用配置
+/// - `is_production`: 是否为非开发环境；生产环境必须配置加密密钥
 ///
 /// # 返回
-/// - `Ok(())`: 成功初始化或无加密配置
-/// - `Err(...)`: 密钥格式错误
+/// - `Ok(())`: 成功初始化；开发环境也允许未配置密钥
+/// - `Err(...)`: 生产环境缺少密钥或密钥格式错误
 ///
 /// # 示例
 /// ```rust,ignore
 /// let config = AppConfig::load()?;
-/// init_global_crypto(&config)?;
+/// init_global_crypto(&config, true)?;
 /// let state = AppState::with_config(AppStateConfig::from_config(&config));
 /// ```
-pub fn init_global_crypto(config: &keycompute_config::AppConfig) -> crate::error::Result<()> {
-    if let Some(crypto) = &config.crypto {
-        if let Some(key) = crypto.secret_key() {
-            set_global_crypto(key).map_err(|e| {
-                crate::error::ApiError::Config(format!("Failed to set global crypto key: {}", e))
-            })?;
-            tracing::info!("Global crypto key initialized from config");
-        } else {
-            tracing::info!("No crypto key configured, upstream API keys will be used as plaintext");
+pub fn init_global_crypto(
+    config: &keycompute_config::AppConfig,
+    is_production: bool,
+) -> crate::error::Result<()> {
+    let key = config
+        .crypto
+        .as_ref()
+        .filter(|crypto| crypto.has_key())
+        .and_then(|crypto| crypto.secret_key());
+
+    let Some(key) = key else {
+        if is_production {
+            return Err(crate::error::ApiError::Config(
+                "KC__CRYPTO__SECRET_KEY must be set in production".to_string(),
+            ));
         }
-    } else {
-        tracing::info!("No crypto config found, upstream API keys will be used as plaintext");
-    }
+
+        tracing::warn!(
+            "No crypto key configured; storing upstream API keys as plaintext in development"
+        );
+        return Ok(());
+    };
+
+    set_global_crypto(key).map_err(|e| {
+        crate::error::ApiError::Config(format!("Failed to set global crypto key: {}", e))
+    })?;
+    tracing::info!("Global crypto key initialized from config");
     Ok(())
 }
 
@@ -732,6 +747,23 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_crypto_initialization_rejects_missing_key() {
+        let error = init_global_crypto(&keycompute_config::AppConfig::default(), true).unwrap_err();
+
+        assert!(matches!(error, crate::error::ApiError::Config(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("KC__CRYPTO__SECRET_KEY must be set")
+        );
+    }
+
+    #[test]
+    fn development_crypto_initialization_allows_missing_key() {
+        init_global_crypto(&keycompute_config::AppConfig::default(), false).unwrap();
+    }
 
     #[test]
     fn test_app_state_new() {

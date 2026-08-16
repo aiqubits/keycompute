@@ -335,7 +335,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("home.sponsors.title", "社区赞助者");
     m.insert(
         "home.sponsors.subtitle",
-        "感谢以下赞助者对 KeyCompute 的大力支持 🙏",
+        "感谢以下朋友的赞赏支持 🙏（排名不分先后）",
     );
 
     // ── 需求收集 ─────────────────────────────────
@@ -1180,10 +1180,30 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("accounts.test_success", "连接测试成功");
     m.insert("accounts.test_failed", "测试失败");
     m.insert("accounts.test", "测试");
+    m.insert("accounts.refresh_success", "模型列表已刷新");
+    m.insert("accounts.refresh_failed", "刷新模型列表失败");
     m.insert("accounts.create_title", "新增 LLM 渠道");
     m.insert("accounts.channel_name", "渠道名称 *");
     m.insert("accounts.channel_name_placeholder", "如 OpenAI 官方");
     m.insert("accounts.provider", "Provider *");
+    m.insert("accounts.provider_openai_compatible", "OpenAI 兼容");
+    m.insert("accounts.provider_anthropic_compatible", "Anthropic 兼容");
+    m.insert(
+        "accounts.provider_deepseek_openai_compatible",
+        "DeepSeek（OpenAI 兼容）",
+    );
+    m.insert(
+        "accounts.provider_gemini_openai_compatible",
+        "Google Gemini（OpenAI 兼容）",
+    );
+    m.insert(
+        "accounts.provider_vllm_openai_compatible",
+        "vLLM（OpenAI 兼容）",
+    );
+    m.insert(
+        "accounts.provider_ollama_openai_compatible",
+        "Ollama（OpenAI 兼容）",
+    );
     m.insert("accounts.supported_models", "支持模型 *");
     m.insert("accounts.models_hint", "多个模型用逗号分隔");
     m.insert("accounts.api_key", "API Key *");

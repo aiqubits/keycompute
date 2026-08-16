@@ -7,13 +7,15 @@
 
 use async_trait::async_trait;
 use futures::Stream;
-use keycompute_types::{Result, SensitiveString};
+use keycompute_types::{KeyComputeError, Result, SensitiveString};
 use std::pin::Pin;
 
 pub mod http;
 pub mod protocol;
 pub mod request;
 pub mod stream;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub use http::{ByteStream, DefaultHttpTransport, GetBinaryResponse, HttpTransport};
 pub use protocol::{ProtocolType, normalize_base_url};
@@ -104,7 +106,7 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
             format!("Bearer {}", api_key.expose()),
         )];
         let response = transport.get_binary(&url, headers).await?;
-        Ok(parse_models_response(&response.body))
+        parse_models_response(&response.body)
     }
 
     /// 验证上游 API Key 连通性（用于渠道账号测试）
@@ -124,19 +126,30 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
 
 /// 解析上游 `/models` 接口响应，提取模型 ID 列表
 ///
-/// openai 与 anthropic 协议的响应均为 `{"data": [{"id": ...}]}` 结构，
-/// 解析失败或结构不匹配时返回空列表（连通性验证以 HTTP 状态为准）
-pub fn parse_models_response(body: &[u8]) -> Vec<String> {
-    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::json!({}));
-    parsed
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+/// openai 与 anthropic 协议的响应均为 `{"data": [{"id": ...}]}` 结构。
+///
+/// 合法的空列表 `{"data": []}` 表示连接正常但当前账号没有可列出的模型；
+/// 非法 JSON 或不符合该结构的响应则说明请求未到达兼容的 `/models` 端点，
+/// 必须令渠道连接测试失败，不能误报成功。
+pub fn parse_models_response(body: &[u8]) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct ModelsResponse {
+        data: Vec<Model>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Model {
+        id: String,
+    }
+
+    let response: ModelsResponse = serde_json::from_slice(body).map_err(|_| {
+        KeyComputeError::ProviderError(
+            "Invalid /models response: expected an object with a data array of model IDs"
+                .to_string(),
+        )
+    })?;
+
+    Ok(response.data.into_iter().map(|model| model.id).collect())
 }
 
 /// 流返回类型
@@ -145,6 +158,29 @@ pub type StreamBox = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::RecordingGetTransport;
+
+    #[derive(Debug)]
+    struct DefaultModelListAdapter;
+
+    #[async_trait::async_trait]
+    impl ProviderAdapter for DefaultModelListAdapter {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn supported_models(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        async fn stream_chat(
+            &self,
+            _transport: &dyn HttpTransport,
+            _request: UpstreamRequest,
+        ) -> Result<StreamBox> {
+            Err(KeyComputeError::ProviderError("not used".into()))
+        }
+    }
 
     #[test]
     fn test_stream_event_serialization() {
@@ -159,19 +195,53 @@ mod tests {
     #[test]
     fn test_parse_models_response_valid() {
         let body = br#"{"data": [{"id": "gpt-4o"}, {"id": "gpt-4o-mini"}]}"#;
-        assert_eq!(parse_models_response(body), vec!["gpt-4o", "gpt-4o-mini"]);
+        assert_eq!(
+            parse_models_response(body).unwrap(),
+            vec!["gpt-4o", "gpt-4o-mini"]
+        );
     }
 
     #[test]
-    fn test_parse_models_response_tolerates_bad_input() {
-        // 解析失败或结构不匹配时返回空列表（连通性验证以 HTTP 状态为准）
-        assert!(parse_models_response(b"not json").is_empty());
-        assert!(parse_models_response(br#"{"data": "oops"}"#).is_empty());
-        assert!(parse_models_response(br#"{"models": [{"id": "x"}]}"#).is_empty());
-        // 缺 id 的条目跳过，其余正常提取
+    fn test_parse_models_response_accepts_empty_model_list() {
+        assert!(
+            parse_models_response(br#"{"data": []}"#)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_parse_models_response_rejects_invalid_or_incompatible_responses() {
+        for body in [
+            b"not json".as_slice(),
+            br#"{"data": "oops"}"#,
+            br#"{"models": [{"id": "x"}]}"#,
+            br#"{"data": [{"name": "a"}]}"#,
+        ] {
+            assert!(parse_models_response(body).is_err());
+        }
+    }
+
+    #[test]
+    fn default_list_models_propagates_invalid_response() {
+        let transport = RecordingGetTransport::new(br#"{"data": "invalid"}"#.to_vec());
+        let adapter = DefaultModelListAdapter;
+        let api_key = SensitiveString::new("test-key");
+
+        let error = futures::executor::block_on(adapter.list_models(
+            &transport,
+            "https://provider.example/v1/",
+            &api_key,
+        ))
+        .unwrap_err();
+
+        assert!(matches!(error, KeyComputeError::ProviderError(_)));
         assert_eq!(
-            parse_models_response(br#"{"data": [{"name": "a"}, {"id": "b"}]}"#),
-            vec!["b"]
+            transport.requests(),
+            vec![(
+                "https://provider.example/v1/models".to_string(),
+                vec![("Authorization".to_string(), "Bearer test-key".to_string())],
+            )]
         );
     }
 }

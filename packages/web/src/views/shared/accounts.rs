@@ -1,9 +1,11 @@
+use client_api::api::admin::AccountTestResponse;
 use dioxus::prelude::*;
 use ui::{Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Pagination, Table, TableHead};
 
 const PAGE_SIZE: usize = 20;
 
 use crate::hooks::use_i18n::use_i18n;
+use crate::i18n::I18n;
 use crate::services::{
     account_service, api_client::with_auto_refresh, debug_service, tenant_service,
 };
@@ -12,35 +14,45 @@ use crate::stores::ui_store::UiStore;
 use crate::stores::user_store::UserStore;
 use crate::utils::time::format_time;
 
-/// 厂商预设列表：(预设 id, 显示名, 协议, Base URL 模板)
+/// 厂商预设列表：(预设 id, 显示名 i18n key, 协议, Base URL 模板)
 ///
 /// 后端仅支持两种协议（openai / anthropic），厂商通过
 /// `协议 + base_url + api_key` 接入。选择预设后自动填充协议与
 /// Base URL 模板（空串表示使用协议默认端点）。
 const PRESETS: &[(&str, &str, &str, &str)] = &[
-    ("openai", "OpenAI", "openai", ""),
-    ("anthropic", "Anthropic Claude", "anthropic", ""),
+    (
+        "openai",
+        "accounts.provider_openai_compatible",
+        "openai",
+        "",
+    ),
+    (
+        "anthropic",
+        "accounts.provider_anthropic_compatible",
+        "anthropic",
+        "",
+    ),
     (
         "deepseek",
-        "DeepSeek (OpenAI 协议)",
+        "accounts.provider_deepseek_openai_compatible",
         "openai",
         "https://api.deepseek.com/v1",
     ),
     (
         "gemini",
-        "Google Gemini (OpenAI 协议)",
+        "accounts.provider_gemini_openai_compatible",
         "openai",
         "https://generativelanguage.googleapis.com/v1beta/openai",
     ),
     (
         "vllm",
-        "vLLM (OpenAI 协议)",
+        "accounts.provider_vllm_openai_compatible",
         "openai",
         "http://localhost:8000/v1",
     ),
     (
         "ollama",
-        "Ollama (OpenAI 协议)",
+        "accounts.provider_ollama_openai_compatible",
         "openai",
         "http://localhost:11434/v1",
     ),
@@ -53,12 +65,12 @@ fn preset_by_id(
     PRESETS.iter().find(|(value, _, _, _)| *value == id)
 }
 
-fn provider_label(provider: &str) -> &str {
+fn provider_label(provider: &str, i18n: I18n) -> String {
     // 账号的 provider 字段存储协议名（openai / anthropic）
     match provider {
-        "openai" => "OpenAI 协议",
-        "anthropic" => "Anthropic 协议",
-        other => other,
+        "openai" => i18n.t("accounts.provider_openai_compatible").to_string(),
+        "anthropic" => i18n.t("accounts.provider_anthropic_compatible").to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -72,6 +84,22 @@ fn models_placeholder_key_for(preset: &str) -> &'static str {
         "vllm" => "accounts.models_placeholder_vllm",
         "ollama" => "accounts.models_placeholder_ollama",
         _ => "accounts.models_placeholder_default",
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AccountTestOutcome {
+    Success,
+    Failure,
+}
+
+fn account_test_outcome(response: AccountTestResponse) -> AccountTestOutcome {
+    if response.success {
+        AccountTestOutcome::Success
+    } else {
+        // The server message is intentionally generic and not localized. Keep
+        // presentation localized instead of combining it with the UI language.
+        AccountTestOutcome::Failure
     }
 }
 
@@ -388,7 +416,7 @@ fn AdminAccountsView() -> Element {
                                             td {
                                                 div { class: "account-provider-cell",
                                                     span { class: "account-provider-badge account-provider-{acc.provider}",
-                                                        "{provider_label(&acc.provider)}"
+                                                        "{provider_label(&acc.provider, i18n)}"
                                                     }
                                                     p { class: "account-provider-code", "{acc.provider}" }
                                                     div { class: "account-models",
@@ -517,7 +545,14 @@ fn AdminAccountsView() -> Element {
                                                                 let id = id.clone();
                                                                 spawn(async move {
                                                                     match account_service::test(&id, &token).await {
-                                                                        Ok(_) => ui_store.show_success(i18n.t("accounts.test_success")),
+                                                                        Ok(response) => match account_test_outcome(response) {
+                                                                            AccountTestOutcome::Success => {
+                                                                                ui_store.show_success(i18n.t("accounts.test_success"));
+                                                                            }
+                                                                            AccountTestOutcome::Failure => {
+                                                                                ui_store.show_error(i18n.t("accounts.test_failed"));
+                                                                            }
+                                                                        },
                                                                         Err(e) => {
                                                                             ui_store
                                                                                 .show_error(
@@ -530,6 +565,29 @@ fn AdminAccountsView() -> Element {
                                                             }
                                                         },
                                                         {i18n.t("accounts.test")}
+                                                    }
+                                                    Button {
+                                                        variant: ButtonVariant::Ghost,
+                                                        size: ButtonSize::Small,
+                                                        onclick: {
+                                                            let id = acc.id.clone();
+                                                            move |_| {
+                                                                let token = auth_store.token().unwrap_or_default();
+                                                                let id = id.clone();
+                                                                spawn(async move {
+                                                                    match account_service::refresh(&id, &token).await {
+                                                                        Ok(_) => ui_store.show_success(i18n.t("accounts.refresh_success")),
+                                                                        Err(e) => ui_store.show_error(format!(
+                                                                            "{}: {}",
+                                                                            i18n.t("accounts.refresh_failed"),
+                                                                            e,
+                                                                        )),
+                                                                    }
+                                                                    accounts.restart();
+                                                                });
+                                                            }
+                                                        },
+                                                        {i18n.t("common.refresh")}
                                                     }
                                                     Button {
                                                         variant: ButtonVariant::Danger,
@@ -612,11 +670,11 @@ fn AdminAccountsView() -> Element {
                                         }
                                         *create_preset.write() = preset_id;
                                     },
-                                    for (value , label , _ , _) in PRESETS {
+                                    for (value , label_key , _ , _) in PRESETS {
                                         option {
                                             value: "{value}",
                                             selected: *value == create_preset(),
-                                            "{label}"
+                                            "{i18n.t(label_key)}"
                                         }
                                     }
                                 }
@@ -909,5 +967,34 @@ pub fn NoPermissionView(resource: String) -> Element {
             h3 { class: "empty-title", {i18n.t("accounts.no_permission_title")} }
             p { class: "empty-description", "{no_permission_desc}" }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(success: bool, message: &str) -> AccountTestResponse {
+        AccountTestResponse {
+            success,
+            message: message.to_string(),
+            latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn account_test_success_uses_success_feedback() {
+        assert_eq!(
+            account_test_outcome(response(true, "Account connection test passed")),
+            AccountTestOutcome::Success
+        );
+    }
+
+    #[test]
+    fn account_test_failure_uses_localized_failure_feedback_even_when_http_request_succeeds() {
+        assert_eq!(
+            account_test_outcome(response(false, "Account connection test failed")),
+            AccountTestOutcome::Failure
+        );
     }
 }

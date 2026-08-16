@@ -1371,10 +1371,8 @@ fn read_lang_from_storage() -> Option<String> {
 
 #[cfg(target_arch = "wasm32")]
 fn save_lang_to_storage(lang: &str) {
-    if let Some(window) = web_sys::window() {
-        if let Ok(Some(storage)) = window.local_storage() {
-            let _ = storage.set_item("keyc_lang", lang);
-        }
+    if let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok()?) {
+        let _ = storage.set_item("keyc_lang", lang);
     }
 }
 

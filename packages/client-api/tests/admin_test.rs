@@ -297,6 +297,36 @@ async fn test_delete_account_success() {
     assert!(result.is_ok());
 }
 
+#[tokio::test]
+async fn test_refresh_account_success() {
+    let (client, mock_server) = create_test_client().await;
+    let admin_api = AdminApi::new(&client);
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/accounts/account_001/refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "message": "Account refreshed",
+            "account_id": "account_001",
+            "refreshed_by": "admin_001",
+            "previous_models": ["gpt-4o"],
+            "updated_models": ["gpt-4o", "gpt-4o-mini"]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let result = admin_api
+        .refresh_account("account_001", fixtures::TEST_ACCESS_TOKEN)
+        .await;
+
+    assert!(result.is_ok(), "Expected Ok, got {result:?}");
+    let response = result.unwrap();
+    assert!(response.success);
+    assert_eq!(response.account_id, "account_001");
+    assert_eq!(response.previous_models, ["gpt-4o"]);
+    assert_eq!(response.updated_models, ["gpt-4o", "gpt-4o-mini"]);
+}
+
 // ==================== 定价管理测试 ====================
 
 #[tokio::test]

@@ -56,7 +56,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ==================== 阶段 3: 初始化全局加密 ====================
-    if let Err(e) = init_global_crypto(&config) {
+    let is_production = env != "development" && env != "dev";
+    if let Err(e) = init_global_crypto(&config, is_production) {
         error!("全局加密初始化失败: {}", e);
         std::process::exit(1);
     }
@@ -158,10 +159,7 @@ async fn main() -> anyhow::Result<()> {
     let app_state = AppState::with_pool_and_config(pool, state_config);
 
     // 验证生产环境配置
-    if env != "development"
-        && env != "dev"
-        && let Err(e) = app_state.validate_for_production()
-    {
+    if is_production && let Err(e) = app_state.validate_for_production() {
         error!("生产环境验证失败：{}", e);
         std::process::exit(1);
     }

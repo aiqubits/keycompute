@@ -3,6 +3,9 @@ name = "llm-protocol-provider"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-support = []
+
 [dependencies]
 keycompute-types = { workspace = true }
 async-trait = "0.1"

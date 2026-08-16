@@ -191,7 +191,7 @@ fn remove_session_storage(key: &str) -> Option<()> {
 fn currently_persistent() -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        return read_local_storage("access_token").is_some();
+        read_local_storage("access_token").is_some()
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

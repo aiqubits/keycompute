@@ -165,3 +165,56 @@ pub struct AccountTestResponse {
     pub message: String,
     pub latency_ms: Option<i64>,
 }
+
+/// 账号模型刷新响应
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountRefreshResponse {
+    pub success: bool,
+    pub message: String,
+    pub account_id: String,
+    pub refreshed_by: String,
+    pub previous_models: Vec<String>,
+    pub updated_models: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AccountRefreshResponse, AccountTestResponse};
+
+    #[test]
+    fn account_test_response_reads_top_level_latency() {
+        let response: AccountTestResponse = serde_json::from_str(
+            r#"{
+                "success": false,
+                "message": "Account connection test failed",
+                "latency_ms": 123,
+                "test_result": {"is_healthy": false}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!response.success);
+        assert_eq!(response.latency_ms, Some(123));
+    }
+
+    #[test]
+    fn account_refresh_response_matches_server_payload() {
+        let response: AccountRefreshResponse = serde_json::from_str(
+            r#"{
+                "success": true,
+                "message": "Account refreshed",
+                "account_id": "account-id",
+                "refreshed_by": "admin-id",
+                "previous_models": ["model-a"],
+                "updated_models": ["model-b"]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(response.success);
+        assert_eq!(response.account_id, "account-id");
+        assert_eq!(response.refreshed_by, "admin-id");
+        assert_eq!(response.previous_models, ["model-a"]);
+        assert_eq!(response.updated_models, ["model-b"]);
+    }
+}
