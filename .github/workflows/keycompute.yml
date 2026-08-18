@@ -328,3 +328,9 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo build --release -p web --target wasm32-unknown-unknown
+
+      # ── Step: Run Web Unit Tests ────────────────────────────────────────────
+      # web 包的单测（i18n key 一致性、示例文本生成、URL 归一化）只能在 native 下运行，
+      # 与上方 wasm 构建互补：wasm 构建保证可编译，单测保证行为正确。
+      - name: Run Web Unit Tests
+        run: cargo test --package web

@@ -1574,6 +1574,32 @@ input, textarea, select {
   border-radius: 8px;
 }
 
+.kc-api-example-protocols {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 12px 0;
+}
+
+.kc-api-example-protocol {
+  min-height: 28px;
+  padding: 0 14px;
+  color: #64748b;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid #dde5ee;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.kc-api-example-protocol.active {
+  color: #4f63e6;
+  background: rgba(79, 70, 229, 0.1);
+  border-color: rgba(79, 70, 229, 0.35);
+}
+
 .kc-api-example-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -1715,6 +1741,18 @@ input, textarea, select {
 
 [data-theme="dark"] .kc-api-model-more {
   color: color-mix(in srgb, var(--color-primary) 76%, white) !important;
+}
+
+[data-theme="dark"] .kc-api-example-protocol {
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-card) 74%, var(--bg-primary));
+  border-color: var(--border-color);
+}
+
+[data-theme="dark"] .kc-api-example-protocol.active {
+  color: color-mix(in srgb, var(--color-primary) 76%, white);
+  background: color-mix(in srgb, var(--color-primary) 16%, transparent);
+  border-color: color-mix(in srgb, var(--color-primary) 45%, transparent);
 }
 
 [data-theme="dark"] .kc-api-example-tabs {

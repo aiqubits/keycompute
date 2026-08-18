@@ -161,6 +161,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
 
     // ── 通用 ────────────────────────────────────
     m.insert("common.loading", "加载中");
+    m.insert("common.more", "更多");
     m.insert("common.error", "出错了");
     m.insert("common.success", "操作成功");
     m.insert("common.confirm_delete", "确定要删除吗？此操作不可撤销。");
@@ -174,6 +175,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("common.back", "返回");
     m.insert("common.time", "时间");
     m.insert("common.total_items", "共");
+    m.insert("common.range", "范围");
     m.insert("common.created_at_label", "创建于");
     m.insert("common.load_failed", "加载失败");
     m.insert("common.redirecting", "跳转中");
@@ -240,6 +242,20 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("api_keys.example_python", "OpenAI SDK（Python）");
     m.insert("api_keys.example_node", "OpenAI SDK（Node.js）");
     m.insert("api_keys.example_curl", "cURL");
+    m.insert("api_keys.example_protocol_openai", "OpenAI");
+    m.insert("api_keys.example_protocol_anthropic", "Anthropic");
+    m.insert(
+        "api_keys.example_python_anthropic",
+        "Anthropic SDK（Python）",
+    );
+    m.insert(
+        "api_keys.example_node_anthropic",
+        "Anthropic SDK（Node.js）",
+    );
+    m.insert(
+        "api_keys.example_note_anthropic",
+        "提示：Anthropic 示例调用 /v1/messages 接口；示例模型取列表中第一个 Claude 模型，若列表中没有 Claude 模型则默认使用 {model}。",
+    );
     m.insert("api_keys.copy", "复制");
     m.insert("api_keys.copy_hint", "点击复制");
     m.insert("api_keys.copied", "已复制");

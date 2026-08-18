@@ -19,7 +19,7 @@ use crate::utils::time::format_time;
 /// 后端仅支持两种协议（openai / anthropic），厂商通过
 /// `协议 + base_url + api_key` 接入。选择预设后自动填充协议与
 /// Base URL 模板（空串表示使用协议默认端点）。
-const PRESETS: &[(&str, &str, &str, &str)] = &[
+pub(crate) const PRESETS: &[(&str, &str, &str, &str)] = &[
     (
         "openai",
         "accounts.provider_openai_compatible",

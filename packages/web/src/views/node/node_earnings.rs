@@ -9,6 +9,17 @@ use crate::stores::{auth_store::AuthStore, ui_store::UiStore};
 
 const HISTORY_PAGE_SIZE: u32 = 20;
 
+/// 计算简单分页当前页可见的记录范围（1-based，含首尾）。
+/// `offset` 为已跳过的记录数；结束值截断到 total；total 为 0 时返回 (0, 0)。
+fn visible_range(offset: usize, page_size: usize, total: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let start = offset + 1;
+    let end = (offset + page_size).min(total);
+    (start, end)
+}
+
 /// 提现方式
 #[derive(Clone, PartialEq)]
 enum WithdrawMethod {
@@ -94,6 +105,18 @@ pub fn NodeEarnings() -> Element {
         }
     });
 
+    // 当前页可见记录范围（供小费历史简单分页展示）；total 为 0 时返回 (0, 0)
+    let history_total = history_resource()
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|resp| resp.total.max(0) as usize)
+        .unwrap_or(0);
+    let (range_start, range_end) = visible_range(
+        *history_offset.read() as usize,
+        HISTORY_PAGE_SIZE as usize,
+        history_total,
+    );
+
     // 提现记录
     let withdrawals_resource = use_resource(move || {
         let auth = auth_store.clone();
@@ -128,10 +151,7 @@ pub fn NodeEarnings() -> Element {
 
             // 错误提示
             if let Some(Err(ref e)) = summary_resource().as_ref().map(|r| r.as_ref()) {
-                Alert {
-                    variant: AlertVariant::Error,
-                    "{i18n.t(\"common.load_failed\")}：{e}"
-                }
+                Alert { variant: AlertVariant::Error, "{i18n.t(\"common.load_failed\")}：{e}" }
             }
 
             // 汇总卡片
@@ -140,7 +160,10 @@ pub fn NodeEarnings() -> Element {
                     EarningsCard {
                         label: i18n.t("node_earnings.pending_amount"),
                         value: format!("¥{}", summary.pending_amount),
-                        meta: i18n.t_with_args("node_earnings.pending_count", &[("count", &summary.pending_count.to_string())]),
+                        meta: i18n.t_with_args(
+                            "node_earnings.pending_count",
+                            &[("count", &summary.pending_count.to_string())],
+                        ),
                         variant: "warning",
                     }
                     EarningsCard {
@@ -167,7 +190,7 @@ pub fn NodeEarnings() -> Element {
                 Button {
                     variant: ButtonVariant::Primary,
                     size: ButtonSize::Medium,
-                    onclick: move | _| {
+                    onclick: move |_| {
                         withdraw_error.set(None);
                         withdraw_modal.set(WithdrawModalState::Open);
                     },
@@ -186,10 +209,7 @@ pub fn NodeEarnings() -> Element {
                             div { class: "text-secondary", {i18n.t("table.loading")} }
                         },
                         Some(Err(e)) => rsx! {
-                            Alert {
-                                variant: AlertVariant::Error,
-                                "{e}"
-                            }
+                            Alert { variant: AlertVariant::Error, "{e}" }
                         },
                         Some(Ok(resp)) => rsx! {
                             Table {
@@ -225,20 +245,20 @@ pub fn NodeEarnings() -> Element {
                                         variant: ButtonVariant::Ghost,
                                         size: ButtonSize::Small,
                                         disabled: *history_offset.read() == 0,
-                                        onclick: move | _| {
+                                        onclick: move |_| {
                                             let cur = *history_offset.read();
                                             *history_offset.write() = cur.saturating_sub(HISTORY_PAGE_SIZE);
                                         },
                                         {i18n.t("common.back")}
                                     }
                                     span { class: "pagination-info",
-                                        "{i18n.t(\"common.range\")}"
+                                        "{i18n.t(\"common.range\")} {range_start}-{range_end} / {i18n.t(\"common.total_items\")} {history_total}"
                                     }
                                     Button {
                                         variant: ButtonVariant::Ghost,
                                         size: ButtonSize::Small,
                                         disabled: (*history_offset.read() + HISTORY_PAGE_SIZE) as i64 >= resp.total,
-                                        onclick: move | _| {
+                                        onclick: move |_| {
                                             let cur = *history_offset.read();
                                             *history_offset.write() = cur + HISTORY_PAGE_SIZE;
                                         },
@@ -262,10 +282,7 @@ pub fn NodeEarnings() -> Element {
                             div { class: "text-secondary", {i18n.t("table.loading")} }
                         },
                         Some(Err(e)) => rsx! {
-                            Alert {
-                                variant: AlertVariant::Error,
-                                "{e}"
-                            }
+                            Alert { variant: AlertVariant::Error, "{e}" }
                         },
                         Some(Ok(records)) => rsx! {
                             Table {
@@ -295,14 +312,14 @@ pub fn NodeEarnings() -> Element {
                                                 }
                                             }
                                             td {
-                                                WithdrawalStatusBadge {
-                                                    status: w.status.clone()
-                                                }
+                                                WithdrawalStatusBadge { status: w.status.clone() }
                                             }
                                             td { class: "text-secondary",
                                                 if let Some(ref remark) = w.admin_remark {
                                                     "{remark}"
-                                                } else { "—" }
+                                                } else {
+                                                    "—"
+                                                }
                                             }
                                             td { class: "text-muted", "{&w.id[..8]}" }
                                         }
@@ -373,31 +390,32 @@ fn WithdrawModal(
     let ui_store = use_context::<UiStore>();
 
     rsx! {
-        div { class: "modal-overlay",
-            onclick: move | _| {
+        div {
+            class: "modal-overlay",
+            onclick: move |_| {
                 if !withdraw_loading() {
                     withdraw_modal.set(WithdrawModalState::Closed);
                 }
             },
-            div { class: "modal",
+            div {
+                class: "modal",
                 // 阻止冒泡
-                onclick: move |evt| { evt.stop_propagation(); },
+                onclick: move |evt| {
+                    evt.stop_propagation();
+                },
                 div { class: "modal-header",
                     h3 { class: "modal-title", {i18n.t("node_earnings.withdraw_title")} }
                     button {
                         class: "modal-close",
                         r#type: "button",
                         disabled: withdraw_loading(),
-                        onclick: move | _| withdraw_modal.set(WithdrawModalState::Closed),
+                        onclick: move |_| withdraw_modal.set(WithdrawModalState::Closed),
                         "✕"
                     }
                 }
                 div { class: "modal-body",
                     if let Some(ref err) = withdraw_error() {
-                        Alert {
-                            variant: AlertVariant::Error,
-                            "{err}"
-                        }
+                        Alert { variant: AlertVariant::Error, "{err}" }
                     }
 
                     // 选择提现方式
@@ -412,7 +430,7 @@ fn WithdrawModal(
                                         button {
                                             class: if is_active { "withdraw-method-card active" } else { "withdraw-method-card" },
                                             r#type: "button",
-                                            onclick: move | _| withdraw_method.set(m.clone()),
+                                            onclick: move |_| withdraw_method.set(m.clone()),
                                             strong { "{m.label()}" }
                                             p { class: "text-secondary",
                                                 if m == WithdrawMethod::Balance {
@@ -461,14 +479,14 @@ fn WithdrawModal(
                         variant: ButtonVariant::Ghost,
                         size: ButtonSize::Medium,
                         disabled: withdraw_loading(),
-                        onclick: move | _| withdraw_modal.set(WithdrawModalState::Closed),
+                        onclick: move |_| withdraw_modal.set(WithdrawModalState::Closed),
                         {i18n.t("form.cancel")}
                     }
                     Button {
                         variant: ButtonVariant::Primary,
                         size: ButtonSize::Medium,
                         disabled: withdraw_loading(),
-                        onclick: move | _| {
+                        onclick: move |_| {
                             let needs_alipay = withdraw_method() == WithdrawMethod::Alipay;
                             if needs_alipay
                                 && (alipay_account().trim().is_empty() || real_name().trim().is_empty())
@@ -483,18 +501,28 @@ fn WithdrawModal(
                             let mut ui = ui_store.clone();
                             let i18n_clone = i18n.clone();
                             let method_val = withdraw_method().value().to_string();
-                            let alipay_opt = if needs_alipay { Some(alipay_account().to_string()) } else { None };
+                            let alipay_opt = if needs_alipay {
+                                Some(alipay_account().to_string())
+                            } else {
+                                None
+                            };
                             let name_opt = if needs_alipay { Some(real_name().to_string()) } else { None };
                             let mut wm = withdraw_modal.clone();
                             let mut aa = alipay_account.clone();
                             let mut rn = real_name.clone();
                             let mut wl = withdraw_loading.clone();
-
                             spawn(async move {
                                 let token = auth.token().unwrap_or_default();
                                 let alipay_str = alipay_opt.as_deref();
                                 let name_str = name_opt.as_deref();
-                                match node_tips_service::create_withdrawal(&token, &method_val, alipay_str, name_str).await {
+                                match node_tips_service::create_withdrawal(
+                                        &token,
+                                        &method_val,
+                                        alipay_str,
+                                        name_str,
+                                    )
+                                    .await
+                                {
                                     Ok(_) => {
                                         wl.set(false);
                                         wm.set(WithdrawModalState::Closed);
@@ -509,7 +537,16 @@ fn WithdrawModal(
                                     }
                                     Err(e) => {
                                         wl.set(false);
-                                        withdraw_error.set(Some(format!("{}: {}", i18n_clone.t("node_earnings.withdraw_failed"), e)));
+                                        withdraw_error
+                                            .set(
+                                                Some(
+                                                    format!(
+                                                        "{}: {}",
+                                                        i18n_clone.t("node_earnings.withdraw_failed"),
+                                                        e,
+                                                    ),
+                                                ),
+                                            );
                                     }
                                 }
                             });
@@ -524,5 +561,33 @@ fn WithdrawModal(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_range;
+
+    #[test]
+    fn visible_range_first_page_shows_page_size_items() {
+        assert_eq!(visible_range(0, 20, 50), (1, 20));
+    }
+
+    #[test]
+    fn visible_range_last_page_truncates_to_total() {
+        assert_eq!(visible_range(40, 20, 50), (41, 50));
+        assert_eq!(visible_range(45, 20, 50), (46, 50));
+    }
+
+    #[test]
+    fn visible_range_exact_multiples() {
+        assert_eq!(visible_range(0, 20, 20), (1, 20));
+        assert_eq!(visible_range(20, 20, 40), (21, 40));
+    }
+
+    #[test]
+    fn visible_range_empty_total_returns_zero() {
+        assert_eq!(visible_range(0, 20, 0), (0, 0));
+        assert_eq!(visible_range(40, 20, 0), (0, 0));
     }
 }

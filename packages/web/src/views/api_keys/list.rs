@@ -1,3 +1,12 @@
+use super::examples::{
+    DEFAULT_CLAUDE_MODEL, anthropic_examples, openai_examples, pick_claude_model, pick_sample_model,
+};
+use crate::hooks::use_i18n::use_i18n;
+use crate::services::{api_client::with_auto_refresh, api_key_service, model_service};
+use crate::stores::auth_store::AuthStore;
+use crate::stores::ui_store::UiStore;
+use crate::utils::on_copy;
+use crate::utils::time::format_time;
 use dioxus::prelude::*;
 use ui::{
     Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Pagination, Table, TableHead,
@@ -19,13 +28,6 @@ fn model_display_rank(model: &str) -> usize {
     }
 }
 
-use crate::hooks::use_i18n::use_i18n;
-use crate::services::{api_client::with_auto_refresh, api_key_service, model_service};
-use crate::stores::auth_store::AuthStore;
-use crate::stores::ui_store::UiStore;
-use crate::utils::on_copy;
-use crate::utils::time::format_time;
-
 #[component]
 pub fn ApiKeyList() -> Element {
     let i18n = use_i18n();
@@ -42,6 +44,8 @@ pub fn ApiKeyList() -> Element {
     // 复制状态
     let mut copied = use_signal(|| false);
     let mut example_tab = use_signal(|| "env".to_string());
+    // 示例协议（openai / anthropic），与后端双协议网关对应
+    let mut example_protocol = use_signal(|| "openai".to_string());
     let create_failed = i18n.t("api_keys.create_failed");
 
     // 获取模型列表（用于显示用法示例）
@@ -93,10 +97,8 @@ pub fn ApiKeyList() -> Element {
     };
 
     rsx! {
-        div {
-            class: "page-container kc-api-page",
-            div {
-                class: "page-header kc-api-header",
+        div { class: "page-container kc-api-page",
+            div { class: "page-header kc-api-header",
                 div { class: "kc-api-heading",
                     h1 { class: "page-title", {i18n.t("page.api_keys")} }
                     p { class: "page-subtitle", {i18n.t("api_keys.subtitle")} }
@@ -107,6 +109,7 @@ pub fn ApiKeyList() -> Element {
                         onclick: move |_| {
                             show_create.set(true);
                             new_key_value.set(None);
+                            example_protocol.set("openai".to_string());
                         },
                         IconPlus { size: 16 }
                         {i18n.t("api_keys.create")}
@@ -147,6 +150,8 @@ pub fn ApiKeyList() -> Element {
                 {
                     // 同域部署时从浏览器地址解析完整 origin，避免示例里只显示相对路径 /v1
                     let api_url = crate::services::api_client::public_openai_api_base_url();
+                    // Anthropic SDK 会在 base_url 后自行追加 /v1/messages，示例需用不含 /v1 的根路径
+                    let api_root = crate::services::api_client::public_api_root_url();
 
                     let mut available_models = models()
                         .flatten()
@@ -162,88 +167,51 @@ pub fn ApiKeyList() -> Element {
                         .unwrap_or_default();
 
                     if available_models.is_empty() {
-                        available_models = vec![client_api::api::openai::ModelInfo {
-                            id: "deepseek-chat".to_string(),
-                            object: "model".to_string(),
-                            created: 0,
-                            owned_by: "deepseek".to_string(),
-                        }];
+                        available_models = vec![
+                            client_api::api::openai::ModelInfo {
+                                id: "deepseek-chat".to_string(),
+                                object: "model".to_string(),
+                                created: 0,
+                                owned_by: "deepseek".to_string(),
+                            },
+                        ];
                     }
-
-                    let sample_model = available_models
-                        .first()
-                        .map(|model| model.id.clone())
-                        .unwrap_or_else(|| "deepseek-chat".to_string());
-
+                    let sample_model = pick_sample_model(&available_models);
                     let selected_tab = example_tab();
-                    let env_text = format!(
-                        r#"# {}
-API_URL="{}"
-API_KEY="{}"
-API_MODEL="{}""#,
-                        i18n.t("api_keys.example_env_comment"),
-                        api_url,
-                        key,
-                        sample_model
-                    );
-                    let python_text = format!(
-                        r#"from openai import OpenAI
+                    let is_anthropic = example_protocol() == "anthropic";
+                    let claude_model = pick_claude_model(&available_models);
 
-client = OpenAI(
-    base_url="{}",
-    api_key="{}",
-)
-
-response = client.chat.completions.create(
-    model="{}",
-    messages=[{{"role": "user", "content": "Hello"}}],
-)
-
-print(response.choices[0].message.content)"#,
-                        api_url, key, sample_model
-                    );
-                    let node_text = format!(
-                        r#"import OpenAI from "openai";
-
-const client = new OpenAI({{
-  baseURL: "{}",
-  apiKey: "{}",
-}});
-
-const response = await client.chat.completions.create({{
-  model: "{}",
-  messages: [{{ role: "user", content: "Hello" }}],
-}});
-
-console.log(response.choices[0].message.content);"#,
-                        api_url, key, sample_model
-                    );
-                    let curl_text = format!(
-                        r#"curl "{}/chat/completions" \
-    -H "Authorization: Bearer {}" \
-    -H "Content-Type: application/json" \
-  -d '{{
-    "model": "{}",
-    "messages": [
-      {{"role": "user", "content": "Hello"}}
-    ]
-  }}'"#,
-                        api_url, key, sample_model
-                    );
-
-                    let example_text = match selected_tab.as_str() {
-                        "python" => python_text,
-                        "node" => node_text,
-                        "curl" => curl_text,
-                        _ => env_text,
+                    let examples = if is_anthropic {
+                        anthropic_examples(
+                            &api_root,
+                            &key,
+                            &claude_model,
+                            i18n.t("api_keys.example_env_comment"),
+                        )
+                    } else {
+                        openai_examples(
+                            &api_url,
+                            &key,
+                            &sample_model,
+                            i18n.t("api_keys.example_env_comment"),
+                        )
                     };
 
+                    let example_text = examples.for_tab(&selected_tab).to_string();
+                    // 预先计算 anthropic 提示文案（含模型名参数），避免在 rsx 内嵌多行表达式节点。
+                    // 注意：{model} 参数是文案中"列表无 Claude 时回退"的默认模型，与示例实际使用的
+                    // claude_model（列表第一个 Claude 模型）语义不同；列表含 Claude 时两者必然不同，
+                    // 属预期行为，勿改为传入 claude_model。
+                    let anthropic_note = i18n
+                        .t_with_args(
+                            "api_keys.example_note_anthropic",
+                            &[("model", DEFAULT_CLAUDE_MODEL)],
+                        );
                     let copied_label = i18n.t("api_keys.copied");
                     let copy_hint = i18n.t("api_keys.copy_hint");
                     let copy_manual_hint = i18n.t("common.copy_manual_hint");
                     rsx! {
-                        div {
-                            class: "kc-api-success-panel",
+                        div { class: "kc-api-success-panel",
                             div { class: "kc-api-success-head",
                                 div { class: "kc-api-success-icon", "✓" }
                                 div {
@@ -261,11 +229,10 @@ console.log(response.choices[0].message.content);"#,
                                         {i18n.t("api_keys.models_desc_suffix")}
                                     }
                                     div { class: "kc-api-model-list",
-                                        for (idx, model) in available_models.iter().take(6).enumerate() {
+                                        for (idx , model) in available_models.iter().take(6).enumerate() {
                                             div { class: "kc-api-model-row",
                                                 span { class: "kc-api-model-name", "{model.id}" }
-                                                span {
-                                                    class: if idx == 0 { "kc-api-model-badge is-default" } else { "kc-api-model-badge" },
+                                                span { class: if idx == 0 { "kc-api-model-badge is-default" } else { "kc-api-model-badge" },
                                                     if idx == 0 {
                                                         {i18n.t("api_keys.default_model")}
                                                     } else {
@@ -276,7 +243,9 @@ console.log(response.choices[0].message.content);"#,
                                         }
                                     }
                                     if available_models.len() > 6 {
-                                        p { class: "kc-api-model-more", "+{available_models.len() - 6} {i18n.t(\"api_keys.more_models\")}" }
+                                        p { class: "kc-api-model-more",
+                                            "+{available_models.len() - 6} {i18n.t(\"api_keys.more_models\")}"
+                                        }
                                     }
                                 }
 
@@ -285,13 +254,45 @@ console.log(response.choices[0].message.content);"#,
                                     p { {i18n.t("api_keys.quick_example_desc")} }
 
                                     div { class: "kc-api-example-box",
+                                        div { class: "kc-api-example-protocols",
+                                            for (value , label) in [
+                                                ("openai", i18n.t("api_keys.example_protocol_openai")),
+                                                ("anthropic", i18n.t("api_keys.example_protocol_anthropic")),
+                                            ]
+                                            {
+                                                button {
+                                                    class: if example_protocol() == value { "kc-api-example-protocol active" } else { "kc-api-example-protocol" },
+                                                    r#type: "button",
+                                                    onclick: move |_| {
+                                                        example_protocol.set(value.to_string());
+                                                        copied.set(false);
+                                                    },
+                                                    "{label}"
+                                                }
+                                            }
+                                        }
                                         div { class: "kc-api-example-tabs",
-                                            for (value, label) in [
+                                            for (value , label) in [
                                                 ("env", i18n.t("api_keys.example_env")),
-                                                ("python", i18n.t("api_keys.example_python")),
-                                                ("node", i18n.t("api_keys.example_node")),
+                                                (
+                                                    "python",
+                                                    if is_anthropic {
+                                                        i18n.t("api_keys.example_python_anthropic")
+                                                    } else {
+                                                        i18n.t("api_keys.example_python")
+                                                    },
+                                                ),
+                                                (
+                                                    "node",
+                                                    if is_anthropic {
+                                                        i18n.t("api_keys.example_node_anthropic")
+                                                    } else {
+                                                        i18n.t("api_keys.example_node")
+                                                    },
+                                                ),
                                                 ("curl", i18n.t("api_keys.example_curl")),
-                                            ] {
+                                            ]
+                                            {
                                                 button {
                                                     class: if selected_tab == value { "kc-api-example-tab active" } else { "kc-api-example-tab" },
                                                     r#type: "button",
@@ -312,12 +313,7 @@ console.log(response.choices[0].message.content);"#,
                                             button {
                                                 class: "kc-api-copy-button",
                                                 r#type: "button",
-                                                onclick: on_copy(
-                                                    example_text.clone(),
-                                                    copy_manual_hint.to_string(),
-                                                    ui_store,
-                                                    copied,
-                                                ),
+                                                onclick: on_copy(example_text.clone(), copy_manual_hint.to_string(), ui_store, copied),
                                                 IconCopy { size: 15 }
                                                 if copied() {
                                                     {copied_label}
@@ -328,9 +324,13 @@ console.log(response.choices[0].message.content);"#,
                                         }
                                     }
                                     p { class: "kc-api-secret-note",
-                                        {i18n.t("api_keys.example_note_prefix")}
-                                        code { "API_MODEL" }
-                                        {i18n.t("api_keys.example_note_suffix")}
+                                        if is_anthropic {
+                                            {anthropic_note}
+                                        } else {
+                                            {i18n.t("api_keys.example_note_prefix")}
+                                            code { "API_MODEL" }
+                                            {i18n.t("api_keys.example_note_suffix")}
+                                        }
                                     }
                                 }
                             }
@@ -352,18 +352,14 @@ console.log(response.choices[0].message.content);"#,
 
             // 创建弹窗
             if show_create() {
-                div {
-                    class: "modal-overlay",
-                    div {
-                        class: "modal",
+                div { class: "modal-overlay",
+                    div { class: "modal",
                         h2 { class: "modal-title", {i18n.t("api_keys.create_title")} }
                         if let Some(err) = create_error() {
                             div { class: "alert alert-error", "{err}" }
                         }
-                        form {
-                            onsubmit: on_create,
-                            div {
-                                class: "form-group",
+                        form { onsubmit: on_create,
+                            div { class: "form-group",
                                 label { class: "form-label", {i18n.t("api_keys.name")} }
                                 input {
                                     class: "form-input",
@@ -373,8 +369,7 @@ console.log(response.choices[0].message.content);"#,
                                     oninput: move |e| new_key_name.set(e.value()),
                                 }
                             }
-                            div {
-                                class: "modal-actions",
+                            div { class: "modal-actions",
                                 Button {
                                     variant: ButtonVariant::Ghost,
                                     r#type: "button".to_string(),
@@ -385,7 +380,11 @@ console.log(response.choices[0].message.content);"#,
                                     variant: ButtonVariant::Primary,
                                     r#type: "submit".to_string(),
                                     loading: creating(),
-                                    if creating() { {i18n.t("api_keys.creating")} } else { {i18n.t("form.create")} }
+                                    if creating() {
+                                        {i18n.t("api_keys.creating")}
+                                    } else {
+                                        {i18n.t("form.create")}
+                                    }
                                 }
                             }
                         }
@@ -420,7 +419,11 @@ console.log(response.choices[0].message.content);"#,
                                     col_count: 5,
                                     empty: true,
                                     empty_text: i18n.t("api_keys.empty").to_string(),
-                                    thead { tr { TableHead { "" } } }
+                                    thead {
+                                        tr {
+                                            TableHead { "" }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -440,9 +443,7 @@ console.log(response.choices[0].message.content);"#,
                                         }
                                     }
                                 }
-                                Table {
-                                    class: "kc-api-table".to_string(),
-                                    col_count: 5,
+                                Table { class: "kc-api-table".to_string(), col_count: 5,
                                     thead {
                                         tr {
                                             TableHead { {i18n.t("table.name")} }
@@ -454,17 +455,21 @@ console.log(response.choices[0].message.content);"#,
                                     }
                                     tbody {
                                         for key in paged.iter() {
-                                            tr {
-                                                key: "{key.id}",
+                                            tr { key: "{key.id}",
                                                 td { class: "kc-api-key-name", "{key.name}" }
-                                                td { code { class: "kc-api-key-preview", "{key.key_preview}" } }
                                                 td {
-                                                    Badge {
-                                                        variant: if key.revoked() { BadgeVariant::Error } else { BadgeVariant::Success },
-                                                        if key.revoked() { {i18n.t("api_keys.revoked")} } else { {i18n.t("api_keys.active")} }
+                                                    code { class: "kc-api-key-preview", "{key.key_preview}" }
+                                                }
+                                                td {
+                                                    Badge { variant: if key.revoked() { BadgeVariant::Error } else { BadgeVariant::Success },
+                                                        if key.revoked() {
+                                                            {i18n.t("api_keys.revoked")}
+                                                        } else {
+                                                            {i18n.t("api_keys.active")}
+                                                        }
                                                     }
                                                 }
-                                                td { { format_time(&key.created_at) } }
+                                                td { {format_time(&key.created_at)} }
                                                 td {
                                                     Button {
                                                         variant: ButtonVariant::Danger,

@@ -179,6 +179,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
 
     // ── Common ──────────────────────────────────
     m.insert("common.loading", "Loading");
+    m.insert("common.more", "More");
     m.insert("common.error", "Something went wrong");
     m.insert("common.success", "Success");
     m.insert(
@@ -195,6 +196,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("common.back", "Back");
     m.insert("common.time", "Time");
     m.insert("common.total_items", "Total");
+    m.insert("common.range", "Range");
     m.insert("common.created_at_label", "Created");
     m.insert("common.load_failed", "Load failed");
     m.insert("common.redirecting", "Redirecting");
@@ -267,6 +269,17 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("api_keys.example_python", "OpenAI SDK (Python)");
     m.insert("api_keys.example_node", "OpenAI SDK (Node.js)");
     m.insert("api_keys.example_curl", "cURL");
+    m.insert("api_keys.example_protocol_openai", "OpenAI");
+    m.insert("api_keys.example_protocol_anthropic", "Anthropic");
+    m.insert(
+        "api_keys.example_python_anthropic",
+        "Anthropic SDK (Python)",
+    );
+    m.insert("api_keys.example_node_anthropic", "Anthropic SDK (Node.js)");
+    m.insert(
+        "api_keys.example_note_anthropic",
+        "Tip: the Anthropic examples call the /v1/messages endpoint; the example model is the first Claude model in the list, falling back to {model} if none is listed.",
+    );
     m.insert("api_keys.copy", "Copy");
     m.insert("api_keys.copy_hint", "Click to copy");
     m.insert("api_keys.copied", "Copied");
@@ -1547,6 +1560,18 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("node_token.status_consumed", "Consumed");
     m.insert("node_token.status_approved", "Approved");
     m.insert("node_token.status_rejected", "Rejected");
+    m.insert(
+        "node_token.cannot_apply",
+        "You already have an active token. Resolve it before applying for a new one.",
+    );
+    m.insert("node_token.delete", "Delete Record");
+    m.insert("node_token.delete_confirm_title", "Confirm Delete");
+    m.insert(
+        "node_token.delete_confirm_msg",
+        "Delete this token record? You can apply for a new one afterwards.",
+    );
+    m.insert("node_token.delete_success", "Record deleted");
+    m.insert("node_token.delete_failed", "Delete failed");
     m.insert("node_token.status_revoked", "Revoked");
     m.insert(
         "node_token.pending_desc",
@@ -1610,7 +1635,6 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
         "Start your node, and it will auto-register and start receiving tasks",
     );
     m.insert("node_token.view_reason", "View Reason");
-    m.insert("node_token.revoke_reason_label", "Revocation Reason");
     m.insert(
         "node_token.no_tokens",
         "No token records. Click the button above to apply for your first token.",

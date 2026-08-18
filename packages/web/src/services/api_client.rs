@@ -19,11 +19,31 @@ pub fn get_client() -> ApiClient {
     CLIENT.clone()
 }
 
-/// 获取对外展示用的 OpenAI 兼容 API 基址
+/// 归一化配置的 API 基址到根路径（去掉 /auth、/api/v1、/v1 等后缀）
+fn normalize_api_root(configured: &str) -> String {
+    let mut root = configured.trim_end_matches('/');
+    loop {
+        // 按最长后缀优先裁剪；用 strip_suffix 而非 trim_end_matches，
+        // 避免重复匹配同一后缀时误吞 `api/v1/v1` 这类前缀
+        let stripped = root
+            .strip_suffix("/api/v1")
+            .or_else(|| root.strip_suffix("/auth"))
+            .or_else(|| root.strip_suffix("/v1"));
+        match stripped {
+            Some(next) => root = next.trim_end_matches('/'),
+            None => return root.to_string(),
+        }
+    }
+}
+
+/// 获取对外展示用的 API 根路径（不含 /v1 后缀）
 ///
-/// - 如果配置了绝对 `API_BASE_URL`，优先使用配置值并归一化到 `/v1`
+/// - 如果配置了绝对 `API_BASE_URL`，优先使用配置值并归一化到根路径
 /// - 如果当前是同域反代部署（`API_BASE_URL=""`），在浏览器中读取当前站点 origin
-pub fn public_openai_api_base_url() -> String {
+///
+/// Anthropic SDK 会在 base_url 后自行追加 `/v1/messages`，快速示例需用根路径；
+/// OpenAI 兼容端点需要 `/v1` 后缀（见 `public_openai_api_base_url`）。
+pub fn public_api_root_url() -> String {
     let client = get_client();
     let configured = client.config().base_url.trim_end_matches('/');
 
@@ -33,20 +53,32 @@ pub fn public_openai_api_base_url() -> String {
             if let Some(origin) =
                 web_sys::window().and_then(|window| window.location().origin().ok())
             {
-                return format!("{}/v1", origin.trim_end_matches('/'));
+                return origin.trim_end_matches('/').to_string();
             }
         }
 
-        return "http://localhost:8080/v1".to_string();
+        return "http://localhost:8080".to_string();
     }
 
-    let root = configured
-        .trim_end_matches("/auth")
-        .trim_end_matches("/api/v1")
-        .trim_end_matches("/v1")
-        .trim_end_matches('/');
+    normalize_api_root(configured)
+}
 
-    format!("{}/v1", root)
+/// 为根路径追加 OpenAI 兼容的 `/v1` 后缀：幂等地处理尾斜杠与已含 `/v1` 的情况。
+fn append_v1(root: &str) -> String {
+    let root = root.trim_end_matches('/');
+    if root.ends_with("/v1") {
+        root.to_string()
+    } else {
+        format!("{root}/v1")
+    }
+}
+
+/// 获取对外展示用的 OpenAI 兼容 API 基址（以 `/v1` 结尾）
+///
+/// - 如果配置了绝对 `API_BASE_URL`，优先使用配置值并归一化到 `/v1`
+/// - 如果当前是同域反代部署（`API_BASE_URL=""`），在浏览器中读取当前站点 origin
+pub fn public_openai_api_base_url() -> String {
+    append_v1(&public_api_root_url())
 }
 
 /// Token 自动刷新封装器
@@ -149,5 +181,98 @@ pub fn user_error_message(err: &client_api::error::ClientError) -> String {
         | ClientError::Serialization(_)
         | ClientError::InvalidResponse(_) => localize_error(err),
         _ => message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_v1, normalize_api_root};
+
+    #[test]
+    fn normalize_api_root_strips_known_suffixes() {
+        assert_eq!(
+            normalize_api_root("http://gw.example.com/v1"),
+            "http://gw.example.com"
+        );
+        assert_eq!(
+            normalize_api_root("http://gw.example.com/api/v1"),
+            "http://gw.example.com"
+        );
+        assert_eq!(
+            normalize_api_root("http://gw.example.com/auth"),
+            "http://gw.example.com"
+        );
+        assert_eq!(
+            normalize_api_root("http://gw.example.com/"),
+            "http://gw.example.com"
+        );
+        assert_eq!(
+            normalize_api_root("http://gw.example.com"),
+            "http://gw.example.com"
+        );
+        assert_eq!(
+            normalize_api_root("http://localhost:8080/v1"),
+            "http://localhost:8080"
+        );
+        // 畸形双后缀：不得吞掉 `/api` 前缀
+        assert_eq!(
+            normalize_api_root("http://gw.example.com/v1/v1"),
+            "http://gw.example.com"
+        );
+        assert_eq!(
+            normalize_api_root("http://gw.example.com/api/v1/v1"),
+            "http://gw.example.com"
+        );
+    }
+
+    /// 空串输入保持空串返回（调用方保证不会传入空串，此处锁定防御性行为）
+    #[test]
+    fn normalize_api_root_handles_empty_input() {
+        assert_eq!(normalize_api_root(""), "");
+    }
+
+    #[test]
+    fn append_v1_is_idempotent_and_handles_trailing_slash() {
+        assert_eq!(
+            append_v1("http://gw.example.com"),
+            "http://gw.example.com/v1"
+        );
+        assert_eq!(
+            append_v1("http://gw.example.com/"),
+            "http://gw.example.com/v1"
+        );
+        assert_eq!(
+            append_v1("http://gw.example.com/v1"),
+            "http://gw.example.com/v1"
+        );
+        assert_eq!(
+            append_v1("http://localhost:8080"),
+            "http://localhost:8080/v1"
+        );
+    }
+
+    /// normalize 到根路径后追加 /v1，等价于旧版 public_openai_api_base_url 的行为
+    #[test]
+    fn normalized_root_plus_v1_matches_previous_openai_base() {
+        assert_eq!(
+            append_v1(&normalize_api_root("http://gw.example.com/v1")),
+            "http://gw.example.com/v1"
+        );
+        assert_eq!(
+            append_v1(&normalize_api_root("http://gw.example.com/api/v1")),
+            "http://gw.example.com/v1"
+        );
+        assert_eq!(
+            append_v1(&normalize_api_root("http://gw.example.com")),
+            "http://gw.example.com/v1"
+        );
+        assert_eq!(
+            append_v1(&normalize_api_root("http://gw.example.com/auth")),
+            "http://gw.example.com/v1"
+        );
+        assert_eq!(
+            append_v1(&normalize_api_root("http://localhost:8080/v1")),
+            "http://localhost:8080/v1"
+        );
     }
 }
