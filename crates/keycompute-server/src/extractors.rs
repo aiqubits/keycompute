@@ -58,20 +58,49 @@ impl AuthExtractor {
         self
     }
 
-    /// 从 Authorization 头和 AuthService 解析
+    /// 从 `Authorization: Bearer` 头和 `AuthService` 解析。
+    ///
+    /// HTTP 提取器另外支持 Anthropic 的 `x-api-key` 约定，但只允许在
+    /// `/v1/messages` 路径使用；这个无路径辅助函数保持 Bearer 调用方兼容。
     pub async fn from_header_with_auth(
         headers: &HeaderMap,
         auth_service: &keycompute_auth::AuthService,
     ) -> Result<Self> {
-        let auth_header = headers
-            .get("Authorization")
-            .and_then(|h| h.to_str().ok())
-            .ok_or_else(|| ApiError::Auth("Missing Authorization header".to_string()))?;
+        Self::from_header_with_auth_for_path(headers, auth_service, None).await
+    }
 
-        // 解析 Bearer token
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| ApiError::Auth("Invalid Authorization format".to_string()))?;
+    /// Parse authentication for an HTTP request path.
+    ///
+    /// Anthropic clients send API keys in `x-api-key`; that transport-level
+    /// convention must not accidentally grant access to the dashboard and
+    /// user-management APIs, which also use this extractor. Keep the legacy
+    /// header-only helper available for callers that already pass Bearer
+    /// tokens, while the Axum extractor supplies the actual request path.
+    async fn from_header_with_auth_for_path(
+        headers: &HeaderMap,
+        auth_service: &keycompute_auth::AuthService,
+        path: Option<&str>,
+    ) -> Result<Self> {
+        let token = if let Some(auth_header) =
+            headers.get("Authorization").and_then(|h| h.to_str().ok())
+        {
+            auth_header
+                .strip_prefix("Bearer ")
+                .ok_or_else(|| ApiError::Auth("Invalid Authorization format".to_string()))?
+        } else {
+            if path != Some("/v1/messages") {
+                return Err(ApiError::Auth(
+                    "x-api-key authentication is only valid for /v1/messages".to_string(),
+                ));
+            }
+            headers
+                .get("x-api-key")
+                .and_then(|h| h.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::Auth("Missing Authorization Bearer or x-api-key header".to_string())
+                })?
+        };
 
         // 使用 AuthService 验证 Token（自动检测 JWT 或 API Key）
         // 注意：通过 From 转换而非手动拼接前缀，避免与 KeyComputeError 的
@@ -116,8 +145,9 @@ impl FromRequestParts<AppState> for AuthExtractor {
     ) -> impl Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
         let auth_service = Arc::clone(&state.auth);
         let headers = parts.headers.clone();
+        let path = parts.uri.path().to_string();
 
-        async move { Self::from_header_with_auth(&headers, &auth_service).await }
+        async move { Self::from_header_with_auth_for_path(&headers, &auth_service, Some(&path)).await }
     }
 }
 
@@ -302,6 +332,23 @@ mod tests {
             keycompute_auth::AuthService::new(keycompute_auth::ProduceAiKeyValidator::default());
         let result = AuthExtractor::from_header_with_auth(&headers, &auth_service).await;
         assert!(matches!(result, Err(ApiError::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn x_api_key_is_rejected_outside_anthropic_messages_path() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("sk-test-key"));
+        let auth_service =
+            keycompute_auth::AuthService::new(keycompute_auth::ProduceAiKeyValidator::default());
+
+        let result = AuthExtractor::from_header_with_auth_for_path(
+            &headers,
+            &auth_service,
+            Some("/api/v1/me"),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::Auth(message)) if message.contains("only valid")));
     }
 
     #[test]

@@ -9,6 +9,9 @@
 
 use keycompute_types::{MessageContent, SensitiveString};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::Arc;
 
 /// 上游请求结构
 ///
@@ -18,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// - `endpoint`: Provider API 端点 URL，由调用方传入（如从 Account 表获取）
 /// - `upstream_api_key`: 上游 Provider API Key，由调用方传入（如从 Account 表获取）
 /// - 这些配置**不**从配置文件读取，支持运行时动态变更
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UpstreamRequest {
     /// 上游 API 端点（由调用方传入，如从 Account 表获取）
     pub endpoint: String,
@@ -36,6 +39,37 @@ pub struct UpstreamRequest {
     pub temperature: Option<f32>,
     /// Top P 参数（可选）
     pub top_p: Option<f32>,
+    /// 原生 Anthropic Messages 请求体。
+    ///
+    /// 仅用于已验证的 Anthropic 入站请求的保真转发；其它 Provider 必须忽略
+    /// 此字段，调用方也必须确保不会把它路由至非 Anthropic 账号。
+    /// 在 Anthropic 适配器创建最终的可变请求体前保持共享，避免每次网关交接
+    /// 都复制大型多模态 payload。
+    #[serde(skip)]
+    pub native_anthropic_request: Option<Arc<serde_json::Value>>,
+    /// 原生 Anthropic 请求允许透传的协议头（如 anthropic-beta）。
+    pub native_anthropic_headers: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for UpstreamRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpstreamRequest")
+            .field("endpoint", &self.endpoint)
+            .field("upstream_api_key", &self.upstream_api_key)
+            .field("model", &self.model)
+            .field("messages", &self.messages)
+            .field("stream", &self.stream)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field(
+                "native_anthropic_request",
+                &self.native_anthropic_request.as_ref().map(|_| "<redacted>"),
+            )
+            .field("native_anthropic_headers", &self.native_anthropic_headers)
+            .finish()
+    }
 }
 
 impl UpstreamRequest {
@@ -54,6 +88,8 @@ impl UpstreamRequest {
             max_tokens: None,
             temperature: None,
             top_p: None,
+            native_anthropic_request: None,
+            native_anthropic_headers: BTreeMap::new(),
         }
     }
 
@@ -172,5 +208,36 @@ mod tests {
         assert_eq!(sys.role, "system");
         assert_eq!(user.role, "user");
         assert_eq!(assistant.role, "assistant");
+    }
+
+    #[test]
+    fn upstream_request_clone_shares_native_anthropic_body() {
+        let mut request =
+            UpstreamRequest::new("https://provider.example/v1", "sk-test", "claude-test");
+        request.native_anthropic_request = Some(Arc::new(serde_json::json!({
+            "messages": [{"role": "user", "content": "large payload"}]
+        })));
+
+        let cloned = request.clone();
+        assert!(Arc::ptr_eq(
+            request.native_anthropic_request.as_ref().unwrap(),
+            cloned.native_anthropic_request.as_ref().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn upstream_request_debug_and_serde_redact_native_body() {
+        let mut request =
+            UpstreamRequest::new("https://provider.example/v1", "sk-test", "claude-test");
+        request.native_anthropic_request = Some(Arc::new(serde_json::json!({
+            "messages": [{"content": "secret-base64"}]
+        })));
+
+        let debug = format!("{request:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret-base64"));
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(!serialized.contains("secret-base64"));
     }
 }

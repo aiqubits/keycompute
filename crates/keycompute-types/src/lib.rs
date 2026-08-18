@@ -24,8 +24,8 @@ pub use node::{
 };
 pub use pricing::PricingSnapshot;
 pub use request::{
-    ChatCompletionRequest, ContentPart, ImageUrl, Message, MessageContent, MessageRole,
-    RequestContext,
+    ChatCompletionRequest, ContentPart, ExecutedProviderAccount, ImageUrl, Message, MessageContent,
+    MessageRole, RequestContext,
 };
 pub use response::{
     ChatCompletionChunk, ChatCompletionResponse, Choice, ErrorResponse, MessageDelta, ModelInfo,

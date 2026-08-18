@@ -92,12 +92,18 @@ impl BillingService {
         let (input_tokens, output_tokens) = ctx.usage_snapshot();
         let total_tokens = input_tokens + output_tokens;
 
-        // 计算用户应付金额
+        // 计算用户应付金额。应付金额始终基于请求开始时冻结的定价快照：定价按
+        // model + 计费维度（"node"/"provideraccount"）查找，与真实 provider 无关，
+        // 因此 provider_name/account_id 归属到 fallback 账号后金额依然一致。若未来
+        // 引入按真实 provider 定价，必须在归属（可能为 fallback 账号）时刷新快照。
         let user_amount = calculate_amount(input_tokens, output_tokens, &ctx.pricing_snapshot);
 
         // 确定用量来源
-        // 根据是否收到 Provider 的 Usage 事件来决定
-        let usage_source = if ctx.is_usage_finalized() {
+        // 只要任一计量侧被 Provider 精确值锁定即标记 ProviderReported：
+        // 例如 Anthropic 在 message_start 即上报精确输入（InputUsage），
+        // 或兼容网关上报 Usage{input:0, output:N}（输入被跳过保留估算）；
+        // 这两种半精确状态都不应被标注为纯网关估算。
+        let usage_source = if ctx.is_input_finalized() || ctx.is_output_finalized() {
             UsageSource::ProviderReported
         } else {
             UsageSource::GatewayAccumulated
@@ -806,7 +812,88 @@ fn bigdecimal_to_decimal(value: &bigdecimal::BigDecimal) -> Result<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keycompute_types::PricingSnapshot;
     use rust_decimal::Decimal;
+
+    #[tokio::test]
+    async fn finalize_records_attributed_provider_account() {
+        // 调用方传入的 provider/account（fallback 场景由 ctx.billing_target
+        // 提供实际完成账号）必须原样写入 usage log 的归属字段。
+        let service = BillingService::new();
+        let ctx = RequestContext::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "claude-test",
+            Vec::new(),
+            false,
+            PricingSnapshot::default(),
+        );
+        // 模拟 executor 已收到 Provider 精确 Usage 后触发结算。
+        ctx.set_input_tokens(10);
+        ctx.set_output_tokens(20);
+
+        let fallback_account_id = Uuid::new_v4();
+        let log = service
+            .finalize(&ctx, "anthropic", fallback_account_id, "success")
+            .await
+            .unwrap();
+
+        assert_eq!(log.provider_name, "anthropic");
+        assert_eq!(log.account_id, fallback_account_id);
+        assert_eq!(log.status, "success");
+        // 精确 usage 已覆盖，来源标记为 ProviderReported 而非估算。
+        assert_eq!(log.usage_source, UsageSource::ProviderReported.as_str());
+        assert_eq!(log.input_tokens, 10);
+        assert_eq!(log.output_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn finalize_usage_source_reflects_half_finalized_usage() {
+        // 来源标签必须反映“是否含 Provider 精确值”，而不是“两侧都精确”：
+        // - 纯估算（无任何 Provider usage 事件）→ GatewayAccumulated
+        // - 仅输入精确（Anthropic message_start 后断流，输出仍为估算）→ ProviderReported
+        // - 仅输出精确（Usage{input:0, output:N}，输入被跳过保留估算）→ ProviderReported
+        let service = BillingService::new();
+        let new_ctx = || {
+            RequestContext::new(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "claude-test",
+                Vec::new(),
+                false,
+                PricingSnapshot::default(),
+            )
+        };
+
+        let estimate_only = new_ctx();
+        estimate_only.set_input_tokens_estimate(5);
+        estimate_only.add_output_tokens(3);
+        let log = service
+            .finalize(&estimate_only, "anthropic", Uuid::new_v4(), "success")
+            .await
+            .unwrap();
+        assert_eq!(log.usage_source, UsageSource::GatewayAccumulated.as_str());
+
+        let input_only = new_ctx();
+        input_only.set_input_tokens(10);
+        input_only.add_output_tokens(3);
+        let log = service
+            .finalize(&input_only, "anthropic", Uuid::new_v4(), "success")
+            .await
+            .unwrap();
+        assert_eq!(log.usage_source, UsageSource::ProviderReported.as_str());
+
+        let output_only = new_ctx();
+        output_only.add_output_tokens(7);
+        output_only.set_output_tokens(20);
+        let log = service
+            .finalize(&output_only, "anthropic", Uuid::new_v4(), "success")
+            .await
+            .unwrap();
+        assert_eq!(log.usage_source, UsageSource::ProviderReported.as_str());
+    }
 
     #[test]
     fn test_new_usage_log_builder() {

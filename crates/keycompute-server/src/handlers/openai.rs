@@ -695,15 +695,14 @@ async fn create_openai_response(
                     error = %message,
                     "Stream error during non-streaming response"
                 );
-                let _ = billing
-                    .finalize_and_trigger_distribution(
-                        &ctx,
-                        &provider_name,
-                        account_id,
-                        &collector.status,
-                        ctx.user_id,
-                    )
-                    .await;
+                finalize_openai_billing(
+                    &billing,
+                    &ctx,
+                    &provider_name,
+                    account_id,
+                    &collector.status,
+                )
+                .await;
                 return Err(ApiError::Internal(message));
             }
         }
@@ -714,30 +713,28 @@ async fn create_openai_response(
 
     // 流意外结束：先执行计费，再返回错误而非空 content 的 200 响应
     if collector.status == "incomplete" {
-        let _ = billing
-            .finalize_and_trigger_distribution(
-                &ctx,
-                &provider_name,
-                account_id,
-                &collector.status,
-                ctx.user_id,
-            )
-            .await;
+        finalize_openai_billing(
+            &billing,
+            &ctx,
+            &provider_name,
+            account_id,
+            &collector.status,
+        )
+        .await;
         return Err(ApiError::Internal(
             "Stream ended unexpectedly: channel closed without Done/Error event".to_string(),
         ));
     }
 
     // 执行 billing
-    let _ = billing
-        .finalize_and_trigger_distribution(
-            &ctx,
-            &provider_name,
-            account_id,
-            &collector.status,
-            ctx.user_id,
-        )
-        .await;
+    finalize_openai_billing(
+        &billing,
+        &ctx,
+        &provider_name,
+        account_id,
+        &collector.status,
+    )
+    .await;
 
     // 获取用量信息
     let (prompt_tokens, completion_tokens) = ctx.usage_snapshot();
@@ -863,6 +860,7 @@ impl StreamCollector {
                 Err(message)
             }
             llm_protocol_provider::StreamEvent::Usage { .. }
+            | llm_protocol_provider::StreamEvent::InputUsage { .. }
             | llm_protocol_provider::StreamEvent::Raw { .. } => Ok(true),
         }
     }
@@ -876,6 +874,28 @@ impl StreamCollector {
             );
             self.status = "incomplete".to_string();
         }
+    }
+}
+
+/// Finalize an OpenAI-compatible request without attributing a successful
+/// fallback to the primary provider account.
+async fn finalize_openai_billing(
+    billing: &keycompute_billing::BillingService,
+    ctx: &RequestContext,
+    primary_provider: &str,
+    primary_account_id: uuid::Uuid,
+    status: &str,
+) {
+    let (provider, account_id) = ctx.billing_target(primary_provider, primary_account_id);
+    if let Err(error) = billing
+        .finalize_and_trigger_distribution(ctx, &provider, account_id, status, ctx.user_id)
+        .await
+    {
+        tracing::error!(
+            request_id = %ctx.request_id,
+            error = %error,
+            "Failed to finalize OpenAI billing"
+        );
     }
 }
 
@@ -944,20 +964,19 @@ fn create_non_streaming_json_with_keepalive(
                         request_id = %ctx.request_id,
                         "Non-streaming keepalive: max duration (120s) exceeded, terminating"
                     );
-                    let _ = billing
-                        .finalize_and_trigger_distribution(
-                            &ctx, &provider_name, account_id, &collector.status, ctx.user_id,
-                        )
-                        .await;
-                    let error_json = serde_json::json!({
-                        "error": {
-                            "message": "Request timed out",
-                            "type": "server_error",
-                            "param": null,
-                            "code": "timeout"
-                        }
-                    });
-                    yield Ok(bytes::Bytes::from(error_json.to_string()));
+                    finalize_openai_billing(
+                        &billing,
+                        &ctx,
+                        &provider_name,
+                        account_id,
+                        &collector.status,
+                    )
+                    .await;
+                    yield Ok(bytes::Bytes::from(openai_error_chunk(
+                        "Request timed out",
+                        "server_error",
+                        Some("timeout"),
+                    )));
                     return;
                 }
                 _ = tokio::time::sleep(Duration::from_secs(10)) => {
@@ -978,21 +997,21 @@ fn create_non_streaming_json_with_keepalive(
                                     error = %message,
                                     "Stream error during non-streaming keepalive response"
                                 );
-                                let _ = billing
-                                    .finalize_and_trigger_distribution(
-                                        &ctx, &provider_name, account_id, &collector.status, ctx.user_id,
-                                    )
-                                    .await;
-                                // 错误格式与 OpenAI API 对齐，包含 param 字段
-                                let error_json = serde_json::json!({
-                                    "error": {
-                                        "message": message,
-                                        "type": "api_error",
-                                        "param": null,
-                                        "code": "internal_error"
-                                    }
-                                });
-                                yield Ok(bytes::Bytes::from(error_json.to_string()));
+                                finalize_openai_billing(
+                                    &billing,
+                                    &ctx,
+                                    &provider_name,
+                                    account_id,
+                                    &collector.status,
+                                )
+                                .await;
+                                // 错误格式与 OpenAI API 对齐，包含 param 字段。
+                                // 消息已脱敏：上游原始错误只记录日志，不暴露给客户端。
+                                yield Ok(bytes::Bytes::from(openai_error_chunk(
+                                    "Upstream request failed",
+                                    "api_error",
+                                    Some("internal_error"),
+                                )));
                                 return;
                             }
                         },
@@ -1010,29 +1029,31 @@ fn create_non_streaming_json_with_keepalive(
 
         // 流意外结束：先执行计费，再返回 error JSON 而非空 content 的 200 响应
         if collector.status == "incomplete" {
-            let _ = billing
-                .finalize_and_trigger_distribution(
-                    &ctx, &provider_name, account_id, &collector.status, ctx.user_id,
-                )
-                .await;
-            let error_json = serde_json::json!({
-                "error": {
-                    "message": "Stream ended unexpectedly",
-                    "type": "server_error",
-                    "param": null,
-                    "code": "incomplete"
-                }
-            });
-            yield Ok(bytes::Bytes::from(error_json.to_string()));
+            finalize_openai_billing(
+                &billing,
+                &ctx,
+                &provider_name,
+                account_id,
+                &collector.status,
+            )
+            .await;
+            yield Ok(bytes::Bytes::from(openai_error_chunk(
+                "Stream ended unexpectedly",
+                "server_error",
+                Some("incomplete"),
+            )));
             return;
         }
 
         // 执行计费
-        let _ = billing
-            .finalize_and_trigger_distribution(
-                &ctx, &provider_name, account_id, &collector.status, ctx.user_id,
-            )
-            .await;
+        finalize_openai_billing(
+            &billing,
+            &ctx,
+            &provider_name,
+            account_id,
+            &collector.status,
+        )
+        .await;
 
         // 获取用量信息
         let (prompt_tokens, completion_tokens) = ctx.usage_snapshot();
@@ -1183,16 +1204,28 @@ fn make_usage_chunk_data(
             error = %e,
             "Failed to serialize usage chunk"
         );
-        serde_json::json!({
-            "error": {
-                "message": "Internal error: failed to serialize usage chunk",
-                "type": "server_error",
-                "param": null,
-                "code": null
-            }
-        })
-        .to_string()
+        openai_error_chunk(
+            "Internal error: failed to serialize usage chunk",
+            "server_error",
+            None,
+        )
     })
+}
+
+/// OpenAI 错误帧 JSON：对客户端只暴露通用文本，不泄露上游细节。
+///
+/// SSE 与 chunked 非流式路径共用同一错误形状；`code` 为 `None` 时输出
+/// `null`（OpenAI API 对部分错误不提供机器码）。
+fn openai_error_chunk(message: &str, error_type: &str, code: Option<&str>) -> String {
+    serde_json::json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": null,
+            "code": code
+        }
+    })
+    .to_string()
 }
 
 /// 创建 OpenAI 格式的 SSE 流
@@ -1221,35 +1254,21 @@ fn create_openai_stream(
                     );
                     yield Ok(Event::default().data(data));
 
-                    // 如果有 finish_reason，这是最后一块，发送 [DONE] 并结束
-                    if finish_reason.is_some() {
-                        completed = true;
-                        // 执行 billing
-                        let _ = billing.finalize_and_trigger_distribution(
-                            &ctx, &provider_name, account_id, &status, ctx.user_id
-                        ).await;
-
-                        // 如果需要包含用量信息
-                        if stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false) {
-                            let (input_tokens, output_tokens) = ctx.usage_snapshot();
-                            let data = make_usage_chunk_data(
-                                input_tokens, output_tokens,
-                                &completion_id, created, &model, &provider_name,
-                            );
-                            yield Ok(Event::default().data(data));
-                        }
-
-                        // 发送 [DONE] 标记
-                        yield Ok(Event::default().data("[DONE]"));
-                        break;
-                    }
+                    // `finish_reason` 不是传输层终止信号。特别是 Anthropic 会在
+                    // `message_delta` 后继续发送精确 Usage 和 `message_stop`；若
+                    // 在这里退出，会丢失用量并让执行器向已关闭的 receiver 写入。
                 }
                 llm_protocol_provider::StreamEvent::Done => {
                     // 流正常结束
                     completed = true;
-                    let _ = billing.finalize_and_trigger_distribution(
-                        &ctx, &provider_name, account_id, &status, ctx.user_id
-                    ).await;
+                    finalize_openai_billing(
+                        &billing,
+                        &ctx,
+                        &provider_name,
+                        account_id,
+                        &status,
+                    )
+                    .await;
 
                     // 如果需要包含用量信息
                     if stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false) {
@@ -1267,22 +1286,33 @@ fn create_openai_stream(
                 llm_protocol_provider::StreamEvent::Error { message } => {
                     completed = true;
                     status = "error".to_string();
-                    let _ = billing.finalize_and_trigger_distribution(
-                        &ctx, &provider_name, account_id, &status, ctx.user_id
-                    ).await;
-
-                    let error_chunk = serde_json::json!({
-                        "error": {
-                            "message": message,
-                            "type": "api_error",
-                            "param": null,
-                            "code": "internal_error"
-                        }
-                    });
-                    yield Ok(Event::default().data(error_chunk.to_string()));
+                    finalize_openai_billing(
+                        &billing,
+                        &ctx,
+                        &provider_name,
+                        account_id,
+                        &status,
+                    )
+                    .await;
+                    // 不向客户端暴露上游错误细节：原始消息只记录日志，SSE
+                    // 错误体与 Anthropic 路径保持一致的通用文本。
+                    tracing::warn!(
+                        request_id = %ctx.request_id,
+                        error = %message,
+                        "OpenAI upstream stream failed"
+                    );
+                    yield Ok(Event::default().data(openai_error_chunk(
+                        "Upstream request failed",
+                        "api_error",
+                        Some("internal_error"),
+                    )));
+                    // 与 keepalive 变体一致，错误帧后仍以 [DONE] 终止，客户端
+                    // 不会把截断的流误认为“连接被重置”。
+                    yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
                 llm_protocol_provider::StreamEvent::Usage { .. }
+                | llm_protocol_provider::StreamEvent::InputUsage { .. }
                 | llm_protocol_provider::StreamEvent::Raw { .. } => {
                     // Usage 由 executor 层通过 ctx.set_*_tokens() 消费，
                     // Raw 为 provider 原始事件不需要透传
@@ -1294,12 +1324,25 @@ fn create_openai_stream(
         if !completed {
             tracing::warn!(
                 request_id = %ctx.request_id,
-                "Stream ended without Done/Error/finish_reason event"
+                "Stream ended without Done or Error event"
             );
             status = "incomplete".to_string();
-            let _ = billing.finalize_and_trigger_distribution(
-                &ctx, &provider_name, account_id, &status, ctx.user_id
-            ).await;
+            finalize_openai_billing(
+                &billing,
+                &ctx,
+                &provider_name,
+                account_id,
+                &status,
+            )
+            .await;
+            // 不能静默截断：客户端会把截断的流误认为完整响应。与 Error 分支
+            // 一致，输出显式错误帧后以 [DONE] 结束。
+            yield Ok(Event::default().data(openai_error_chunk(
+                "Stream ended unexpectedly",
+                "api_error",
+                Some("internal_error"),
+            )));
+            yield Ok(Event::default().data("[DONE]"));
         }
     }
 }
@@ -1348,18 +1391,19 @@ fn create_openai_stream_with_keepalive(
                         request_id = %ctx.request_id,
                         "SSE stream keepalive: max duration (120s) exceeded, terminating"
                     );
-                    let _ = billing.finalize_and_trigger_distribution(
-                        &ctx, &provider_name, account_id, &status, ctx.user_id
-                    ).await;
-                    let error_json = serde_json::json!({
-                        "error": {
-                            "message": "Request timed out",
-                            "type": "server_error",
-                            "param": null,
-                            "code": "timeout"
-                        }
-                    });
-                    yield Ok(Event::default().data(error_json.to_string()));
+                    finalize_openai_billing(
+                        &billing,
+                        &ctx,
+                        &provider_name,
+                        account_id,
+                        &status,
+                    )
+                    .await;
+                    yield Ok(Event::default().data(openai_error_chunk(
+                        "Request timed out",
+                        "server_error",
+                        Some("timeout"),
+                    )));
                     yield Ok(Event::default().data("[DONE]"));
                     return;
                 }
@@ -1378,28 +1422,18 @@ fn create_openai_stream_with_keepalive(
                                 );
                                 yield Ok(Event::default().data(data));
 
-                                if finish_reason.is_some() {
-                                    let _ = billing.finalize_and_trigger_distribution(
-                                        &ctx, &provider_name, account_id, &status, ctx.user_id
-                                    ).await;
-
-                                    if stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false) {
-                                        let (input_tokens, output_tokens) = ctx.usage_snapshot();
-                                        let data = make_usage_chunk_data(
-                                            input_tokens, output_tokens,
-                                            &completion_id, created, &model, &provider_name,
-                                        );
-                                        yield Ok(Event::default().data(data));
-                                    }
-
-                                    yield Ok(Event::default().data("[DONE]"));
-                                    return;
-                                }
+                                // 与普通流式路径一致，等待显式 Done。finish_reason
+                                // 后上游仍可能发送 Usage 与终止事件。
                             }
                             llm_protocol_provider::StreamEvent::Done => {
-                                let _ = billing.finalize_and_trigger_distribution(
-                                    &ctx, &provider_name, account_id, &status, ctx.user_id
-                                ).await;
+                                finalize_openai_billing(
+                                    &billing,
+                                    &ctx,
+                                    &provider_name,
+                                    account_id,
+                                    &status,
+                                )
+                                .await;
 
                                 if stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false) {
                                     let (input_tokens, output_tokens) = ctx.usage_snapshot();
@@ -1415,23 +1449,30 @@ fn create_openai_stream_with_keepalive(
                             }
                             llm_protocol_provider::StreamEvent::Error { message } => {
                                 status = "error".to_string();
-                                let _ = billing.finalize_and_trigger_distribution(
-                                    &ctx, &provider_name, account_id, &status, ctx.user_id
-                                ).await;
-
-                                let error_chunk = serde_json::json!({
-                                    "error": {
-                                        "message": message,
-                                        "type": "api_error",
-                                        "param": null,
-                                        "code": "internal_error"
-                                    }
-                                });
-                                yield Ok(Event::default().data(error_chunk.to_string()));
+                                finalize_openai_billing(
+                                    &billing,
+                                    &ctx,
+                                    &provider_name,
+                                    account_id,
+                                    &status,
+                                )
+                                .await;
+                                // 不向客户端暴露上游错误细节：原始消息只记录日志。
+                                tracing::warn!(
+                                    request_id = %ctx.request_id,
+                                    error = %message,
+                                    "OpenAI upstream stream failed"
+                                );
+                                yield Ok(Event::default().data(openai_error_chunk(
+                                    "Upstream request failed",
+                                    "api_error",
+                                    Some("internal_error"),
+                                )));
                                 yield Ok(Event::default().data("[DONE]"));
                                 return;
                             }
                             llm_protocol_provider::StreamEvent::Usage { .. }
+                            | llm_protocol_provider::StreamEvent::InputUsage { .. }
                             | llm_protocol_provider::StreamEvent::Raw { .. } => {
                                 // Usage 由 executor 层通过 ctx.set_*_tokens() 消费，
                                 // Raw 为 provider 原始事件不需要透传
@@ -1444,16 +1485,28 @@ fn create_openai_stream_with_keepalive(
         }
 
         // 流意外结束（channel 关闭但没有收到完成事件）
-        // 所有正常完成路径（finish_reason / Done / Error / deadline）均使用 return 退出，
+        // 所有正常完成路径（Done / Error / deadline）均使用 return 退出，
         // 只有 channel 关闭（None）通过 break 到达此处
         tracing::warn!(
             request_id = %ctx.request_id,
-            "SSE stream keepalive: ended without Done/Error/finish_reason event"
+            "SSE stream keepalive: ended without Done or Error event"
         );
         status = "incomplete".to_string();
-        let _ = billing.finalize_and_trigger_distribution(
-            &ctx, &provider_name, account_id, &status, ctx.user_id
-        ).await;
+        finalize_openai_billing(
+            &billing,
+            &ctx,
+            &provider_name,
+            account_id,
+            &status,
+        )
+        .await;
+        // 不能静默截断：与 Error 分支一致，输出显式错误帧与 [DONE] 后结束。
+        yield Ok(Event::default().data(openai_error_chunk(
+            "Stream ended unexpectedly",
+            "api_error",
+            Some("internal_error"),
+        )));
+        yield Ok(Event::default().data("[DONE]"));
     }
 }
 
@@ -1674,6 +1727,8 @@ fn simulate_node_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+    use std::time::Duration;
 
     #[test]
     fn test_chat_completion_request_deserialize() {
@@ -1700,6 +1755,252 @@ mod tests {
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert!(req.stream);
         assert!(req.stream_options.unwrap().include_usage);
+    }
+
+    #[tokio::test]
+    async fn openai_stream_waits_for_done_after_finish_reason() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "claude-test",
+            Vec::new(),
+            true,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let mut stream = Box::pin(create_openai_stream(
+            rx,
+            Arc::clone(&ctx),
+            "claude-test".to_string(),
+            "anthropic".to_string(),
+            uuid::Uuid::new_v4(),
+            Arc::new(keycompute_billing::BillingService::new()),
+            None,
+        ));
+
+        tx.send(llm_protocol_provider::StreamEvent::Delta {
+            content: String::new(),
+            finish_reason: Some("stop".to_string()),
+        })
+        .await
+        .unwrap();
+        assert!(
+            stream
+                .next()
+                .await
+                .expect("finish_reason delta should be forwarded")
+                .is_ok()
+        );
+
+        // 若 handler 在 finish_reason 后提前终止，后续 delta 会丢失。executor 在
+        // Done 之前仍可能发送 Usage 与更多 delta，流必须保持打开；用“第二帧仍被
+        // 转发”做确定性断言，替代固定时长的负向等待（原 25ms 断言易 flaky）。
+        tx.send(llm_protocol_provider::StreamEvent::Delta {
+            content: "tail".to_string(),
+            finish_reason: None,
+        })
+        .await
+        .unwrap();
+        assert!(
+            stream
+                .next()
+                .await
+                .expect("stream must stay open and forward the post-finish_reason delta")
+                .is_ok()
+        );
+
+        ctx.set_input_tokens(7);
+        ctx.set_output_tokens(3);
+        tx.send(llm_protocol_provider::StreamEvent::Usage {
+            input_tokens: 7,
+            output_tokens: 3,
+        })
+        .await
+        .unwrap();
+        tx.send(llm_protocol_provider::StreamEvent::Done)
+            .await
+            .unwrap();
+        drop(tx);
+
+        // Usage 不产生 SSE 帧（由 executor 经 ctx 消费）；Done 后输出 [DONE] 并关闭
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_stream_incomplete_path_emits_error_frame() {
+        // channel 在 Done 之前关闭（上游中断/传输层截断）时，流必须以显式错误
+        // 帧结束，不能静默截断：否则客户端会把截断的流误认为完整响应。
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "claude-test",
+            Vec::new(),
+            true,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let stream = Box::pin(create_openai_stream(
+            rx,
+            ctx,
+            "claude-test".to_string(),
+            "anthropic".to_string(),
+            uuid::Uuid::new_v4(),
+            Arc::new(keycompute_billing::BillingService::new()),
+            None,
+        ));
+        drop(tx);
+
+        let response = Sse::new(stream).into_response();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("Stream ended unexpectedly"),
+            "incomplete stream must surface a generic error, got: {body}"
+        );
+        // 与 keepalive 变体一致，错误帧后必须以 [DONE] 终止。
+        assert!(body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn openai_stream_keepalive_incomplete_path_emits_error_frame() {
+        // keepalive 变体同样不得静默截断：channel 在 Done 之前关闭时必须输出
+        // 显式错误帧与 [DONE] 终止符。
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "claude-test",
+            Vec::new(),
+            true,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let stream = Box::pin(create_openai_stream_with_keepalive(
+            rx,
+            ctx,
+            "claude-test".to_string(),
+            "anthropic".to_string(),
+            uuid::Uuid::new_v4(),
+            Arc::new(keycompute_billing::BillingService::new()),
+            None,
+        ));
+        drop(tx);
+
+        let response = Sse::new(stream).into_response();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("Stream ended unexpectedly"),
+            "incomplete keepalive stream must surface a generic error, got: {body}"
+        );
+        assert!(body.contains("[DONE]"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn openai_stream_keepalive_timeout_emits_error_frame_and_done() {
+        // 120s 无事件（首 token 延迟/上游静默）：keepalive 变体的 deadline 分支
+        // 必须以显式错误帧 + [DONE] 终止，不能静默截断；同时结算状态置为
+        // "timeout"（finalize 先于输出执行）。虚拟时间推进避免真实等待 120s。
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "claude-test",
+            Vec::new(),
+            true,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let stream = Box::pin(create_openai_stream_with_keepalive(
+            rx,
+            Arc::clone(&ctx),
+            "claude-test".to_string(),
+            "anthropic".to_string(),
+            uuid::Uuid::new_v4(),
+            Arc::new(keycompute_billing::BillingService::new()),
+            None,
+        ));
+        // channel 保持打开且无事件：rx.recv() 挂起，只有 deadline 能触发终止
+        let _keep_tx_alive = tx;
+
+        let app_handle = tokio::spawn(async move {
+            let response = Sse::new(stream).into_response();
+            axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+        });
+
+        // 轮询推进虚拟时间：deadline（120s）触发后输出错误帧与 [DONE] 并结束
+        for _ in 0..1300 {
+            if app_handle.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+
+        let body = tokio::time::timeout(Duration::from_secs(1), app_handle)
+            .await
+            .expect("keepalive stream must terminate after the timeout branch")
+            .expect("body collection should succeed");
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("Request timed out"),
+            "timeout branch must surface the explicit timeout error, got: {body}"
+        );
+        assert!(body.contains("[DONE]"), "timeout must end with [DONE]");
+        assert!(
+            !body.contains("data: {\"choices\""),
+            "no content chunks may be emitted before the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_stream_error_redacts_upstream_message() {
+        // 流式错误事件中的上游消息绝不能原样进入 SSE：客户端只能看到
+        // 通用错误文本，原始消息保留在服务端日志（与 Anthropic 路径一致）。
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "claude-test",
+            Vec::new(),
+            true,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let stream = Box::pin(create_openai_stream(
+            rx,
+            Arc::clone(&ctx),
+            "claude-test".to_string(),
+            "anthropic".to_string(),
+            uuid::Uuid::new_v4(),
+            Arc::new(keycompute_billing::BillingService::new()),
+            None,
+        ));
+
+        tx.send(llm_protocol_provider::StreamEvent::error(
+            "upstream-secret-detail",
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let response = Sse::new(stream).into_response();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Upstream request failed"));
+        assert!(!body.contains("upstream-secret-detail"));
+        // 错误帧后以 [DONE] 终止，与 keepalive 变体一致。
+        assert!(body.contains("[DONE]"));
     }
 
     fn minimal_request(extra: &str) -> ChatCompletionRequest {

@@ -98,6 +98,7 @@ use crate::{
         list_tenants,
         login_handler,
         make_pricing_default,
+        messages,
         // 节点网关
         node_complete,
         node_heartbeat,
@@ -128,18 +129,25 @@ use crate::{
         wechatpay_notify,
     },
     middleware::{
-        admin_auth_middleware, cors_layer, maintenance_mode_middleware,
-        payment_notify_rate_limit_middleware, public_auth_rate_limit_middleware,
-        rate_limit_middleware, request_logger, trace_id_middleware,
+        admin_auth_middleware, anthropic_error_response_middleware, cors_layer,
+        maintenance_mode_middleware, payment_notify_rate_limit_middleware,
+        public_auth_rate_limit_middleware, rate_limit_middleware, request_logger,
+        trace_id_middleware,
     },
     state::AppState,
 };
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     middleware::from_fn_with_state,
     routing::{delete, get, post, put},
 };
 use tower_http::trace::TraceLayer;
+
+/// Anthropic permits inline multimodal blocks, so its compatibility endpoint
+/// needs a higher limit than Axum's 2 MiB default. Keep the limit explicit and
+/// bounded to avoid accepting arbitrarily large JSON payloads.
+const ANTHROPIC_MESSAGES_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 /// 创建路由器
 pub fn create_router(state: AppState) -> Router {
@@ -182,6 +190,11 @@ pub fn create_router(state: AppState) -> Router {
         // Models
         .route("/v1/models", get(list_models))
         .route("/v1/models/{model}", get(retrieve_model))
+        .layer(from_fn_with_state(state.clone(), rate_limit_middleware));
+
+    let anthropic_routes = Router::new()
+        .route("/v1/messages", post(messages))
+        .layer(DefaultBodyLimit::max(ANTHROPIC_MESSAGES_BODY_LIMIT_BYTES))
         .layer(from_fn_with_state(state.clone(), rate_limit_middleware));
 
     // ==================== 4. 用户自服务 API（需要认证 + 限流） ====================
@@ -456,6 +469,7 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .merge(auth_routes)
         .merge(openai_routes)
+        .merge(anthropic_routes)
         .merge(user_routes)
         .merge(admin_routes)
         .merge(billing_routes)
@@ -466,10 +480,16 @@ pub fn create_router(state: AppState) -> Router {
         .merge(health_routes)
         .merge(node_routes)
         .merge(public_settings_routes) // 公开设置路由
-        // 维护模式中间件（最外层，在其他中间件之前）
+        // 维护模式中间件（位于 anthropic 错误转换之内、业务层之前；
+        // 其 503 拒绝会被更外层的 anthropic_error_response_middleware 转换）
         .layer(from_fn_with_state(
             state.clone(),
             maintenance_mode_middleware,
+        ))
+        // 仅 `/v1/messages` 的非 2xx 响应会被转换，其他 API 保持既有错误格式。
+        // 放在维护模式之外，以覆盖全局维护拒绝。
+        .layer(axum::middleware::from_fn(
+            anthropic_error_response_middleware,
         ))
         .layer(axum::middleware::from_fn(request_logger))
         .layer(axum::middleware::from_fn(trace_id_middleware))
@@ -481,6 +501,15 @@ pub fn create_router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        Json,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        middleware::from_fn,
+        routing::post,
+    };
+    use serde_json::Value;
+    use tower::ServiceExt;
 
     #[test]
     fn test_create_router() {
@@ -488,5 +517,89 @@ mod tests {
         let router = create_router(state);
         // 确保可以创建路由器
         let _ = router;
+    }
+
+    #[tokio::test]
+    async fn anthropic_body_limit_allows_payloads_larger_than_axum_default() {
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(|_: Json<Value>| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(DefaultBodyLimit::max(ANTHROPIC_MESSAGES_BODY_LIMIT_BYTES));
+        let payload = format!(r#"{{"content":"{}"}}"#, "x".repeat(2 * 1024 * 1024));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn anthropic_body_limit_returns_anthropic_request_too_large_error() {
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(|_: Json<Value>| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(DefaultBodyLimit::max(ANTHROPIC_MESSAGES_BODY_LIMIT_BYTES))
+            .layer(from_fn(anthropic_error_response_middleware));
+        let payload = format!(
+            r#"{{"content":"{}"}}"#,
+            "x".repeat(ANTHROPIC_MESSAGES_BODY_LIMIT_BYTES)
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "request_too_large");
+    }
+
+    #[tokio::test]
+    async fn messages_route_wraps_x_api_key_authentication_errors() {
+        let app = create_router(AppState::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01")
+                    .header("x-api-key", "sk-unconfigured-test-key")
+                    .body(Body::from(
+                        r#"{"model":"claude-test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "authentication_error");
     }
 }

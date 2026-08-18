@@ -67,6 +67,28 @@ impl UsageAccumulator {
         self.input_finalized.store(true, Ordering::Relaxed);
     }
 
+    /// 设置输入 token 的估算值（流开始时）。
+    ///
+    /// 与 `set_input` 的区别：不标记 `input_finalized`，因为这是 tiktoken
+    /// 估算而非 Provider 精确值；收到 `InputUsage`/`Usage` 时仍可用
+    /// `set_input` 覆盖并锁定，`is_input_finalized` 因此保持“是否精确”语义。
+    /// 同时清除既有的 finalized 标志：fallback 的新尝试不应继承上一次
+    /// 尝试已锁定的精确值状态。
+    pub fn set_input_estimate(&self, tokens: u32) {
+        self.input_tokens.store(tokens, Ordering::Relaxed);
+        self.input_finalized.store(false, Ordering::Relaxed);
+    }
+
+    /// 设置输出 token 的估算值（流开始时）。
+    ///
+    /// 与 `set_output` 的区别：不标记 `output_finalized`。用于 fallback
+    /// 场景：新的一次上游尝试不应继承上一次失败尝试的精确 output 值，
+    /// 否则 fallback 若无最终 Usage 事件，计费会错误沿用残留值。
+    pub fn set_output_estimate(&self, tokens: u32) {
+        self.output_tokens.store(tokens, Ordering::Relaxed);
+        self.output_finalized.store(false, Ordering::Relaxed);
+    }
+
     /// 获取当前用量快照
     pub fn snapshot(&self) -> (u32, u32) {
         (
@@ -200,6 +222,42 @@ mod tests {
         // 后续的 add_input 会被忽略
         acc.add_input(999);
         assert_eq!(acc.snapshot().0, 100); // 仍然是 100
+    }
+
+    #[test]
+    fn test_input_estimate_does_not_finalize() {
+        // 估算值可被后续精确值覆盖，且不应把 input 标记为 finalized。
+        let acc = UsageAccumulator::new();
+        acc.set_input_estimate(50);
+        assert_eq!(acc.snapshot().0, 50);
+        assert!(!acc.is_input_finalized());
+
+        // 估算后仍可继续累加（估算尚未被“锁定”）。
+        acc.add_input(10);
+        assert_eq!(acc.snapshot().0, 60);
+
+        // 精确值到达后锁定，后续累加被忽略。
+        acc.set_input(100);
+        assert!(acc.is_input_finalized());
+        acc.add_input(999);
+        assert_eq!(acc.snapshot().0, 100);
+    }
+
+    #[test]
+    fn test_output_estimate_resets_without_finalizing() {
+        // fallback 场景：新的上游尝试必须清除上一次尝试的精确 output 值，
+        // 且不把 output 标记为 finalized（后续仍可累积估算）。
+        let acc = UsageAccumulator::new();
+        acc.set_output(222);
+        assert!(acc.is_output_finalized());
+
+        acc.set_output_estimate(0);
+        assert_eq!(acc.snapshot().1, 0);
+        assert!(!acc.is_output_finalized());
+
+        // 重置后可继续累积估算。
+        acc.add_output(15);
+        assert_eq!(acc.snapshot().1, 15);
     }
 
     #[test]

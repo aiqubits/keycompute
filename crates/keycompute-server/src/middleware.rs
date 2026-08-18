@@ -8,15 +8,19 @@ use crate::{
     state::AppState,
 };
 use axum::{
+    body::{Body, to_bytes},
     extract::{Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header::SET_COOKIE},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE, SET_COOKIE},
+    },
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use keycompute_auth::Permission;
 use keycompute_ratelimit::{RateLimitConfig, RateLimitKey};
 use sha2::{Digest, Sha256};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -31,6 +35,117 @@ pub type PermissionMiddlewareFn =
         Request,
         Next,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response>> + Send>>;
+
+/// 纯文本 400/415 错误体首行回显给客户端的最大长度。
+///
+/// axum `Json` 提取器的反序列化提示是字段级排障信息（不含服务端内部细节），
+/// 但异常长的纯文本体不应被完整回显；超长部分截断即可。
+const MAX_PLAINTEXT_ERROR_CHARS: usize = 256;
+
+/// 错误响应体读取超时。
+///
+/// 非 2xx 响应在本服务中都是即时的小 body，但防御性加上限时：若未来某个
+/// 中间件返回流式（chunked）错误体，`to_bytes` 会挂起直到流结束；超时后
+/// 回退通用文本，保证 /v1/messages 的错误路径不会因此挂起请求。
+const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 将 `/v1/messages` 的 HTTP 失败响应转换为 Anthropic Errors schema。
+///
+/// 流建立后的错误由 handler 以 SSE `error` 事件输出；这里处理鉴权、JSON
+/// 反序列化、限流和 handler 返回的非 2xx，使 SDK 在所有 HTTP 错误路径都能
+/// 使用同一结构解析。
+pub async fn anthropic_error_response_middleware(req: Request, next: Next) -> Response {
+    let is_anthropic_messages = req.uri().path() == "/v1/messages";
+    let response = next.run(req).await;
+    // 成功与重定向原样透传：3xx 携带 Location 等跳转语义，改写成错误 JSON
+    // 会破坏重定向流程。
+    if !is_anthropic_messages
+        || response.status().is_success()
+        || response.status().is_redirection()
+    {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let body = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, to_bytes(body, 64 * 1024)).await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) | Err(_) => bytes::Bytes::new(),
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+
+    // 避免重复封装已经符合 Anthropic schema 的响应。
+    if parsed.get("type").and_then(serde_json::Value::as_str) == Some("error")
+        && parsed
+            .get("error")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return Response::from_parts(parts, Body::from(body));
+    }
+
+    let message = parsed
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            parsed
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        // axum 的 `Json` 提取器失败时返回纯文本 400/415（如缺失 `max_tokens`、
+        // 字段类型错误）。这类提示只反映客户端请求自身的问题，不涉及服务端
+        // 内部细节，提取首行可安全返回，便于 SDK 客户端排障；其它非 JSON
+        // 错误体（如代理错误页）保持通用文本。首行同时被截断，防止异常长的
+        // 纯文本体被完整回显到响应。
+        .or_else(|| {
+            if !matches!(parts.status.as_u16(), 400 | 415) {
+                return None;
+            }
+            std::str::from_utf8(&body)
+                .ok()?
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| {
+                    line.chars()
+                        .take(MAX_PLAINTEXT_ERROR_CHARS)
+                        .collect::<String>()
+                })
+        })
+        .unwrap_or_else(|| "Request failed".to_string());
+    let error_type = anthropic_error_type(parts.status);
+
+    parts.headers.remove(CONTENT_LENGTH);
+    parts
+        .headers
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {"type": error_type, "message": message}
+    })
+    .to_string();
+    Response::from_parts(parts, Body::from(body))
+}
+
+/// 将本服务的 HTTP 状态映射至 Anthropic 的公开错误类别。保留原始 HTTP
+/// 状态码，只统一 SDK 读取的 `error.type`。
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 | 405 | 415 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        // Anthropic 的标准过载状态是 529；本服务既有的 503 也表示暂时
+        // 无可用容量，向客户端暴露相同可重试类别更准确。
+        503 | 529 => "overloaded_error",
+        _ => "api_error",
+    }
+}
 
 /// 请求日志中间件
 pub async fn request_logger(req: Request, next: Next) -> Response {
@@ -143,16 +258,22 @@ pub async fn rate_limit_middleware(
 ) -> Response {
     // 从请求头中提取认证信息
     let headers = req.headers();
-    let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
-
-    // 如果没有认证头，直接放行（由认证中间件处理）
-    let Some(auth_header) = auth_header else {
-        return next.run(req).await;
-    };
-
-    // 解析 Bearer token
-    let Some(token) = auth_header.strip_prefix("Bearer ") else {
-        return next.run(req).await;
+    let token = match headers.get("Authorization").and_then(|h| h.to_str().ok()) {
+        Some(auth_header) => match auth_header.strip_prefix("Bearer ") {
+            Some(token) => token,
+            None => return next.run(req).await,
+        },
+        None => {
+            // 与认证提取器保持一致：x-api-key 是 Anthropic 传输层约定，
+            // 仅 /v1/messages 使用；其他路径不得以 x-api-key 身份消耗配额。
+            if !x_api_key_allowed_on_path(req.uri().path()) {
+                return next.run(req).await;
+            }
+            match headers.get("x-api-key").and_then(|h| h.to_str().ok()) {
+                Some(token) if !token.is_empty() => token,
+                _ => return next.run(req).await,
+            }
+        }
     };
 
     // 使用 AuthService 验证 token 获取真实的用户信息
@@ -496,6 +617,12 @@ fn hash_to_uuid(input: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+/// x-api-key 仅在 `/v1/messages` 路径被接受为限流身份（与认证提取器的
+/// 路径限制对称，避免其他端点以 x-api-key 身份消耗配额）。
+fn x_api_key_allowed_on_path(path: &str) -> bool {
+    path == "/v1/messages"
+}
+
 fn rate_limit_exceeded_response() -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -817,7 +944,12 @@ mod tests {
     use super::*;
     use crate::state::{AppStateConfig, JwtConfig};
     use axum::http::Request;
-    use axum::{Router, body::Body, middleware::from_fn_with_state, routing::get};
+    use axum::{
+        Json, Router,
+        body::Body,
+        middleware::{from_fn, from_fn_with_state},
+        routing::get,
+    };
     use keycompute_auth::JwtValidator;
     use tower::ServiceExt;
     use uuid::Uuid;
@@ -827,6 +959,331 @@ mod tests {
         let cors = cors_layer();
         // 确保可以创建 CORS 层
         let _ = cors;
+    }
+
+    #[tokio::test]
+    async fn anthropic_error_middleware_wraps_generic_errors() {
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {"message": "messages is required", "type": "bad_request_error"}
+                        })),
+                    )
+                }),
+            )
+            .layer(from_fn(anthropic_error_response_middleware));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], "messages is required");
+    }
+
+    #[tokio::test]
+    async fn anthropic_error_middleware_passes_through_conforming_schema() {
+        // 已经符合 Anthropic Errors schema 的错误响应不得被二次封装：SDK 依赖
+        // 顶层 `type: "error"` 与 `error` 对象，重复包装会让结构化解析失效。
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                get(|| async {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": "authentication_error",
+                                "message": "invalid x-api-key"
+                            }
+                        })),
+                    )
+                }),
+            )
+            .layer(from_fn(anthropic_error_response_middleware));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(body["error"]["message"], "invalid x-api-key");
+        assert!(body.get("error").is_some());
+        assert_eq!(body.as_object().unwrap().len(), 2, "must not be re-wrapped");
+    }
+
+    #[tokio::test]
+    async fn anthropic_error_middleware_passes_through_redirects() {
+        // 3xx 携带 Location 等跳转语义，改写成错误 JSON 会破坏重定向流程，
+        // 必须原样透传（含状态码与响应头）。
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                get(|| async { (StatusCode::FOUND, [("Location", "/login")], "redirecting") }),
+            )
+            .layer(from_fn(anthropic_error_response_middleware));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.headers().get("location").unwrap(), "/login");
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(body.as_ref(), b"redirecting");
+    }
+
+    #[tokio::test]
+    async fn anthropic_error_middleware_truncates_plaintext_error_line() {
+        // 纯文本 400 首行超过长度上限时必须被截断，不能完整回显到响应。
+        let long_line = format!(
+            "Failed to deserialize the JSON body into the target type: missing field `{}`",
+            "x".repeat(600)
+        );
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                get(move || async move { (StatusCode::BAD_REQUEST, long_line) }),
+            )
+            .layer(from_fn(anthropic_error_response_middleware));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.len() <= MAX_PLAINTEXT_ERROR_CHARS,
+            "plaintext error line must be truncated"
+        );
+        assert!(
+            message.contains("missing field"),
+            "field-level hint should survive the truncation"
+        );
+        assert!(
+            !message.contains(&"x".repeat(600)),
+            "oversized tail must not be echoed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn anthropic_error_middleware_does_not_hang_on_streaming_error_body() {
+        // 防御验证：非 2xx 的流式（永不结束）错误体不得挂起中间件。
+        // body 读取超时后回退通用文本，请求仍返回 Anthropic schema 错误。
+        // start_paused 让超时使用虚拟时间，避免测试真实等待 5 秒。
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                get(|| async {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Body::from_stream(futures::stream::pending::<
+                            std::result::Result<bytes::Bytes, std::convert::Infallible>,
+                        >()),
+                    )
+                }),
+            )
+            .layer(from_fn(anthropic_error_response_middleware));
+
+        let app_handle = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+
+        // 轮询推进虚拟时间：后台任务在 body 读取超时后完成回退。
+        // advance 会 poll 等待时间的任务，因此无需固定 sleep 或精确时序。
+        for _ in 0..100 {
+            if app_handle.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+
+        let response = tokio::time::timeout(Duration::from_secs(1), app_handle)
+            .await
+            .expect("middleware must not hang on a never-ending error body")
+            .expect("oneshot should succeed");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "Request failed");
+    }
+
+    #[tokio::test]
+    async fn anthropic_error_middleware_keeps_json_rejection_field_hint() {
+        // axum 的 `Json` 提取器失败（缺失字段/类型错误）时返回纯文本 400，
+        // 中间件应提取首行作为 message，让 SDK 客户端看到字段级提示。
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Failed to deserialize the JSON body into the target type: \
+                         missing field `max_tokens` at line 1 column 21",
+                    )
+                }),
+            )
+            .layer(from_fn(anthropic_error_response_middleware));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("max_tokens"),
+            "field-level hint from the JSON rejection should survive the schema wrap"
+        );
+        assert!(
+            !body["error"]["message"].as_str().unwrap().contains("\n"),
+            "only the first line of a plaintext body should be exposed"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_error_middleware_keeps_other_plaintext_errors_generic() {
+        // 非反序列化错误的纯文本 body（如 500 代理错误页）不得原样回显，
+        // 必须保持通用文本，避免泄露服务端内部内容。
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "panic: internal secret stack trace",
+                    )
+                }),
+            )
+            .layer(from_fn(anthropic_error_response_middleware));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "Request failed");
+    }
+
+    #[tokio::test]
+    async fn anthropic_error_middleware_converts_rate_limit_body() {
+        // 限流中间件（rate_limit_exceeded_response）的 429 响应体是
+        // `{"error": {...}}` 形式：必须提取 message 并映射到 Anthropic 的
+        // rate_limit_error 类别，SDK 才能按 Anthropic schema 解析限流错误。
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                get(|| async {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        serde_json::json!({
+                            "error": {
+                                "message": "Rate limit exceeded. Please try again later.",
+                                "type": "rate_limit_exceeded",
+                                "code": "rate_limit_exceeded"
+                            }
+                        })
+                        .to_string(),
+                    )
+                }),
+            )
+            .layer(from_fn(anthropic_error_response_middleware));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Rate limit exceeded. Please try again later."
+        );
+    }
+
+    #[test]
+    fn anthropic_error_type_covers_messages_specific_statuses() {
+        assert_eq!(
+            anthropic_error_type(StatusCode::NOT_FOUND),
+            "not_found_error"
+        );
+        assert_eq!(
+            anthropic_error_type(StatusCode::PAYLOAD_TOO_LARGE),
+            "request_too_large"
+        );
+        assert_eq!(
+            anthropic_error_type(StatusCode::from_u16(529).unwrap()),
+            "overloaded_error"
+        );
+        assert_eq!(
+            anthropic_error_type(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            "invalid_request_error"
+        );
     }
 
     #[test]
@@ -956,6 +1413,47 @@ mod tests {
             "/api/v1/payments/notify/alipay/extra"
         ));
         assert!(!is_maintenance_excluded_path("/health-check"));
+    }
+
+    #[test]
+    fn x_api_key_only_authorized_on_messages_path() {
+        // 与认证提取器的路径限制对称：只有 /v1/messages 允许 x-api-key 身份。
+        assert!(x_api_key_allowed_on_path("/v1/messages"));
+        assert!(!x_api_key_allowed_on_path("/v1/chat/completions"));
+        assert!(!x_api_key_allowed_on_path("/api/v1/me"));
+        assert!(!x_api_key_allowed_on_path("/api/v1/admin/users"));
+    }
+
+    #[tokio::test]
+    async fn x_api_key_is_not_rate_limited_outside_messages_path() {
+        // 非 /v1/messages 路径携带 x-api-key：中间件直接放行，不尝试以该
+        // key 身份限流（认证层随后会拒绝 x-api-key，见 extractors 测试）。
+        // 连续发送超过 RPM 上限数量的请求仍全部放行，证明该路径不会以
+        // x-api-key 身份消耗配额（否则会像 JWT 测试一样触发 429）。
+        let state = AppState::with_config(AppStateConfig::default());
+        let app = Router::new()
+            .route("/other", get(|| async { StatusCode::NO_CONTENT }))
+            .layer(from_fn_with_state(state.clone(), rate_limit_middleware))
+            .with_state(state);
+
+        for request_number in 1..=keycompute_ratelimit::DEFAULT_RPM_LIMIT + 1 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/other")
+                        .header("x-api-key", "sk-test-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NO_CONTENT,
+                "request {request_number}: x-api-key must not consume quota outside /v1/messages"
+            );
+        }
     }
 
     #[tokio::test]

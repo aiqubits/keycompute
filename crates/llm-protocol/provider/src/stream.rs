@@ -25,6 +25,14 @@ pub enum StreamEvent {
         /// 输出 token 数
         output_tokens: u32,
     },
+    /// Provider 已确认的输入 token 数（输出尚未完成时）。
+    ///
+    /// Anthropic 会在 `message_start` 提供这个值；将它与最终 Usage 分开，
+    /// 可避免用虚假的 `output_tokens = 0` 覆盖中途断流前的输出估算。
+    InputUsage {
+        /// 输入 token 数
+        input_tokens: u32,
+    },
     /// 流结束
     Done,
     /// 错误
@@ -62,6 +70,11 @@ impl StreamEvent {
             input_tokens,
             output_tokens,
         }
+    }
+
+    /// 创建仅包含精确输入 token 的用量事件。
+    pub fn input_usage(input_tokens: u32) -> Self {
+        Self::InputUsage { input_tokens }
     }
 
     /// 创建 Done 事件
@@ -106,14 +119,24 @@ pub mod sse {
     ///
     /// SSE 格式: `data: {...}\n\n`
     pub fn parse_sse_line(line: &str) -> Option<String> {
-        let line = line.trim();
-        if line.is_empty() {
+        // 不对整行做 trim：那会改写 data 部分首尾的合法空白。SSE 字段行
+        // 不允许前导空白，`strip_prefix` 精确匹配行首的 "data:"。
+        if line.trim().is_empty() {
             return None;
         }
 
-        if let Some(data) = line.strip_prefix("data: ") {
-            let data = data.trim();
-            if data == "[DONE]" {
+        if let Some(data) = line.strip_prefix("data:") {
+            // SSE 规范允许冒号后紧跟数据，也允许一个可选空格。
+            // 只移除该可选空格，不使用 `trim()`，以免意外改写 JSON 字符串
+            // 内部或首尾的合法空白。
+            let data = data.strip_prefix(' ').unwrap_or(data);
+            if data.trim().is_empty() {
+                // `data:` 与 `data: ` 空行不构成事件；忽略而非交给调用方
+                // 去解析空 JSON 后中断整条流。
+                return None;
+            }
+            if data.trim() == "[DONE]" {
+                // 容忍冒号后多个空格，但始终返回归一化的标准标记。
                 return Some(String::from("[DONE]"));
             }
             return Some(data.to_string());
@@ -147,6 +170,12 @@ mod tests {
             }
         ));
 
+        let input_usage = StreamEvent::input_usage(10);
+        assert!(matches!(
+            input_usage,
+            StreamEvent::InputUsage { input_tokens: 10 }
+        ));
+
         let done = StreamEvent::done();
         assert!(done.is_done());
 
@@ -165,6 +194,28 @@ mod tests {
         );
 
         assert_eq!(parse_sse_line("data: [DONE]"), Some(String::from("[DONE]")));
+
+        assert_eq!(
+            parse_sse_line("data:{\"content\": \"Hello\"}"),
+            Some(String::from("{\"content\": \"Hello\"}"))
+        );
+
+        // 空 data 行不构成事件；旧行为对 "data: " 返回 Some("")，
+        // 会让下游尝试解析空 JSON 从而中断整条流。
+        assert_eq!(parse_sse_line("data:"), None);
+        assert_eq!(parse_sse_line("data: "), None);
+
+        // 数据首尾的合法空白是数据的一部分，不再被 trim 改写。
+        assert_eq!(
+            parse_sse_line("data: {\"content\": \"Hello\"} "),
+            Some(String::from("{\"content\": \"Hello\"} "))
+        );
+
+        // 冒号后多个空格仍容忍，[DONE] 归一化为标准标记。
+        assert_eq!(
+            parse_sse_line("data:  [DONE]"),
+            Some(String::from("[DONE]"))
+        );
 
         assert_eq!(parse_sse_line("id: 123"), None);
         assert_eq!(parse_sse_line(""), None);

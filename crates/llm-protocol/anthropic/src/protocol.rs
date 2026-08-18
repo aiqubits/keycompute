@@ -3,6 +3,7 @@
 //! Anthropic Messages API 的请求/响应结构定义
 //! 文档: https://docs.anthropic.com/claude/reference/messages_post
 
+use keycompute_types::{KeyComputeError, Result};
 use serde::{Deserialize, Serialize};
 
 /// Anthropic Messages API 请求
@@ -127,9 +128,36 @@ pub struct AnthropicUsage {
     /// 输入 token 数
     #[serde(default)]
     pub input_tokens: u32,
+    /// 写入 prompt cache 的输入 token 数。
+    ///
+    /// Anthropic 将此项与常规输入分别报告；即使本项目当前只有统一的输入
+    /// 单价，也必须将它计入输入 token，不能在结算时静默丢弃。
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    /// 从 prompt cache 读取的输入 token 数。
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
     /// 输出 token 数
     #[serde(default)]
     pub output_tokens: u32,
+}
+
+impl AnthropicUsage {
+    /// 返回所有可计费的输入 token。
+    ///
+    /// `input_tokens` 不包含 prompt-cache 的读写计数。账本当前采用统一输入
+    /// 单价，因此将三项合并后计费；使用 checked_add 防止异常上游数据溢出
+    /// 后静默少记用量。
+    pub fn total_input_tokens(&self) -> Result<u32> {
+        self.input_tokens
+            .checked_add(self.cache_creation_input_tokens)
+            .and_then(|tokens| tokens.checked_add(self.cache_read_input_tokens))
+            .ok_or_else(|| {
+                KeyComputeError::ProviderError(
+                    "Anthropic input token usage exceeds u32".to_string(),
+                )
+            })
+    }
 }
 
 /// Anthropic 流式响应事件
@@ -379,9 +407,23 @@ mod tests {
     fn test_claude_usage() {
         let usage = AnthropicUsage {
             input_tokens: 100,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             output_tokens: 50,
         };
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
+    }
+
+    #[test]
+    fn total_input_tokens_rejects_overflow() {
+        let usage = AnthropicUsage {
+            input_tokens: u32::MAX,
+            cache_creation_input_tokens: 1,
+            cache_read_input_tokens: 0,
+            output_tokens: 0,
+        };
+
+        assert!(usage.total_input_tokens().is_err());
     }
 }

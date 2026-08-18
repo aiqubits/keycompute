@@ -21,44 +21,52 @@ pub fn parse_openai_stream(
     let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
 
     tokio::spawn(async move {
-        let mut buffer = String::new();
+        // Keep the raw bytes until a complete SSE line is available. Network
+        // chunks may split a multi-byte UTF-8 character; decoding each chunk
+        // with `from_utf8_lossy` would permanently replace such characters
+        // with U+FFFD before the next chunk arrives.
+        let mut buffer = Vec::new();
         let mut stream = stream;
 
-        while let Some(chunk_result) = stream.next().await {
+        loop {
+            // Dropping the receiver (for example after a client disconnect or
+            // executor timeout) must also stop the producer and release the
+            // underlying HTTP body. Without this branch, a detached parser
+            // task can remain blocked in `stream.next()` until the transport's
+            // much longer stream timeout expires.
+            let Some(chunk_result) = (tokio::select! {
+                _ = tx.closed() => return,
+                chunk = stream.next() => chunk,
+            }) else {
+                break;
+            };
             match chunk_result {
                 Ok(chunk) => {
-                    let text = String::from_utf8_lossy(&chunk);
-                    buffer.push_str(&text);
+                    buffer.extend_from_slice(&chunk);
 
                     // 处理缓冲区中的完整行
-                    while let Some(pos) = buffer.find('\n') {
-                        let line = buffer[..pos].to_string();
-                        buffer.drain(..=pos);
+                    while let Some(pos) = buffer.iter().position(|byte| *byte == b'\n') {
+                        let mut line = buffer.drain(..=pos).collect::<Vec<_>>();
 
                         // 处理可能的 \r\n
-                        let line = line.trim_end_matches('\r');
-
-                        if let Some(data) = sse::parse_sse_line(line) {
-                            if sse::is_done_marker(&data) {
-                                let _ = tx.send(Ok(StreamEvent::done())).await;
+                        line.pop(); // `\n`
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        let line = match std::str::from_utf8(&line) {
+                            Ok(line) => line,
+                            Err(error) => {
+                                let _ = tx
+                                    .send(Err(KeyComputeError::ProviderError(format!(
+                                        "OpenAI stream contained invalid UTF-8: {error}"
+                                    ))))
+                                    .await;
                                 return;
                             }
+                        };
 
-                            // 解析 JSON 数据（一条上游事件可能产生多个 StreamEvent）
-                            match parse_openai_event(&data) {
-                                Ok(events) => {
-                                    for event in events {
-                                        if tx.send(Ok(event)).await.is_err() {
-                                            // 接收端已关闭（客户端断开），停止解析
-                                            return;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(e)).await;
-                                    return;
-                                }
-                            }
+                        if !handle_sse_line(&tx, line).await {
+                            return;
                         }
                     }
                 }
@@ -71,11 +79,70 @@ pub fn parse_openai_stream(
             }
         }
 
-        // 流结束
-        let _ = tx.send(Ok(StreamEvent::done())).await;
+        // 处理 EOF 前未以换行结尾的剩余字节。上游可以在 `data: [DONE]`
+        // 之后直接关闭 TCP 而不补 LF；把剩余内容按行解析后再判断是否截断，
+        // 否则携带完成标记的响应会被误判为截断。
+        if !buffer.is_empty() {
+            let remaining = std::mem::take(&mut buffer);
+            let text = match std::str::from_utf8(&remaining) {
+                Ok(text) => text,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(KeyComputeError::ProviderError(format!(
+                            "OpenAI stream contained invalid UTF-8: {error}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+            for raw_line in text.split('\n') {
+                if !handle_sse_line(&tx, raw_line.trim_end_matches('\r')).await {
+                    return;
+                }
+            }
+        }
+
+        // EOF alone is not a successful OpenAI stream completion. A proxy or
+        // upstream can close the connection after a partial response; only
+        // the protocol's explicit `[DONE]` marker proves that the response
+        // completed.
+        let _ = tx
+            .send(Err(KeyComputeError::ProviderError(
+                "OpenAI stream ended without a terminal [DONE] marker".to_string(),
+            )))
+            .await;
     });
 
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// 处理单条 SSE 行；返回 `false` 表示应停止解析（完成 / 错误 / 接收端关闭）。
+async fn handle_sse_line(tx: &mpsc::Sender<Result<StreamEvent>>, line: &str) -> bool {
+    let Some(data) = sse::parse_sse_line(line) else {
+        return true;
+    };
+
+    if sse::is_done_marker(&data) {
+        let _ = tx.send(Ok(StreamEvent::done())).await;
+        return false;
+    }
+
+    // 解析 JSON 数据（一条上游事件可能产生多个 StreamEvent）
+    match parse_openai_event(&data) {
+        Ok(events) => {
+            for event in events {
+                if tx.send(Ok(event)).await.is_err() {
+                    // 接收端已关闭（客户端断开），停止解析
+                    return false;
+                }
+            }
+            true
+        }
+        Err(e) => {
+            let _ = tx.send(Err(e)).await;
+            false
+        }
+    }
 }
 
 /// 解析 OpenAI 流事件 JSON
@@ -160,6 +227,32 @@ fn extract_upstream_error(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::task::{Context, Poll};
+
+    struct PendingDropStream {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl futures::Stream for PendingDropStream {
+        type Item = keycompute_types::Result<bytes::Bytes>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDropStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn test_parse_openai_event_with_content() {
@@ -347,5 +440,103 @@ mod tests {
                 output_tokens: 20
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn preserves_utf8_characters_split_across_network_chunks() {
+        // Split the three-byte UTF-8 encoding of "你" between network chunks.
+        // The parser must retain the bytes until the complete SSE line arrives.
+        let source = futures::stream::iter(vec![
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"\xe4",
+            )),
+            Ok(bytes::Bytes::from_static(
+                b"\xbd\xa0\"}}]}\n\ndata: [DONE]\n\n",
+            )),
+        ]);
+        let mut parsed = parse_openai_stream(Box::pin(source));
+        let event = parsed.next().await.unwrap().unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::Delta { content, .. } if content == "你"
+        ));
+        assert!(matches!(parsed.next().await, Some(Ok(StreamEvent::Done))));
+    }
+
+    #[tokio::test]
+    async fn eof_without_done_marker_is_reported_as_truncated() {
+        let source = futures::stream::iter(vec![Ok(bytes::Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        ))]);
+        let mut parsed = parse_openai_stream(Box::pin(source));
+
+        assert!(matches!(
+            parsed.next().await,
+            Some(Ok(StreamEvent::Delta { content, .. })) if content == "partial"
+        ));
+        assert!(matches!(
+            parsed.next().await,
+            Some(Err(KeyComputeError::ProviderError(message)))
+                if message.contains("[DONE]")
+        ));
+    }
+
+    #[tokio::test]
+    async fn done_marker_without_final_newline_is_accepted() {
+        // 上游可以在 `data: [DONE]` 之后直接关闭 TCP 而不补 LF；EOF 时残留
+        // 的这一行必须解析为最终 SSE 行，响应才算正常完成而非截断。
+        let source = futures::stream::iter(vec![
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            )),
+            Ok(bytes::Bytes::from_static(b"data: [DONE]")),
+        ]);
+        let mut parsed = parse_openai_stream(Box::pin(source));
+        assert!(matches!(
+            parsed.next().await,
+            Some(Ok(StreamEvent::Delta { content, .. })) if content == "ok"
+        ));
+        assert!(matches!(parsed.next().await, Some(Ok(StreamEvent::Done))));
+        assert!(parsed.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn eof_flushes_buffered_line_before_reporting_truncation() {
+        // EOF 时残留的完整 data 行（非 [DONE]）必须先作为事件上报，
+        // 再以缺少 [DONE] 标记判定截断，不能静默丢弃缓冲内容。
+        let source = futures::stream::iter(vec![Ok(bytes::Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"tail\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"last\"}}]}",
+        ))]);
+        let mut parsed = parse_openai_stream(Box::pin(source));
+        assert!(matches!(
+            parsed.next().await,
+            Some(Ok(StreamEvent::Delta { content, .. })) if content == "tail"
+        ));
+        assert!(matches!(
+            parsed.next().await,
+            Some(Ok(StreamEvent::Delta { content, .. })) if content == "last"
+        ));
+        assert!(matches!(
+            parsed.next().await,
+            Some(Err(KeyComputeError::ProviderError(message))) if message.contains("[DONE]")
+        ));
+    }
+
+    #[tokio::test]
+    async fn drops_upstream_when_receiver_is_dropped() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let source = PendingDropStream {
+            dropped: Arc::clone(&dropped),
+        };
+        let parsed = parse_openai_stream(Box::pin(source));
+        tokio::task::yield_now().await;
+        drop(parsed);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
