@@ -952,6 +952,84 @@ mod tests {
         assert_eq!(anthropic_ranked, vec!["anthropic".to_string()]);
     }
 
+    #[tokio::test]
+    async fn test_rank_providers_anthropic_entry_selects_anthropic_only() {
+        // anthropic 入口只选 anthropic 协议候选：即使 openai 等其他协议注册在前，
+        // 候选列表仍只含 anthropic，且保持注册顺序（隔离发生在 rank 阶段，
+        // 而非账号选择阶段）。
+        let account_states = Arc::new(AccountStateStore::new());
+        let provider_health = Arc::new(ProviderHealthStore::new());
+        let providers = vec![
+            "openai".to_string(),
+            "deepseek".to_string(),
+            "anthropic".to_string(),
+            "claude".to_string(),
+        ];
+        let engine = RoutingEngine::new(account_states, provider_health, providers);
+        let pricing = PricingSnapshot {
+            model_name: "gpt-4o".to_string(),
+            currency: "CNY".to_string(),
+            input_price_per_1k: Decimal::from(1),
+            output_price_per_1k: Decimal::from(2),
+        };
+
+        let anthropic_ranked = engine
+            .rank_providers("gpt-4o", &pricing, "anthropic")
+            .await
+            .unwrap();
+        assert_eq!(anthropic_ranked, vec!["anthropic".to_string()]);
+
+        // 大小写不敏感：route() 传入值固定为小写，此处为防御性验证
+        // （eq_ignore_ascii_case 匹配），防止将来传入规范化前的用户输入
+        let mixed_case_ranked = engine
+            .rank_providers("gpt-4o", &pricing, "Anthropic")
+            .await
+            .unwrap();
+        assert_eq!(mixed_case_ranked, vec!["anthropic".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_rank_providers_returns_empty_without_protocol_candidates() {
+        // 无同协议候选时不跨协议兜底：anthropic 入口 + 引擎仅注册 openai 等
+        // 其他协议 → 返回空列表（route 据此报 RoutingFailed），而不是回退到
+        // openai 候选（避免原生 Anthropic 字段在协议转换中丢失）。
+        let account_states = Arc::new(AccountStateStore::new());
+        let provider_health = Arc::new(ProviderHealthStore::new());
+        let providers = vec![
+            "openai".to_string(),
+            "deepseek".to_string(),
+            "claude".to_string(),
+        ];
+        let engine = RoutingEngine::new(account_states, provider_health, providers);
+        let pricing = PricingSnapshot {
+            model_name: "gpt-4o".to_string(),
+            currency: "CNY".to_string(),
+            input_price_per_1k: Decimal::from(1),
+            output_price_per_1k: Decimal::from(2),
+        };
+
+        // 本协议未注册：空列表，不跨协议兜底
+        let anthropic_ranked = engine
+            .rank_providers("gpt-4o", &pricing, "anthropic")
+            .await
+            .unwrap();
+        assert!(anthropic_ranked.is_empty());
+
+        // 对照组：openai 入口正常返回 openai 候选（过滤未误伤其他协议）
+        let openai_ranked = engine
+            .rank_providers("gpt-4o", &pricing, "openai")
+            .await
+            .unwrap();
+        assert_eq!(openai_ranked, vec!["openai".to_string()]);
+
+        // 未知协议名同样返回空列表（防御性，避免静默路由到错误协议）
+        let unknown_ranked = engine
+            .rank_providers("gpt-4o", &pricing, "unknown")
+            .await
+            .unwrap();
+        assert!(unknown_ranked.is_empty());
+    }
+
     #[test]
     fn test_score_provider() {
         let engine = create_test_engine();
