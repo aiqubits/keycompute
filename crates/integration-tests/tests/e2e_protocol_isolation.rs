@@ -18,7 +18,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use integration_tests::common::generate_test_id;
-use integration_tests::db::{cleanup_test_data, create_test_tenant};
+use integration_tests::db::{cleanup_test_data, create_test_tenant, initialize_test_schema};
 use keycompute_db::models::account::CreateAccountRequest;
 use keycompute_db::{Account, CreateUserRequest, DbRouter, User};
 use keycompute_runtime::{ApiKeyCrypto, encrypt_api_key, set_global_crypto};
@@ -38,10 +38,20 @@ fn get_database_url() -> String {
 }
 
 /// 尝试创建数据库连接（DB 不可用时跳过）
+///
+/// 与其他集成测试的 `create_test_pool` 保持一致：连接后初始化 schema。
+/// 本文件不依赖其他测试二进制的初始化，CI 中若单独或先行运行，
+/// 也必须保证表已存在，否则 cleanup 会因表缺失而失败。
 async fn try_create_db_pool() -> Option<DatabaseConnection> {
     let url = get_database_url();
     match Database::connect(&url).await {
-        Ok(db) => Some(db),
+        Ok(db) => {
+            if let Err(e) = initialize_test_schema(&db).await {
+                eprintln!("SKIP: Failed to initialize schema: {}", e);
+                return None;
+            }
+            Some(db)
+        }
         Err(e) => {
             eprintln!("SKIP: Database not reachable: {}", e);
             None
@@ -84,17 +94,20 @@ async fn create_test_account(
     .expect("create test account")
 }
 
-/// 创建租户 + Admin 用户 + 带数据库连接的路由器，返回 (app, admin token)
+/// 创建 Admin 用户 + 带数据库连接的路由器，返回 (app, admin token)
+///
+/// 租户由调用方创建后传入 tenant_id：本函数不再 create_test_tenant，
+/// 避免测试外层与内部用同一 test_id 重复创建相同 slug 的租户
+/// （tenants.slug 唯一约束冲突）。
 async fn build_admin_app(
     pool: &DatabaseConnection,
-    suffix: &str,
+    tenant_id: Uuid,
     test_id: &str,
 ) -> (Router, String) {
-    let tenant = create_test_tenant(pool, suffix, test_id).await;
     let admin = User::create(
         pool,
         &CreateUserRequest {
-            tenant_id: tenant.id,
+            tenant_id,
             email: format!("proto-admin-{}@example.com", test_id),
             name: Some("Protocol Isolation Admin".to_string()),
             role: Some(UserRole::Admin),
@@ -200,10 +213,10 @@ async fn test_debug_routing_entry_parameter_isolates_protocol() {
     // 同一租户配置 openai 与 anthropic 账号，均声明同一模型
     let tenant = create_test_tenant(&pool, "proto-entry", &test_id).await;
     let model = "kc-e2e-route-model";
-    let openai_account = create_test_account(&pool, tenant.id, "openai", &[model]).await;
-    let anthropic_account = create_test_account(&pool, tenant.id, "anthropic", &[model]).await;
+    let _openai_account = create_test_account(&pool, tenant.id, "openai", &[model]).await;
+    let _anthropic_account = create_test_account(&pool, tenant.id, "anthropic", &[model]).await;
 
-    let (app, token) = build_admin_app(&pool, "proto-entry", &test_id).await;
+    let (app, token) = build_admin_app(&pool, tenant.id, &test_id).await;
 
     // openai 入口（缺省 entry）：primary 必须是 openai 协议账号
     let body = get_debug_routing(&app, &token, model, None).await;
@@ -221,12 +234,10 @@ async fn test_debug_routing_entry_parameter_isolates_protocol() {
         "anthropic entry must not route to openai accounts"
     );
 
-    // 清理本测试账号，避免污染 /v1/models 的 find_enabled_all
-    openai_account.delete(&pool).await.expect("cleanup openai");
-    anthropic_account
-        .delete(&pool)
+    // 清理本测试数据（账号、用户、租户），避免污染后续运行与 /v1/models
+    cleanup_test_data(&pool, &test_id)
         .await
-        .expect("cleanup anthropic");
+        .expect("cleanup should succeed");
 }
 
 // ============================================================================
@@ -246,9 +257,9 @@ async fn test_debug_routing_anthropic_entry_does_not_fallback_across_protocols()
     // 仅配置 openai 协议账号（无 anthropic 账号）
     let tenant = create_test_tenant(&pool, "proto-fallback", &test_id).await;
     let model = "kc-e2e-route-fallback";
-    let openai_account = create_test_account(&pool, tenant.id, "openai", &[model]).await;
+    let _openai_account = create_test_account(&pool, tenant.id, "openai", &[model]).await;
 
-    let (app, token) = build_admin_app(&pool, "proto-fallback", &test_id).await;
+    let (app, token) = build_admin_app(&pool, tenant.id, &test_id).await;
 
     // 对照组：openai 入口正常路由
     let body = get_debug_routing(&app, &token, model, None).await;
@@ -271,7 +282,10 @@ async fn test_debug_routing_anthropic_entry_does_not_fallback_across_protocols()
         "diagnostic message should name the model, got: {message}"
     );
 
-    openai_account.delete(&pool).await.expect("cleanup openai");
+    // 清理本测试数据（账号、用户、租户），避免污染后续运行与 /v1/models
+    cleanup_test_data(&pool, &test_id)
+        .await
+        .expect("cleanup should succeed");
 }
 
 // ============================================================================
@@ -292,8 +306,8 @@ async fn test_list_models_filters_by_protocol_param() {
     let tenant = create_test_tenant(&pool, "proto-models", &test_id).await;
     let openai_models = ["kc-e2e-models-openai-a", "kc-e2e-models-openai-b"];
     let anthropic_models = ["kc-e2e-models-anthropic-a"];
-    let openai_account = create_test_account(&pool, tenant.id, "openai", &openai_models).await;
-    let anthropic_account =
+    let _openai_account = create_test_account(&pool, tenant.id, "openai", &openai_models).await;
+    let _anthropic_account =
         create_test_account(&pool, tenant.id, "anthropic", &anthropic_models).await;
 
     let router = DbRouter::single(pool.clone());
@@ -337,9 +351,8 @@ async fn test_list_models_filters_by_protocol_param() {
         .expect("invalid protocol request");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    openai_account.delete(&pool).await.expect("cleanup openai");
-    anthropic_account
-        .delete(&pool)
+    // 清理本测试数据（账号、用户、租户），避免污染后续运行与 /v1/models
+    cleanup_test_data(&pool, &test_id)
         .await
-        .expect("cleanup anthropic");
+        .expect("cleanup should succeed");
 }

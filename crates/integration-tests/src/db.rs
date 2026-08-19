@@ -129,6 +129,13 @@ pub async fn cleanup_test_data(
         [slug_pattern.clone().into()],
     ))
     .await?;
+    // accounts 无外键约束，需显式删除，避免残留账号污染 find_enabled_all
+    pool.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "DELETE FROM accounts WHERE tenant_id IN (SELECT id FROM tenants WHERE slug LIKE $1)",
+        [slug_pattern.clone().into()],
+    ))
+    .await?;
     pool.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "DELETE FROM tenants WHERE slug LIKE $1",
