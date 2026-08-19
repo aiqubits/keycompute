@@ -87,6 +87,39 @@ fn models_placeholder_key_for(preset: &str) -> &'static str {
     }
 }
 
+/// 协议默认端点（与后端 ProtocolType::default_endpoint 保持一致）
+///
+/// web 为独立 WASM 包，无法引用后端 llm-protocol-provider 常量，只能
+/// 在此维护硬编码副本；若后端默认端点变更，需同步修改此处
+/// （protocol_default_endpoint_maps_known_protocols 测试锁定当前值）。
+///
+/// 预设模板为空串时表示使用协议默认端点，占位提示显示该值，
+/// 暗示用户留空即可使用默认端点。
+fn protocol_default_endpoint(protocol: &str) -> &'static str {
+    match protocol {
+        "anthropic" => "https://api.anthropic.com/v1",
+        // openai 及未知协议回落到 OpenAI 默认端点
+        _ => "https://api.openai.com/v1",
+    }
+}
+
+/// 根据预设获取 Base URL 占位提示（仅创建表单使用）
+///
+/// 预设模板非空时直接复用模板 URL；openai / anthropic 模板为空，
+/// 提示协议默认端点（留空即使用）。编辑表单直接按账号协议取
+/// protocol_default_endpoint，不经过预设查找。
+fn base_url_placeholder_for(preset: &str) -> String {
+    preset_by_id(preset)
+        .map(|(_, _, protocol, base_url)| {
+            if base_url.is_empty() {
+                protocol_default_endpoint(protocol).to_string()
+            } else {
+                base_url.to_string()
+            }
+        })
+        .unwrap_or_else(|| protocol_default_endpoint("openai").to_string())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum AccountTestOutcome {
     Success,
@@ -154,6 +187,7 @@ fn AdminAccountsView() -> Element {
     // 编辑弹窗状态
     let mut edit_id = use_signal(String::new);
     let mut edit_name = use_signal(String::new);
+    let mut edit_provider = use_signal(String::new);
     let mut edit_api_key = use_signal(String::new);
     let mut edit_api_base = use_signal(String::new);
     let mut edit_reset_api_base = use_signal(|| false);
@@ -517,12 +551,14 @@ fn AdminAccountsView() -> Element {
                                                         onclick: {
                                                             let id = acc.id.clone();
                                                             let name = acc.name.clone();
+                                                            let provider = acc.provider.clone();
                                                             let active = acc.is_active;
                                                             let visibility = acc.visibility.clone();
                                                             let tenant_id = acc.tenant_id.clone();
                                                             move |_| {
                                                                 edit_id.set(id.clone());
                                                                 edit_name.set(name.clone());
+                                                                edit_provider.set(provider.clone());
                                                                 edit_api_key.set(String::new());
                                                                 edit_api_base.set(String::new());
                                                                 edit_reset_api_base.set(false);
@@ -545,14 +581,16 @@ fn AdminAccountsView() -> Element {
                                                                 let id = id.clone();
                                                                 spawn(async move {
                                                                     match account_service::test(&id, &token).await {
-                                                                        Ok(response) => match account_test_outcome(response) {
-                                                                            AccountTestOutcome::Success => {
-                                                                                ui_store.show_success(i18n.t("accounts.test_success"));
+                                                                        Ok(response) => {
+                                                                            match account_test_outcome(response) {
+                                                                                AccountTestOutcome::Success => {
+                                                                                    ui_store.show_success(i18n.t("accounts.test_success"));
+                                                                                }
+                                                                                AccountTestOutcome::Failure => {
+                                                                                    ui_store.show_error(i18n.t("accounts.test_failed"));
+                                                                                }
                                                                             }
-                                                                            AccountTestOutcome::Failure => {
-                                                                                ui_store.show_error(i18n.t("accounts.test_failed"));
-                                                                            }
-                                                                        },
+                                                                        }
                                                                         Err(e) => {
                                                                             ui_store
                                                                                 .show_error(
@@ -577,11 +615,12 @@ fn AdminAccountsView() -> Element {
                                                                 spawn(async move {
                                                                     match account_service::refresh(&id, &token).await {
                                                                         Ok(_) => ui_store.show_success(i18n.t("accounts.refresh_success")),
-                                                                        Err(e) => ui_store.show_error(format!(
-                                                                            "{}: {}",
-                                                                            i18n.t("accounts.refresh_failed"),
-                                                                            e,
-                                                                        )),
+                                                                        Err(e) => {
+                                                                            ui_store
+                                                                                .show_error(
+                                                                                    format!("{}: {}", i18n.t("accounts.refresh_failed"), e),
+                                                                                )
+                                                                        }
                                                                     }
                                                                     accounts.restart();
                                                                 });
@@ -703,7 +742,7 @@ fn AdminAccountsView() -> Element {
                                 label { class: "form-label", {i18n.t("accounts.custom_base_url")} }
                                 input {
                                     class: "input-field",
-                                    placeholder: "https://api.openai.com/v1",
+                                    placeholder: "{base_url_placeholder_for(&create_preset())}",
                                     value: "{create_api_base}",
                                     oninput: move |e| *create_api_base.write() = e.value(),
                                 }
@@ -772,7 +811,7 @@ fn AdminAccountsView() -> Element {
                                 }
                                 input {
                                     class: "input-field",
-                                    placeholder: "https://api.openai.com/v1",
+                                    placeholder: "{protocol_default_endpoint(&edit_provider())}",
                                     disabled: edit_reset_api_base(),
                                     value: "{edit_api_base}",
                                     oninput: move |e| *edit_api_base.write() = e.value(),
@@ -995,6 +1034,47 @@ mod tests {
         assert_eq!(
             account_test_outcome(response(false, "Account connection test failed")),
             AccountTestOutcome::Failure
+        );
+    }
+
+    #[test]
+    fn base_url_placeholder_follows_preset_template_or_protocol_default() {
+        // 有模板的预设直接显示模板 URL
+        assert_eq!(
+            base_url_placeholder_for("deepseek"),
+            "https://api.deepseek.com/v1"
+        );
+        // 模板为空的预设（openai / anthropic）显示协议默认端点
+        assert_eq!(
+            base_url_placeholder_for("openai"),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            base_url_placeholder_for("anthropic"),
+            "https://api.anthropic.com/v1"
+        );
+        // 未知预设回落到 OpenAI 默认端点
+        assert_eq!(
+            base_url_placeholder_for("unknown"),
+            "https://api.openai.com/v1"
+        );
+    }
+
+    #[test]
+    fn protocol_default_endpoint_maps_known_protocols() {
+        // 编辑表单按账号协议取默认端点（与后端 ProtocolType::default_endpoint 一致）
+        assert_eq!(
+            protocol_default_endpoint("openai"),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            protocol_default_endpoint("anthropic"),
+            "https://api.anthropic.com/v1"
+        );
+        // 未知协议回落到 OpenAI 默认端点
+        assert_eq!(
+            protocol_default_endpoint("unknown"),
+            "https://api.openai.com/v1"
         );
     }
 }

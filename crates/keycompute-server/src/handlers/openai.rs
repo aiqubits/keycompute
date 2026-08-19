@@ -10,7 +10,7 @@ use crate::{
 };
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::{
         IntoResponse,
         sse::{Event, Sse},
@@ -405,7 +405,7 @@ pub async fn chat_completions(
         .routing
         .route(&ctx)
         .await
-        .map_err(|e| ApiError::Internal(format!("Routing failed: {}", e)))?;
+        .map_err(|e| crate::error::map_routing_error(e, "openai"))?;
 
     // 5. 根据 ExecutionTarget 分流执行路径
     match &plan.primary {
@@ -587,9 +587,7 @@ pub async fn chat_completions(
             )
             .await
             {
-                Ok(result) => {
-                    result.map_err(|e| ApiError::Internal(format!("Execution failed: {}", e)))?
-                }
+                Ok(result) => result.map_err(crate::error::map_execution_error)?,
                 Err(_) => {
                     tracing::error!(
                         request_id = %request_id.0,
@@ -1534,23 +1532,78 @@ pub struct ListModelsResponse {
     pub data: Vec<Model>,
 }
 
-/// 列出所有模型
-/// GET /v1/models
-/// 从数据库聚合所有启用的 Provider 账号支持的模型列表
-pub async fn list_models(State(state): State<AppState>) -> Result<Json<ListModelsResponse>> {
+/// 模型列表查询参数
+#[derive(Debug, Deserialize)]
+pub struct ListModelsQuery {
+    /// 入口协议（openai / anthropic），缺省 openai。
+    ///
+    /// 与路由的入口协议隔离保持一致：/v1/models 是 OpenAI 兼容入口，
+    /// 缺省只列出 openai 协议账号声明的模型，避免列出当前端点无法
+    /// 服务的模型（否则列表中的 Claude 模型在 /v1/chat/completions
+    /// 会得到 404）；`protocol=anthropic` 供需要 Anthropic 模型清单的
+    /// 消费方使用（如 web 端 Anthropic 示例）。
+    #[serde(default)]
+    pub protocol: Option<String>,
+}
+
+/// 按入口协议收集模型清单：仅保留指定协议账号声明的模型。
+///
+/// 提取为纯函数便于单元测试（handler 级测试需构造完整 AppState，
+/// 成本高且不必要）。
+fn collect_models_by_protocol(
+    accounts: impl IntoIterator<Item = Account>,
+    protocol: &str,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, String>,
+) {
     let mut model_set = std::collections::HashSet::new();
     let mut provider_map = std::collections::HashMap::new();
+    for account in accounts.into_iter().filter(|a| a.provider == protocol) {
+        for model in account.models_supported {
+            model_set.insert(model.clone());
+            provider_map.insert(model, account.provider.clone());
+        }
+    }
+    (model_set, provider_map)
+}
+
+/// 解析模型列表的入口协议参数：规范化大小写并校验合法性。
+///
+/// 提取为纯函数便于单元测试（handler 级测试需构造完整 AppState，
+/// 成本高且不必要）。
+fn resolve_list_protocol(protocol: Option<&str>) -> Result<&'static str> {
+    match protocol {
+        Some(p) => match llm_protocol_provider::ProtocolType::parse(p) {
+            Some(pt) => Ok(pt.as_str()),
+            None => Err(ApiError::BadRequest(format!(
+                "Unsupported protocol '{p}', expected one of: openai, anthropic"
+            ))),
+        },
+        // 缺省按 openai 入口过滤（与 /v1/chat/completions 的隔离一致）
+        None => Ok("openai"),
+    }
+}
+
+/// 列出所有模型
+/// GET /v1/models
+/// 从数据库聚合指定入口协议（缺省 openai）的启用账号支持的模型列表
+pub async fn list_models(
+    State(state): State<AppState>,
+    Query(query): Query<ListModelsQuery>,
+) -> Result<Json<ListModelsResponse>> {
+    let protocol = resolve_list_protocol(query.protocol.as_deref())?;
+
+    let (mut model_set, mut provider_map) = (
+        std::collections::HashSet::new(),
+        std::collections::HashMap::new(),
+    );
 
     // 尝试从数据库获取模型列表
     if let Some(pool) = state.pool.as_deref() {
         // 查询所有启用的账号（不限制 tenant_id，使用系统级查询）
         if let Ok(accounts) = Account::find_enabled_all(pool).await {
-            for account in accounts {
-                for model in account.models_supported {
-                    model_set.insert(model.clone());
-                    provider_map.insert(model, account.provider.clone());
-                }
-            }
+            (model_set, provider_map) = collect_models_by_protocol(accounts, protocol);
         }
     }
 
@@ -2161,5 +2214,114 @@ mod tests {
             }]),
         };
         assert!(!has_image_content(&[msg]));
+    }
+
+    fn test_account(provider: &str, models: &[&str]) -> Account {
+        let now = chrono::Utc::now();
+        Account {
+            id: uuid::Uuid::new_v4(),
+            tenant_id: uuid::Uuid::new_v4(),
+            provider: provider.to_string(),
+            name: format!("{provider}-account"),
+            endpoint: "https://example.com/v1".to_string(),
+            upstream_api_key_encrypted: "sk-encrypted".to_string(),
+            upstream_api_key_preview: "sk-t****".to_string(),
+            rpm_limit: 60,
+            tpm_limit: 100_000,
+            priority: 10,
+            enabled: true,
+            models_supported: models.iter().map(|m| m.to_string()).collect(),
+            visibility: "tenant".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn list_models_query_defaults_to_openai_protocol() {
+        // 缺省 protocol 时按 openai 入口过滤（与 /v1/chat/completions 的隔离一致）
+        let json = serde_json::json!({});
+        let query: ListModelsQuery = serde_json::from_value(json).unwrap();
+        assert!(query.protocol.is_none());
+
+        // 显式指定入口协议
+        let json = serde_json::json!({ "protocol": "anthropic" });
+        let query: ListModelsQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(query.protocol.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn resolve_list_protocol_normalizes_case_and_rejects_unknown() {
+        // 缺省按 openai 过滤
+        assert_eq!(resolve_list_protocol(None).unwrap(), "openai");
+        assert_eq!(resolve_list_protocol(Some("openai")).unwrap(), "openai");
+        assert_eq!(
+            resolve_list_protocol(Some("anthropic")).unwrap(),
+            "anthropic"
+        );
+        // 大小写不敏感：parse 接受 "OpenAI"，规范化后仍与账号 provider（小写）匹配
+        assert_eq!(resolve_list_protocol(Some("OpenAI")).unwrap(), "openai");
+        assert_eq!(
+            resolve_list_protocol(Some("ANTHROPIC")).unwrap(),
+            "anthropic"
+        );
+        // 非协议名拒绝（避免过滤出空列表造成"静默无模型"）
+        assert!(resolve_list_protocol(Some("deepseek")).is_err());
+        assert!(resolve_list_protocol(Some("")).is_err());
+    }
+
+    #[test]
+    fn collect_models_by_protocol_only_includes_matching_accounts() {
+        let accounts = vec![
+            test_account("openai", &["gpt-4o", "deepseek-chat"]),
+            test_account("anthropic", &["claude-3-5-sonnet-20241022"]),
+        ];
+
+        // openai 入口：不包含 anthropic 账号声明的模型（否则列表与可调用性不一致）
+        let (openai_models, openai_providers) =
+            collect_models_by_protocol(accounts.clone(), "openai");
+        assert!(openai_models.contains("gpt-4o"));
+        assert!(openai_models.contains("deepseek-chat"));
+        assert!(!openai_models.contains("claude-3-5-sonnet-20241022"));
+        assert_eq!(
+            openai_providers.get("gpt-4o").map(String::as_str),
+            Some("openai")
+        );
+
+        // anthropic 入口：只包含 anthropic 账号声明的模型
+        let (anthropic_models, anthropic_providers) =
+            collect_models_by_protocol(accounts, "anthropic");
+        assert!(anthropic_models.contains("claude-3-5-sonnet-20241022"));
+        assert!(!anthropic_models.contains("gpt-4o"));
+        assert_eq!(
+            anthropic_providers
+                .get("claude-3-5-sonnet-20241022")
+                .map(String::as_str),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn collect_models_by_protocol_empty_without_matching_accounts() {
+        let accounts = vec![test_account("anthropic", &["claude-opus-4"])];
+        let (models, providers) = collect_models_by_protocol(accounts, "openai");
+        assert!(models.is_empty());
+        assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn collect_models_by_protocol_deduplicates_models_across_accounts() {
+        // 同一协议下多个账号声明相同模型：列表去重，不产生重复条目
+        let accounts = vec![
+            test_account("openai", &["gpt-4o", "deepseek-chat"]),
+            test_account("openai", &["gpt-4o", "deepseek-chat"]),
+            test_account("openai", &["gpt-4o"]),
+        ];
+        let (models, providers) = collect_models_by_protocol(accounts, "openai");
+        assert_eq!(models.len(), 2);
+        assert!(models.contains("gpt-4o"));
+        assert!(models.contains("deepseek-chat"));
+        assert_eq!(providers.get("gpt-4o").map(String::as_str), Some("openai"));
+        assert_eq!(providers.len(), 2);
     }
 }

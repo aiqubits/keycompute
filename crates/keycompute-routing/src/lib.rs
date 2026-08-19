@@ -215,8 +215,17 @@ impl RoutingEngine {
         }
 
         // Layer1: 模型路由 - 选择 provider 排序
+        // 入口协议隔离：Anthropic 入站（带原生请求体）只从 anthropic 协议账号选路，
+        // OpenAI 兼容入站只从 openai 协议账号选路；本协议下无可用账号时直接失败，
+        // 不跨协议兜底（避免原生 Anthropic 字段在协议转换中丢失，或 OpenAI 请求
+        // 意外落到 Anthropic 上游）。
+        let entry_protocol = if ctx.native_anthropic_request.is_some() {
+            "anthropic"
+        } else {
+            "openai"
+        };
         let ranked_providers = self
-            .rank_providers(&ctx.model, &ctx.pricing_snapshot)
+            .rank_providers(&ctx.model, &ctx.pricing_snapshot, entry_protocol)
             .await?;
 
         tracing::info!(
@@ -287,20 +296,32 @@ impl RoutingEngine {
     /// 注意：暂时不过滤不健康的 Provider，所有 Provider 都参与路由
     /// 评分规则：所有指标统一为"越高越不优先"，最终分数越低越优先
     /// 综合评分 = weighted_average + unhealthy_penalty
-    async fn rank_providers(&self, _model: &str, pricing: &PricingSnapshot) -> Result<Vec<String>> {
+    ///
+    /// 入口协议隔离：候选 Provider 仅限入口协议本身（openai / anthropic），
+    /// 不跨协议兜底；本协议未配置账号时返回空列表，由 route 报 RoutingFailed
+    async fn rank_providers(
+        &self,
+        _model: &str,
+        pricing: &PricingSnapshot,
+        entry_protocol: &str,
+    ) -> Result<Vec<String>> {
         // 注意：暂时不过滤不健康的 Provider，所有 Provider 都参与路由
         // 健康状态仅用于评分排序，不用于过滤
         let _healthy_providers = self.provider_health.healthy_providers(&self.providers);
 
-        // 使用所有 Provider 参与路由
-        let candidates = &self.providers;
+        // 候选 Provider 仅限入口协议本身
+        let candidates: Vec<&String> = self
+            .providers
+            .iter()
+            .filter(|p| p.eq_ignore_ascii_case(entry_protocol))
+            .collect();
 
         // 计算每个 Provider 的综合评分
         let mut scored_providers: Vec<(String, f64)> = candidates
             .iter()
             .map(|p| {
                 let score = self.score_provider(p, pricing);
-                (p.clone(), score)
+                ((*p).clone(), score)
             })
             .collect();
 
@@ -832,6 +853,105 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_route_openai_entry_selects_openai_only() {
+        // openai 入口（无原生 Anthropic 请求体）只从 openai 协议选账号，
+        // 即使引擎同时注册了其他协议也不跨协议路由。
+        // openai 不排首位：若入口隔离被移除，primary 会落到排首的 deepseek，测试即失败。
+        let account_states = Arc::new(AccountStateStore::new());
+        let provider_health = Arc::new(ProviderHealthStore::new());
+        let providers = vec![
+            "deepseek".to_string(),
+            "openai".to_string(),
+            "claude".to_string(),
+            "gemini".to_string(),
+        ];
+        let engine = RoutingEngine::new(account_states, provider_health, providers);
+        let ctx = create_test_context();
+
+        let plan = engine.route(&ctx).await.unwrap();
+        match &plan.primary {
+            ExecutionTarget::ProviderAccount { provider, .. } => {
+                assert_eq!(provider, "openai");
+            }
+            ExecutionTarget::Node { .. } => panic!("Expected ProviderAccount variant in test"),
+        }
+        // 无数据库时 select_fallback_account 只生成 1 个 target，fallback 链
+        // 必然为空。fallback 链的协议隔离由 rank_providers 的过滤保证（见
+        // test_rank_providers_filters_by_entry_protocol），此处显式断言空链，
+        // 避免先前空循环断言形同虚设。
+        assert!(plan.fallback_chain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_route_anthropic_entry_selects_anthropic_only() {
+        // anthropic 入口（带原生请求体）只从 anthropic 协议选账号，
+        // 即使 openai 协议也在候选注册表中
+        let account_states = Arc::new(AccountStateStore::new());
+        let provider_health = Arc::new(ProviderHealthStore::new());
+        let providers = vec!["openai".to_string(), "anthropic".to_string()];
+        let engine = RoutingEngine::new(account_states, provider_health, providers);
+
+        let mut ctx = create_test_context();
+        ctx.native_anthropic_request = Some(Arc::new(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        })));
+
+        let plan = engine.route(&ctx).await.unwrap();
+        match &plan.primary {
+            ExecutionTarget::ProviderAccount { provider, .. } => {
+                assert_eq!(provider, "anthropic");
+            }
+            ExecutionTarget::Node { .. } => panic!("Expected ProviderAccount variant in test"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_route_anthropic_entry_fails_without_anthropic_accounts() {
+        // 本协议未配置账号时不跨协议兜底，直接路由失败
+        let engine = create_test_engine(); // providers 不含 anthropic
+        let mut ctx = create_test_context();
+        ctx.native_anthropic_request = Some(Arc::new(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        })));
+
+        let err = engine.route(&ctx).await.unwrap_err();
+        assert!(matches!(err, KeyComputeError::RoutingFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_rank_providers_filters_by_entry_protocol() {
+        // 候选 Provider 仅限入口协议本身：fallback 链隔离的根源是
+        // rank_providers 的过滤，而非账号选择阶段
+        let account_states = Arc::new(AccountStateStore::new());
+        let provider_health = Arc::new(ProviderHealthStore::new());
+        let providers = vec![
+            "deepseek".to_string(),
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "claude".to_string(),
+        ];
+        let engine = RoutingEngine::new(account_states, provider_health, providers);
+        let pricing = PricingSnapshot {
+            model_name: "gpt-4o".to_string(),
+            currency: "CNY".to_string(),
+            input_price_per_1k: Decimal::from(1),
+            output_price_per_1k: Decimal::from(2),
+        };
+
+        let openai_ranked = engine
+            .rank_providers("gpt-4o", &pricing, "openai")
+            .await
+            .unwrap();
+        assert_eq!(openai_ranked, vec!["openai".to_string()]);
+
+        let anthropic_ranked = engine
+            .rank_providers("gpt-4o", &pricing, "anthropic")
+            .await
+            .unwrap();
+        assert_eq!(anthropic_ranked, vec!["anthropic".to_string()]);
+    }
+
     #[test]
     fn test_score_provider() {
         let engine = create_test_engine();
@@ -1030,6 +1150,44 @@ mod tests {
         }
 
         // 应该没有 fallback
+        assert!(plan.fallback_chain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_route_node_model_ignores_entry_protocol_isolation() {
+        // node 模型走 node 路由分支，不受入口协议隔离影响；对应 debug_routing
+        // 的 entry=anthropic + node: 模型组合（哨兵 body 仅让 route() 判定入口协议，
+        // node 分支在协议判定之前返回）。
+        let account_states = Arc::new(AccountStateStore::new());
+        let provider_health = Arc::new(ProviderHealthStore::new());
+        let pool = DbRouter::single(DatabaseConnection::Disconnected);
+        let providers = vec!["openai".to_string()];
+        let node_index = Arc::new(MockNodeIndex {
+            ready_models: vec!["deepseek-chat".to_string()],
+        });
+        let engine = RoutingEngine::with_node_index(
+            account_states,
+            provider_health,
+            pool,
+            providers,
+            node_index,
+        );
+
+        let mut ctx = create_test_context();
+        ctx.model = "node:deepseek-chat".to_string();
+        ctx.stream = false;
+        // anthropic 入口（debug_routing entry=anthropic 注入的哨兵 body）
+        ctx.native_anthropic_request = Some(Arc::new(serde_json::json!({ "messages": [] })));
+
+        let plan = engine.route(&ctx).await.unwrap();
+        match &plan.primary {
+            ExecutionTarget::Node { model } => {
+                assert_eq!(model, "deepseek-chat");
+            }
+            ExecutionTarget::ProviderAccount { .. } => {
+                panic!("Expected Node variant");
+            }
+        }
         assert!(plan.fallback_chain.is_empty());
     }
 
@@ -1245,6 +1403,32 @@ mod tests {
                 "https://low.example.com/v1",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_select_best_accounts_empty_when_all_cooling() {
+        // 全部账号冷却时返回空 targets，route() 据此报 RoutingFailed（不跨协议兜底）；
+        // 冷却耗尽是"账号池临时不可用"的一种来源，验证空结果语义而非静默选错账号
+        let account_states = Arc::new(AccountStateStore::new());
+        let provider_health = Arc::new(ProviderHealthStore::new());
+        let engine = RoutingEngine::new(
+            account_states.clone(),
+            provider_health,
+            vec!["openai".to_string()],
+        );
+        let accounts = vec![
+            create_test_account("openai", "https://high.example.com/v1", 100),
+            create_test_account("openai", "https://low.example.com/v1", 1),
+        ];
+        for account in &accounts {
+            account_states.set_cooldown(account.id, 60);
+        }
+
+        let targets = engine
+            .select_best_accounts("openai", accounts)
+            .await
+            .unwrap();
+        assert!(targets.is_empty());
     }
 
     #[tokio::test]

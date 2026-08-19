@@ -7,10 +7,11 @@
 
 use client_api::api::openai::ModelInfo;
 
-/// Anthropic 示例的默认模型：模型列表中无 Claude 模型时的回退值。
-/// 与后端 Anthropic 协议测试与文档中广泛使用的命名保持一致。
+/// Anthropic 示例的默认模型：列表中没有 Anthropic 兼容模型时显示的空模型。
+/// 与后端 openai 接口的空模型占位一致（见 server list_models 的 model-empty），
+/// 提示用户该模型不可用、需自行替换为实际可用的模型。
 /// `pub`：供视图层把模型名代入翻译文案（见 list.rs 的 example_note_anthropic）。
-pub const DEFAULT_CLAUDE_MODEL: &str = "claude-3-5-sonnet-20241022";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "model-empty";
 
 /// 一套四种示例文本（env / python / node / curl）
 pub struct ApiExamples {
@@ -174,13 +175,16 @@ pub fn pick_sample_model(models: &[ModelInfo]) -> String {
 }
 
 /// 从模型列表中选取 Anthropic 示例模型：优先第一个 Claude 模型
-/// （大小写不敏感），列表中没有 Claude 模型时回退默认值。
-pub fn pick_claude_model(models: &[ModelInfo]) -> String {
+/// （大小写不敏感）；列表中没有 Claude 模型时取列表中第一个
+/// Anthropic 兼容模型；列表为空时显示空模型
+/// （DEFAULT_ANTHROPIC_MODEL，与 openai 空模型一致），提示用户不可用。
+pub fn pick_anthropic_model(models: &[ModelInfo]) -> String {
     models
         .iter()
         .map(|model| model.id.clone())
         .find(|id| id.to_lowercase().starts_with("claude"))
-        .unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.to_string())
+        .or_else(|| models.first().map(|model| model.id.clone()))
+        .unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_string())
 }
 
 #[cfg(test)]
@@ -294,22 +298,31 @@ mod tests {
     }
 
     #[test]
-    fn pick_claude_model_prefers_first_claude_case_insensitive() {
+    fn pick_anthropic_model_prefers_first_claude_case_insensitive() {
         let models = [
             model("deepseek-chat"),
             model("Claude-3-5-Sonnet"),
             model("claude-3-opus"),
         ];
-        assert_eq!(pick_claude_model(&models), "Claude-3-5-Sonnet");
+        assert_eq!(pick_anthropic_model(&models), "Claude-3-5-Sonnet");
     }
 
     #[test]
-    fn pick_claude_model_falls_back_when_no_claude_listed() {
+    fn pick_anthropic_model_falls_back_to_first_model_when_no_claude() {
+        // 列表非空但无 Claude 模型时，示例取列表中第一个 Anthropic 兼容模型
         assert_eq!(
-            pick_claude_model(&[model("deepseek-chat"), model("gpt-4o")]),
-            "claude-3-5-sonnet-20241022"
+            pick_anthropic_model(&[model("deepseek-chat"), model("gpt-4o")]),
+            "deepseek-chat"
         );
-        assert_eq!(pick_claude_model(&[]), "claude-3-5-sonnet-20241022");
+        assert_eq!(
+            pick_anthropic_model(&[model("deepseek-v4-flash")]),
+            "deepseek-v4-flash"
+        );
+    }
+
+    #[test]
+    fn pick_anthropic_model_uses_empty_model_when_list_empty() {
+        assert_eq!(pick_anthropic_model(&[]), DEFAULT_ANTHROPIC_MODEL);
     }
 
     #[test]

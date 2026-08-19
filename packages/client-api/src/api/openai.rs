@@ -32,8 +32,28 @@ impl OpenAiApi {
     }
 
     /// 获取模型列表
+    ///
+    /// 不指定协议，网关按 openai 入口过滤模型（见 `list_models_for_protocol`）。
     pub async fn list_models(&self, api_key: &str) -> Result<ModelListResponse> {
-        self.client.get_json("/v1/models", api_key).await
+        self.list_models_for_protocol(api_key, None).await
+    }
+
+    /// 按入口协议获取模型列表（keycompute 网关扩展）
+    ///
+    /// `protocol` 为 `openai` / `anthropic`：网关只返回该协议账号声明的模型，
+    /// 与入口协议隔离路由保持一致；`None` 时网关缺省按 openai 入口过滤。
+    /// 协议名作为 query 值拼接前做 URL 编码（协议名受限于代码内固定取值，
+    /// 编码为防御性措施，防特殊字符破坏 query 结构）。
+    pub async fn list_models_for_protocol(
+        &self,
+        api_key: &str,
+        protocol: Option<&str>,
+    ) -> Result<ModelListResponse> {
+        let path = match protocol {
+            Some(p) => format!("/v1/models?protocol={}", urlencoding::encode(p)),
+            None => "/v1/models".to_string(),
+        };
+        self.client.get_json(&path, api_key).await
     }
 
     /// 获取模型详情

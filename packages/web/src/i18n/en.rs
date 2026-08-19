@@ -278,7 +278,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("api_keys.example_node_anthropic", "Anthropic SDK (Node.js)");
     m.insert(
         "api_keys.example_note_anthropic",
-        "Tip: the Anthropic examples call the /v1/messages endpoint; the example model is the first Claude model in the list, falling back to {model} if none is listed.",
+        "Tip: the Anthropic examples call the /v1/messages endpoint; the example model prefers the first Claude model in the list, otherwise the first listed model; if the list is empty, {model} is a non-callable placeholder, please replace it with a real model.",
     );
     m.insert("api_keys.copy", "Copy");
     m.insert("api_keys.copy_hint", "Click to copy");

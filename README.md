@@ -320,7 +320,8 @@ curl http://localhost:3000/v1/chat/completions \
     "stream": true
   }'
 
-# List available models
+# List available models (defaults to the openai ingress protocol)
+# Pass ?protocol=anthropic to list anthropic-protocol models instead
 curl http://localhost:3000/v1/models \
   -H "Authorization: Bearer sk-xxx"
 ```

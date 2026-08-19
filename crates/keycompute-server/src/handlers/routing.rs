@@ -13,6 +13,7 @@ use axum::{
 };
 use keycompute_types::{ExecutionTarget, RequestContext};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// 从 ExecutionTarget 提取路由目标信息
@@ -37,6 +38,10 @@ fn extract_target_info(target: &ExecutionTarget) -> Option<RoutingTargetInfo> {
 pub struct RoutingDebugQuery {
     /// 模型名称
     pub model: String,
+    /// 入口协议（openai / anthropic），默认 openai；
+    /// 用于按入口协议隔离模拟路由（Anthropic 入口只从 anthropic 协议选路）
+    #[serde(default)]
+    pub entry: Option<String>,
 }
 
 /// 路由目标信息
@@ -95,6 +100,41 @@ pub struct PricingInfo {
     pub output_price_per_1k: String,
 }
 
+/// 按 debug 查询的 entry 参数模拟入口协议（与真实 handler 行为一致）：
+/// `entry=anthropic`（大小写不敏感）时设置原生 Anthropic 请求体，使
+/// route() 按 anthropic 协议隔离选路；其余取值（含缺省）保持 openai。
+///
+/// 提取为纯函数便于单元测试：handler 级测试需构造完整 AppState，
+/// 成本高且不必要。
+///
+/// 注意：此处注入的哨兵 body（空 messages）仅用于让 route() 判定入口
+/// 协议；route() 当前只检查 native_anthropic_request 是否存在、不解析
+/// 内容。若将来 route() 开始读取请求体，此哨兵必须替换为真实结构。
+fn apply_debug_entry_protocol(ctx: &mut RequestContext, entry: Option<&str>) {
+    if entry.is_some_and(|e| e.eq_ignore_ascii_case("anthropic")) {
+        ctx.native_anthropic_request = Some(Arc::new(serde_json::json!({ "messages": [] })));
+    }
+}
+
+/// 路由失败时的诊断提示文案（区分 node 模型与普通模型的排查路径）。
+///
+/// NoReadyNode 与 RoutingFailed 的排查路径不同：node 模型看节点是否
+/// 在线，普通模型看账号/Provider 配置，提示需区分。提取为纯函数便于
+/// 单元测试。
+fn routing_debug_failure_message(model: &str) -> String {
+    if model.starts_with("node:") {
+        format!(
+            "模型 '{}' 暂时没有在线节点。请检查：1) 节点是否已注册并在线；2) 节点会话是否有效。",
+            model
+        )
+    } else {
+        format!(
+            "模型 '{}' 没有可用的路由目标。请检查：1) 是否已配置对应 Provider 的账号；2) Provider 是否健康；3) 模型名称是否正确。",
+            model
+        )
+    }
+}
+
 /// 路由调试接口
 ///
 /// 模拟一个请求，返回路由决策结果（不实际执行）
@@ -125,6 +165,9 @@ pub async fn debug_routing(
         true,
         pricing.clone(),
     );
+
+    // 入口协议隔离：按 entry 参数模拟对应入口的路由（与真实 handler 行为一致）
+    apply_debug_entry_protocol(&mut ctx, query.entry.as_deref());
 
     // 3. 获取所有配置的 provider 列表
     let all_providers: Vec<String> = state.routing.configured_providers().to_vec();
@@ -230,8 +273,12 @@ pub async fn debug_routing(
 
             Ok(Json(response))
         }
-        Err(keycompute_types::KeyComputeError::RoutingFailed(_)) => {
+        Err(
+            keycompute_types::KeyComputeError::RoutingFailed(_)
+            | keycompute_types::KeyComputeError::NoReadyNode(_),
+        ) => {
             // 路由失败，但仍返回诊断信息
+            let message = routing_debug_failure_message(&query.model);
             let response = RoutingDebugResponse {
                 request_id: ctx.request_id,
                 routed: false,
@@ -244,10 +291,7 @@ pub async fn debug_routing(
                     output_price_per_1k: pricing.output_price_per_1k.to_string(),
                 },
                 provider_status,
-                message: Some(format!(
-                    "模型 '{}' 没有可用的路由目标。请检查：1) 是否已配置对应 Provider 的账号；2) Provider 是否健康；3) 模型名称是否正确。",
-                    query.model
-                )),
+                message: Some(message),
             };
 
             tracing::warn!(
@@ -374,9 +418,65 @@ mod tests {
 
     #[test]
     fn test_routing_debug_query_deserialize() {
+        // 缺失 entry 时默认 None（按 openai 协议模拟）
         let json = r#"{"model": "gpt-4o"}"#;
         let query: RoutingDebugQuery = serde_json::from_str(json).unwrap();
         assert_eq!(query.model, "gpt-4o");
+        assert!(query.entry.is_none());
+
+        // entry 显式指定入口协议
+        let json = r#"{"model": "gpt-4o", "entry": "anthropic"}"#;
+        let query: RoutingDebugQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.entry.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn apply_debug_entry_protocol_sets_native_request_only_for_anthropic() {
+        let make_ctx = || {
+            RequestContext::new(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "gpt-4o".to_string(),
+                vec![],
+                true,
+                keycompute_types::PricingSnapshot::default(),
+            )
+        };
+
+        // 缺省或 openai：保持 openai 入口（不设置原生请求体）
+        let mut ctx = make_ctx();
+        apply_debug_entry_protocol(&mut ctx, None);
+        assert!(ctx.native_anthropic_request.is_none());
+        let mut ctx = make_ctx();
+        apply_debug_entry_protocol(&mut ctx, Some("openai"));
+        assert!(ctx.native_anthropic_request.is_none());
+        let mut ctx = make_ctx();
+        apply_debug_entry_protocol(&mut ctx, Some("unknown"));
+        assert!(ctx.native_anthropic_request.is_none());
+
+        // anthropic（大小写不敏感）：模拟 anthropic 入口
+        let mut ctx = make_ctx();
+        apply_debug_entry_protocol(&mut ctx, Some("anthropic"));
+        assert!(ctx.native_anthropic_request.is_some());
+        let mut ctx = make_ctx();
+        apply_debug_entry_protocol(&mut ctx, Some("ANTHROPIC"));
+        assert!(ctx.native_anthropic_request.is_some());
+    }
+
+    #[test]
+    fn routing_debug_failure_message_distinguishes_node_models() {
+        // node 模型：提示检查节点在线状态
+        let node_msg = routing_debug_failure_message("node:llama3");
+        assert!(node_msg.contains("node:llama3"));
+        assert!(node_msg.contains("在线节点"));
+        assert!(!node_msg.contains("路由目标"));
+
+        // 普通模型：提示检查账号/Provider 配置
+        let model_msg = routing_debug_failure_message("gpt-4o");
+        assert!(model_msg.contains("gpt-4o"));
+        assert!(model_msg.contains("路由目标"));
+        assert!(!model_msg.contains("在线节点"));
     }
 
     #[test]

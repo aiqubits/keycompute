@@ -1,5 +1,5 @@
 use super::examples::{
-    DEFAULT_CLAUDE_MODEL, anthropic_examples, openai_examples, pick_claude_model, pick_sample_model,
+    anthropic_examples, openai_examples, pick_anthropic_model, pick_sample_model,
 };
 use crate::hooks::use_i18n::use_i18n;
 use crate::services::{api_client::with_auto_refresh, api_key_service, model_service};
@@ -48,8 +48,13 @@ pub fn ApiKeyList() -> Element {
     let mut example_protocol = use_signal(|| "openai".to_string());
     let create_failed = i18n.t("api_keys.create_failed");
 
-    // 获取模型列表（用于显示用法示例）
-    let models = use_resource(move || async move { model_service::list_models().await.ok() });
+    // 获取模型列表（用于显示用法示例）：按当前示例协议拉取，
+    // 与入口协议隔离保持一致（OpenAI 示例只展示 openai 协议模型，
+    // Anthropic 示例展示 anthropic 协议模型）。
+    let models = use_resource(move || {
+        let protocol = example_protocol();
+        async move { model_service::list_models(&protocol).await.ok() }
+    });
 
     // 拉取 key 列表
     let mut keys = use_resource(move || async move {
@@ -166,7 +171,14 @@ pub fn ApiKeyList() -> Element {
                         })
                         .unwrap_or_default();
 
-                    if available_models.is_empty() {
+                    let sample_model = pick_sample_model(&available_models);
+                    let selected_tab = example_tab();
+                    let is_anthropic = example_protocol() == "anthropic";
+                    // 列表为空时的兜底示例模型：仅 openai 协议注入 deepseek-chat；
+                    // anthropic 协议下不注入 openai 协议模型（示例回落到不可用的
+                    // model-empty 占位，文案已提示用户自行替换），避免在 Anthropic 视图
+                    // 展示 openai 协议模型造成误导。
+                    if available_models.is_empty() && !is_anthropic {
                         available_models = vec![
                             client_api::api::openai::ModelInfo {
                                 id: "deepseek-chat".to_string(),
@@ -176,16 +188,13 @@ pub fn ApiKeyList() -> Element {
                             },
                         ];
                     }
-                    let sample_model = pick_sample_model(&available_models);
-                    let selected_tab = example_tab();
-                    let is_anthropic = example_protocol() == "anthropic";
-                    let claude_model = pick_claude_model(&available_models);
+                    let anthropic_model = pick_anthropic_model(&available_models);
 
                     let examples = if is_anthropic {
                         anthropic_examples(
                             &api_root,
                             &key,
-                            &claude_model,
+                            &anthropic_model,
                             i18n.t("api_keys.example_env_comment"),
                         )
                     } else {
@@ -199,13 +208,12 @@ pub fn ApiKeyList() -> Element {
 
                     let example_text = examples.for_tab(&selected_tab).to_string();
                     // 预先计算 anthropic 提示文案（含模型名参数），避免在 rsx 内嵌多行表达式节点。
-                    // 注意：{model} 参数是文案中"列表无 Claude 时回退"的默认模型，与示例实际使用的
-                    // claude_model（列表第一个 Claude 模型）语义不同；列表含 Claude 时两者必然不同，
-                    // 属预期行为，勿改为传入 claude_model。
+                    // {model} 参数与示例实际使用的 anthropic_model 保持一致：列表为空时
+                    // anthropic_model 即空模型，文案与示例不会出现矛盾。
                     let anthropic_note = i18n
                         .t_with_args(
                             "api_keys.example_note_anthropic",
-                            &[("model", DEFAULT_CLAUDE_MODEL)],
+                            &[("model", anthropic_model.as_str())],
                         );
                     let copied_label = i18n.t("api_keys.copied");
                     let copy_hint = i18n.t("api_keys.copy_hint");

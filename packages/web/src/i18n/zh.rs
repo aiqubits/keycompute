@@ -254,7 +254,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     );
     m.insert(
         "api_keys.example_note_anthropic",
-        "提示：Anthropic 示例调用 /v1/messages 接口；示例模型取列表中第一个 Claude 模型，若列表中没有 Claude 模型则默认使用 {model}。",
+        "提示：Anthropic 示例调用 /v1/messages 接口；示例模型优先取列表中第一个 Claude 模型，无 Claude 时取列表第一个模型；若列表为空，示例中的 {model} 为不可用占位，请替换为实际可用的模型。",
     );
     m.insert("api_keys.copy", "复制");
     m.insert("api_keys.copy_hint", "点击复制");

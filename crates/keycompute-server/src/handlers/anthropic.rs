@@ -190,7 +190,7 @@ pub async fn messages(
         .routing
         .route(&ctx)
         .await
-        .map_err(|e| ApiError::Internal(format!("Routing failed: {e}")))?;
+        .map_err(|e| crate::error::map_routing_error(e, "anthropic"))?;
 
     let (primary_provider, primary_account_id) = match &plan.primary {
         ExecutionTarget::ProviderAccount {
@@ -236,7 +236,7 @@ pub async fn messages(
     )
     .await
     {
-        Ok(result) => result.map_err(|e| ApiError::Internal(format!("Execution failed: {e}")))?,
+        Ok(result) => result.map_err(crate::error::map_execution_error)?,
         Err(_) => {
             return Err(ApiError::Internal(format!(
                 "Gateway execute timeout after {}s",

@@ -3,7 +3,7 @@
 use client_api::api::openai::{ChatCompletionRequest, Message, OpenAiApi};
 use client_api::client::OpenAiClient;
 use client_api::config::ClientConfig;
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// 创建 OpenAI 测试客户端
@@ -152,6 +152,39 @@ async fn test_list_models_success() {
     assert_eq!(models.data.len(), 3);
     assert_eq!(models.data[0].id, "gpt-4");
     assert_eq!(models.data[1].id, "gpt-3.5-turbo");
+}
+
+#[tokio::test]
+async fn test_list_models_by_protocol_success() {
+    let (client, mock_server) = create_openai_test_client().await;
+    let openai_api = OpenAiApi::new(&client);
+
+    // 网关扩展：按入口协议过滤模型（与入口协议隔离路由保持一致）
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(query_param("protocol", "anthropic"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "claude-3-5-sonnet-20241022",
+                    "object": "model",
+                    "created": 1729680000,
+                    "owned_by": "anthropic"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let result = openai_api
+        .list_models_for_protocol("sk-test-api-key", Some("anthropic"))
+        .await;
+
+    assert!(result.is_ok());
+    let models = result.unwrap();
+    assert_eq!(models.data.len(), 1);
+    assert_eq!(models.data[0].id, "claude-3-5-sonnet-20241022");
 }
 
 #[tokio::test]
