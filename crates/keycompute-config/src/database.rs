@@ -39,7 +39,7 @@ const fn default_read_min_connections() -> u32 {
 
 /// 默认读库连接超时
 const fn default_read_connect_timeout() -> u64 {
-    30
+    5
 }
 
 /// 默认读库空闲超时
@@ -192,6 +192,6 @@ mod tests {
         let config = DatabaseReadConfig::default();
         assert_eq!(config.max_connections, 10);
         assert_eq!(config.min_connections, 1);
-        assert_eq!(config.connect_timeout_secs, 30);
+        assert_eq!(config.connect_timeout_secs, 5);
     }
 }

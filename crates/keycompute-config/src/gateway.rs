@@ -6,6 +6,15 @@ use std::collections::HashMap;
 /// Gateway 配置
 #[derive(Debug, Deserialize, Clone)]
 pub struct GatewayConfig {
+    /// Maximum raw monitoring query range in hours.
+    #[serde(default = "default_monitoring_raw_max_hours")]
+    pub monitoring_raw_max_hours: u32,
+    /// 自动 Provider Account 探测间隔（秒）；0 表示禁用，避免默认产生上游费用。
+    #[serde(default)]
+    pub account_probe_interval_secs: u64,
+    /// 自动 Provider Account 探测并发数。
+    #[serde(default = "default_account_probe_concurrency")]
+    pub account_probe_concurrency: usize,
     /// 最大重试次数
     pub max_retries: u32,
     /// 请求超时时间（秒）
@@ -16,21 +25,8 @@ pub struct GatewayConfig {
     pub request_timeout_secs: u64,
     /// 流式请求超时（秒）
     pub stream_timeout_secs: u64,
-    /// 重试策略配置
-    pub retry: RetryConfig,
     /// HTTP 代理配置（可选）
     pub proxy: Option<ProxyConfig>,
-}
-
-/// 重试策略配置
-#[derive(Debug, Deserialize, Clone)]
-pub struct RetryConfig {
-    /// 初始退避时间（毫秒）
-    pub initial_backoff_ms: u64,
-    /// 最大退避时间（毫秒）
-    pub max_backoff_ms: u64,
-    /// 退避倍数
-    pub backoff_multiplier: f64,
 }
 
 /// HTTP 代理配置
@@ -50,39 +46,25 @@ pub struct ProxyConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
+            monitoring_raw_max_hours: default_monitoring_raw_max_hours(),
+            account_probe_interval_secs: 0,
+            account_probe_concurrency: default_account_probe_concurrency(),
             max_retries: 3,
             timeout_secs: 120,
             enable_fallback: true,
             request_timeout_secs: 120,
             stream_timeout_secs: 600,
-            retry: RetryConfig::default(),
             proxy: None,
         }
     }
 }
 
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            initial_backoff_ms: 100,
-            max_backoff_ms: 10000,
-            backoff_multiplier: 2.0,
-        }
-    }
+fn default_monitoring_raw_max_hours() -> u32 {
+    24
 }
 
-impl RetryConfig {
-    /// 计算第 n 次重试的退避时间（毫秒）
-    pub fn backoff_ms(&self, attempt: u32) -> u64 {
-        if attempt == 0 {
-            return 0;
-        }
-
-        let backoff = (self.initial_backoff_ms as f64
-            * self.backoff_multiplier.powi((attempt - 1) as i32)) as u64;
-
-        backoff.min(self.max_backoff_ms)
-    }
+fn default_account_probe_concurrency() -> usize {
+    4
 }
 
 #[cfg(test)]
@@ -94,17 +76,11 @@ mod tests {
         let config = GatewayConfig::default();
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.timeout_secs, 120);
+        assert_eq!(config.monitoring_raw_max_hours, 24);
+        assert_eq!(config.account_probe_interval_secs, 0);
+        assert_eq!(config.account_probe_concurrency, 4);
         assert!(config.enable_fallback);
         assert!(config.proxy.is_none());
-    }
-
-    #[test]
-    fn test_retry_backoff() {
-        let retry = RetryConfig::default();
-        assert_eq!(retry.backoff_ms(0), 0);
-        assert_eq!(retry.backoff_ms(1), 100);
-        assert_eq!(retry.backoff_ms(2), 200);
-        assert_eq!(retry.backoff_ms(3), 400);
     }
 
     #[test]

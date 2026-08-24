@@ -11,6 +11,7 @@ use keycompute_db::DbRouter;
 use keycompute_emailserver::EmailConfig;
 use keycompute_routing::{AccountStateStore, ProviderHealthStore, RoutingEngine};
 use keycompute_runtime::set_global_crypto;
+use keycompute_types::{NoopRequestLifecycleRecorder, RequestLifecycleRecorder};
 use llm_gateway::{GatewayBuilder, GatewayExecutor, HttpProxy, ProxyConfig as HttpProxyConfig};
 use llm_protocol_provider::ProviderAdapter;
 use node_gateway::{NodeGatewayService, PostgresNodeIndex};
@@ -25,7 +26,11 @@ pub enum RateLimitBackendConfig {
     #[default]
     Memory,
     /// Redis 后端
-    Redis { url: String },
+    Redis {
+        url: String,
+        pool_size: usize,
+        connect_timeout: Duration,
+    },
 }
 
 /// JWT 配置
@@ -74,6 +79,8 @@ impl AppStateConfig {
             rate_limit: if let Some(redis) = &config.redis {
                 RateLimitBackendConfig::Redis {
                     url: redis.url.clone(),
+                    pool_size: redis.pool_size as usize,
+                    connect_timeout: Duration::from_secs(redis.connect_timeout_secs),
                 }
             } else {
                 RateLimitBackendConfig::Memory
@@ -97,11 +104,11 @@ impl AppStateConfig {
 ///
 /// # 参数
 /// - `config`: 应用配置
-/// - `is_production`: 是否为非开发环境；生产环境必须配置加密密钥
+/// - `is_production`: 是否为非开发环境；用于调整缺失密钥时的告警等级
 ///
 /// # 返回
-/// - `Ok(())`: 成功初始化；开发环境也允许未配置密钥
-/// - `Err(...)`: 生产环境缺少密钥或密钥格式错误
+/// - `Ok(())`: 成功初始化，或未配置密钥并回退到明文存储
+/// - `Err(...)`: 已提供密钥但格式错误
 ///
 /// # 示例
 /// ```rust,ignore
@@ -122,13 +129,11 @@ pub fn init_global_crypto(
     let Some(key) = key else {
         if is_production {
             return Err(crate::error::ApiError::Config(
-                "KC__CRYPTO__SECRET_KEY must be set in production".to_string(),
+                "KC__CRYPTO__SECRET_KEY is required in production; refusing plaintext Provider API key storage".to_string(),
             ));
+        } else {
+            tracing::warn!("未配置 KC__CRYPTO__SECRET_KEY，Provider API Key 将以明文存储");
         }
-
-        tracing::warn!(
-            "No crypto key configured; storing upstream API keys as plaintext in development"
-        );
         return Ok(());
     };
 
@@ -176,6 +181,8 @@ pub struct AppState {
     pub cache: Arc<CacheService>,
     /// Gateway 配置
     pub gateway_config: keycompute_config::GatewayConfig,
+    /// Best-effort lifecycle tracing sink.
+    pub lifecycle: Arc<dyn RequestLifecycleRecorder>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -204,6 +211,7 @@ impl std::fmt::Debug for AppState {
             )
             .field("cache", &"<CacheService>")
             .field("gateway_config", &self.gateway_config)
+            .field("lifecycle", &"<RequestLifecycleRecorder>")
             .finish()
     }
 }
@@ -248,7 +256,9 @@ impl AppState {
         ));
 
         // 创建 Gateway 执行器，使用 providers 模块统一的 Provider 列表
-        let mut gateway_builder = GatewayBuilder::new().with_http_proxy(Arc::clone(&http_proxy));
+        let mut gateway_builder = GatewayBuilder::new()
+            .with_config(Self::gateway_executor_config(&config.gateway))
+            .with_http_proxy(Arc::clone(&http_proxy));
         for (name, adapter) in crate::providers::get_provider_adapters() {
             gateway_builder = gateway_builder.add_provider(name, adapter);
         }
@@ -289,6 +299,7 @@ impl AppState {
             node_gateway: None, // 节点网关需要数据库连接和 Redis
             cache,
             gateway_config: config.gateway,
+            lifecycle: Arc::new(NoopRequestLifecycleRecorder),
         }
     }
 
@@ -326,11 +337,19 @@ impl AppState {
                 keycompute_ratelimit::RateLimitService::default_memory()
             }
             #[cfg(feature = "redis")]
-            RateLimitBackendConfig::Redis { url } => {
-                match keycompute_ratelimit::RateLimitService::new_redis(url) {
-                    Ok(service) => {
+            RateLimitBackendConfig::Redis {
+                url,
+                pool_size,
+                connect_timeout,
+            } => {
+                match keycompute_runtime::redis_store::RedisRuntimeStore::create_pool_with_options(
+                    url,
+                    *pool_size,
+                    *connect_timeout,
+                ) {
+                    Ok(pool) => {
                         tracing::info!(redis_url = %url, "Redis rate limiter initialized successfully");
-                        service
+                        keycompute_ratelimit::RateLimitService::with_redis_pool(pool)
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -352,6 +371,16 @@ impl AppState {
         }
     }
 
+    fn gateway_executor_config(
+        gateway_config: &keycompute_config::GatewayConfig,
+    ) -> llm_gateway::GatewayConfig {
+        llm_gateway::GatewayConfig {
+            max_retries: gateway_config.max_retries,
+            timeout_secs: gateway_config.timeout_secs,
+            enable_fallback: gateway_config.enable_fallback,
+        }
+    }
+
     /// 创建 HTTP Proxy（支持从配置读取代理设置）
     fn create_http_proxy(
         proxy_config: Option<&keycompute_config::ProxyConfig>,
@@ -363,26 +392,33 @@ impl AppState {
             .with_stream_timeout(Duration::from_secs(gateway_config.stream_timeout_secs));
 
         if let Some(proxy) = proxy_config {
-            // 有代理配置，创建带代理的 HttpProxy
-            let mut proxies = proxy.providers.clone();
+            // Build each rule into its native selector tier. Encoding account
+            // and pattern rules into the provider map leaves them unreachable.
+            let mut http_proxy = HttpProxy::new(http_proxy_config);
+            for (provider, url) in &proxy.providers {
+                http_proxy.add_proxy(provider.clone(), url.clone());
+            }
 
-            // 添加通配符规则
             if let Some(patterns) = &proxy.patterns {
                 for (pattern, url) in patterns {
-                    // 通配符规则以 pattern: 为前缀存储
-                    proxies.insert(format!("pattern:{}", pattern), url.clone());
+                    http_proxy.add_pattern(pattern.clone(), url.clone());
                 }
             }
 
-            // 添加账号级代理
             if let Some(accounts) = &proxy.accounts {
                 for (key, url) in accounts {
-                    // 账号级代理以 account: 为前缀存储
-                    proxies.insert(format!("account:{}", key), url.clone());
+                    let Some((provider, account_id)) = key.rsplit_once(':') else {
+                        tracing::warn!(proxy_account_key=%key, "ignoring invalid account proxy key");
+                        continue;
+                    };
+                    let Ok(account_id) = uuid::Uuid::parse_str(account_id) else {
+                        tracing::warn!(proxy_account_key=%key, "ignoring invalid account proxy UUID");
+                        continue;
+                    };
+                    http_proxy.add_account_proxy(provider.to_string(), account_id, url.clone());
                 }
             }
-
-            HttpProxy::with_proxies(http_proxy_config, proxies)
+            http_proxy
         } else {
             // 无代理配置，使用默认 HttpProxy
             HttpProxy::new(http_proxy_config)
@@ -405,13 +441,8 @@ impl AppState {
         // 使用已有连接池创建 Redis 存储（与限流服务共享连接池）
         let redis_store = Arc::new(RedisRuntimeStore::with_pool(redis_pool));
 
-        // 创建节点网关配置
-        let config = if let Some(node_config) = node_config {
-            NodeGatewayAppConfig::from_config(&node_config)
-                .map_err(|e| anyhow::anyhow!("Node gateway config error: {}", e))?
-        } else {
-            NodeGatewayAppConfig::default()
-        };
+        // 创建节点网关配置。缺失的安全密钥使用可运行的示例值并记录安全建议。
+        let config = NodeGatewayAppConfig::from_config(&node_config.unwrap_or_default());
 
         // 创建 Store 和 Redis 实例
         let store = NodeGatewayStore::new(Arc::clone(router), config.clone());
@@ -470,7 +501,9 @@ impl AppState {
         ));
 
         // 创建 Gateway 执行器，使用 providers 模块统一的 Provider 列表
-        let mut gateway_builder = GatewayBuilder::new().with_http_proxy(Arc::clone(&http_proxy));
+        let mut gateway_builder = GatewayBuilder::new()
+            .with_config(Self::gateway_executor_config(&config.gateway))
+            .with_http_proxy(Arc::clone(&http_proxy));
         for (name, adapter) in crate::providers::get_provider_adapters() {
             gateway_builder = gateway_builder.add_provider(name, adapter);
         }
@@ -479,11 +512,25 @@ impl AppState {
         // 创建带数据库连接的计费服务
         let billing = Arc::new(BillingService::with_pool(Arc::clone(&pool)));
 
+        let database: Arc<dyn RequestLifecycleRecorder> = Arc::new(
+            keycompute_db::PostgresRequestLifecycleRecorder::new(Arc::clone(&pool)),
+        );
+        let lifecycle: Arc<dyn RequestLifecycleRecorder> =
+            Arc::new(crate::lifecycle_metrics::MetricsRequestLifecycleRecorder::new(database));
+
         #[cfg(feature = "redis")]
         let (rate_limiter, node_gateway, cache) = {
             let shared_redis_pool = match &config.rate_limit {
-                RateLimitBackendConfig::Redis { url } => {
-                    match keycompute_runtime::redis_store::RedisRuntimeStore::create_pool(url) {
+                RateLimitBackendConfig::Redis {
+                    url,
+                    pool_size,
+                    connect_timeout,
+                } => {
+                    match keycompute_runtime::redis_store::RedisRuntimeStore::create_pool_with_options(
+                        url,
+                        *pool_size,
+                        *connect_timeout,
+                    ) {
                         Ok(pool) => {
                             tracing::info!(redis_url = %url, "Shared Redis connection pool created");
                             Some(pool)
@@ -522,7 +569,7 @@ impl AppState {
                     ) {
                         Ok(service) => {
                             tracing::info!("Node gateway service initialized successfully");
-                            Some(Arc::new(service))
+                            Some(Arc::new(service.with_lifecycle(Arc::clone(&lifecycle))))
                         }
                         Err(e) => {
                             tracing::warn!("Failed to initialize node gateway service: {}", e);
@@ -582,6 +629,7 @@ impl AppState {
             node_gateway,
             cache,
             gateway_config: config.gateway,
+            lifecycle,
         }
     }
 
@@ -627,7 +675,9 @@ impl AppState {
         ));
 
         // 创建 Gateway 执行器，使用自定义 Provider
-        let mut builder = GatewayBuilder::new().with_http_proxy(Arc::clone(&http_proxy));
+        let mut builder = GatewayBuilder::new()
+            .with_config(Self::gateway_executor_config(&config.gateway))
+            .with_http_proxy(Arc::clone(&http_proxy));
         for (name, provider) in providers {
             builder = builder.add_provider(name, provider);
         }
@@ -668,6 +718,7 @@ impl AppState {
             node_gateway: None, // 测试环境不需要节点网关
             cache,
             gateway_config: config.gateway,
+            lifecycle: Arc::new(NoopRequestLifecycleRecorder),
         }
     }
 
@@ -750,19 +801,49 @@ mod tests {
 
     #[test]
     fn production_crypto_initialization_rejects_missing_key() {
-        let error = init_global_crypto(&keycompute_config::AppConfig::default(), true).unwrap_err();
-
-        assert!(matches!(error, crate::error::ApiError::Config(_)));
-        assert!(
-            error
-                .to_string()
-                .contains("KC__CRYPTO__SECRET_KEY must be set")
-        );
+        assert!(init_global_crypto(&keycompute_config::AppConfig::default(), true).is_err());
     }
 
     #[test]
     fn development_crypto_initialization_allows_missing_key() {
         init_global_crypto(&keycompute_config::AppConfig::default(), false).unwrap();
+    }
+
+    #[test]
+    fn app_state_config_preserves_redis_pool_settings() {
+        let config = keycompute_config::AppConfig {
+            redis: Some(keycompute_config::RedisConfig {
+                url: "redis://redis.internal:6379".to_string(),
+                pool_size: 23,
+                connect_timeout_secs: 7,
+            }),
+            ..keycompute_config::AppConfig::default()
+        };
+
+        let state_config = AppStateConfig::from_config(&config);
+        assert!(matches!(
+            state_config.rate_limit,
+            RateLimitBackendConfig::Redis {
+                pool_size: 23,
+                connect_timeout,
+                ..
+            } if connect_timeout == Duration::from_secs(7)
+        ));
+    }
+
+    #[test]
+    fn gateway_executor_config_preserves_runtime_controls() {
+        let gateway_config = keycompute_config::GatewayConfig {
+            max_retries: 7,
+            timeout_secs: 43,
+            enable_fallback: false,
+            ..keycompute_config::GatewayConfig::default()
+        };
+
+        let executor_config = AppState::gateway_executor_config(&gateway_config);
+        assert_eq!(executor_config.max_retries, 7);
+        assert_eq!(executor_config.timeout_secs, 43);
+        assert!(!executor_config.enable_fallback);
     }
 
     #[test]

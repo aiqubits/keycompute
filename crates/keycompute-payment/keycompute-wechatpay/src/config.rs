@@ -34,33 +34,33 @@ const MAX_TIMEOUT_MINUTES: i32 = 15 * 24 * 60;
 impl WechatPayConfig {
     pub fn from_env() -> Result<Self, WechatPayConfigError> {
         Ok(Self {
-            appid: env("WECHATPAY_APP_ID", "KC__PAYMENT__WECHATPAY__APPID")?,
-            mchid: env("WECHATPAY_MCH_ID", "KC__PAYMENT__WECHATPAY__MCHID")?,
+            appid: env("KC__PAYMENT__WECHATPAY__APPID", "WECHATPAY_APP_ID")?,
+            mchid: env("KC__PAYMENT__WECHATPAY__MCHID", "WECHATPAY_MCH_ID")?,
             merchant_serial_no: env(
-                "WECHATPAY_MERCHANT_SERIAL_NO",
                 "KC__PAYMENT__WECHATPAY__MERCHANT_SERIAL_NO",
+                "WECHATPAY_MERCHANT_SERIAL_NO",
             )?,
             merchant_private_key: normalize_private_key(&env(
-                "WECHATPAY_MERCHANT_PRIVATE_KEY",
                 "KC__PAYMENT__WECHATPAY__MERCHANT_PRIVATE_KEY",
+                "WECHATPAY_MERCHANT_PRIVATE_KEY",
             )?),
-            api_v3_key: env("WECHATPAY_API_V3_KEY", "KC__PAYMENT__WECHATPAY__API_V3_KEY")?,
+            api_v3_key: env("KC__PAYMENT__WECHATPAY__API_V3_KEY", "WECHATPAY_API_V3_KEY")?,
             wechatpay_public_key_id: env(
-                "WECHATPAY_PUBLIC_KEY_ID",
                 "KC__PAYMENT__WECHATPAY__WECHATPAY_PUBLIC_KEY_ID",
+                "WECHATPAY_PUBLIC_KEY_ID",
             )?,
             wechatpay_public_key: normalize_public_key(&env(
-                "WECHATPAY_PUBLIC_KEY",
                 "KC__PAYMENT__WECHATPAY__WECHATPAY_PUBLIC_KEY",
+                "WECHATPAY_PUBLIC_KEY",
             )?),
             previous_callback_keys: parse_previous_callback_keys(env_optional(
-                "WECHATPAY_PREVIOUS_CALLBACK_KEYS_JSON",
                 "KC__PAYMENT__WECHATPAY__PREVIOUS_CALLBACK_KEYS_JSON",
+                "WECHATPAY_PREVIOUS_CALLBACK_KEYS_JSON",
             ))?,
-            notify_url: env("WECHATPAY_NOTIFY_URL", "KC__PAYMENT__WECHATPAY__NOTIFY_URL")?,
+            notify_url: env("KC__PAYMENT__WECHATPAY__NOTIFY_URL", "WECHATPAY_NOTIFY_URL")?,
             timeout_minutes: parse_timeout_minutes(env_optional(
-                "WECHATPAY_TIMEOUT_MINUTES",
                 "KC__PAYMENT__WECHATPAY__TIMEOUT_MINUTES",
+                "WECHATPAY_TIMEOUT_MINUTES",
             ))?,
         })
     }

@@ -311,6 +311,7 @@ async fn test_billing_triggers_distribution() {
     };
 
     let request_context = keycompute_types::RequestContext::new(
+        uuid::Uuid::new_v4(),
         user_id,
         tenant_id,
         produce_ai_key_id,

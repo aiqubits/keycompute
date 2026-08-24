@@ -2,8 +2,8 @@
 //!
 //! 数据库操作层，封装所有节点相关的数据库操作。
 
-use crate::config::NodeGatewayAppConfig;
-use chrono::Utc;
+use crate::{config::NodeGatewayAppConfig, trace::node_completion_finish};
+use chrono::{DateTime, Utc};
 use keycompute_db::DbError;
 use keycompute_db::DbRouter;
 use keycompute_db::models::{
@@ -18,11 +18,21 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
+const ACTIVE_NODE_SESSION_FOR_UPDATE_SQL: &str = "SELECT * FROM node_sessions WHERE id = $1 AND node_id = $2 \
+     AND revoked_at IS NULL AND expires_at > NOW() FOR UPDATE";
+
 /// Node Gateway Store
 #[derive(Clone)]
 pub struct NodeGatewayStore {
     pool: Arc<DbRouter>,
     config: NodeGatewayAppConfig,
+}
+
+pub(crate) struct NodeTaskCompletionOutcome {
+    pub(crate) response: NodeTaskCompleteResponse,
+    pub(crate) model: String,
+    pub(crate) is_new_task_transition: bool,
+    pub(crate) attempt_started_at: Option<DateTime<Utc>>,
 }
 
 impl NodeGatewayStore {
@@ -34,6 +44,73 @@ impl NodeGatewayStore {
     /// 获取 pool 引用
     pub fn pool(&self) -> &DbRouter {
         self.pool.as_ref()
+    }
+
+    pub(crate) fn pool_arc(&self) -> Arc<DbRouter> {
+        Arc::clone(&self.pool)
+    }
+
+    async fn rollback_trace_savepoint(
+        tx: &DatabaseTransaction,
+        savepoint: &str,
+        request_id: Uuid,
+        phase: &str,
+    ) -> bool {
+        let rollback = format!("ROLLBACK TO SAVEPOINT {savepoint}");
+        if let Err(error) = tx.execute_unprepared(&rollback).await {
+            tracing::error!(%request_id, phase, %error, "failed to roll back monitoring savepoint");
+            return false;
+        }
+        let release = format!("RELEASE SAVEPOINT {savepoint}");
+        if let Err(error) = tx.execute_unprepared(&release).await {
+            tracing::error!(%request_id, phase, %error, "failed to release rolled-back monitoring savepoint");
+            return false;
+        }
+        true
+    }
+
+    async fn mark_node_trace_partial_savepoint(
+        tx: &DatabaseTransaction,
+        request_id: Uuid,
+        phase: &str,
+    ) {
+        const SAVEPOINT: &str = "monitoring_trace_partial";
+        if let Err(error) = tx
+            .execute_unprepared("SAVEPOINT monitoring_trace_partial")
+            .await
+        {
+            tracing::warn!(%request_id, phase, %error, "failed to create degraded trace savepoint");
+            return;
+        }
+        let result = async {
+            tx.execute_unprepared("SET LOCAL statement_timeout = '250ms'")
+                .await?;
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE gateway_requests SET trace_quality='partial',updated_at=NOW() WHERE request_id=$1",
+                [request_id.into()],
+            ))
+            .await?;
+            tx.execute_unprepared("SET LOCAL statement_timeout = DEFAULT")
+                .await?;
+            Ok::<(), sea_orm::DbErr>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                if let Err(error) = tx
+                    .execute_unprepared("RELEASE SAVEPOINT monitoring_trace_partial")
+                    .await
+                {
+                    tracing::warn!(%request_id, phase, %error, "failed to release degraded trace savepoint");
+                    let _ = Self::rollback_trace_savepoint(tx, SAVEPOINT, request_id, phase).await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%request_id, phase, %error, "failed to mark node trace partial");
+                let _ = Self::rollback_trace_savepoint(tx, SAVEPOINT, request_id, phase).await;
+            }
+        }
     }
 
     /// 计算 request_hash (canonical JSON hash)
@@ -264,16 +341,18 @@ impl NodeGatewayStore {
     ) -> Result<(Node, NodeSession), DbError> {
         let token_hash = UserNodeGatewayToken::hash_token(session_token);
 
-        let session = NodeSession::find_by_token_hash(self.pool.as_ref(), &token_hash).await?;
+        // Authentication and exclusion checks must not observe stale replicas.
+        let session = NodeSession::find_by_token_hash(self.pool.write_conn(), &token_hash).await?;
 
         match session {
             Some(s) => {
-                // 检查 session 是否被撤销
-                if s.is_revoked() {
-                    return Err(DbError::Other("Session revoked".to_string()));
+                // Internal callers do not go through the HTTP extractor, so
+                // enforce the same expiry/revocation boundary here as well.
+                if !s.is_valid() {
+                    return Err(DbError::Other("Session expired or revoked".to_string()));
                 }
 
-                let node = Node::find_by_id(self.pool.as_ref(), s.node_id)
+                let node = Node::find_by_id(self.pool.write_conn(), s.node_id)
                     .await?
                     .ok_or_else(|| DbError::not_found("Node", s.node_id.to_string()))?;
 
@@ -325,12 +404,12 @@ impl NodeGatewayStore {
 
         let session = NodeSession::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT * FROM node_sessions WHERE id = $1 FOR UPDATE",
-            [session_id.into()],
+            ACTIVE_NODE_SESSION_FOR_UPDATE_SQL,
+            [session_id.into(), node_id.into()],
         ))
         .one(&tx)
         .await?
-        .ok_or_else(|| DbError::not_found("Session", session_id.to_string()))?;
+        .ok_or_else(|| DbError::not_found("active session", session_id.to_string()))?;
 
         // 2. 校验请求体与认证结果一致
         if session.node_id != node_id {
@@ -478,8 +557,13 @@ impl NodeGatewayStore {
     ) -> Result<Option<(NodeTask, NodeTaskEnvelope)>, DbError> {
         let lease_id = Uuid::new_v4();
 
-        let task =
-            NodeTask::claim(self.pool.as_ref(), task_id, node_id, session_id, lease_id).await?;
+        let tx = self.pool.begin().await?;
+        let task = NodeTask::claim(&tx, task_id, node_id, session_id, lease_id).await?;
+
+        if let Some(task) = task.as_ref() {
+            Self::record_node_claim_savepoint(&tx, task).await;
+        }
+        tx.commit().await?;
 
         match task {
             Some(t) => {
@@ -501,6 +585,191 @@ impl NodeGatewayStore {
         }
     }
 
+    /// Monitoring writes share the claim transaction but are isolated behind
+    /// a savepoint, so trace failures never roll back the Node state machine.
+    async fn record_node_claim_savepoint(tx: &DatabaseTransaction, task: &NodeTask) {
+        if let Err(error) = tx.execute_unprepared("SAVEPOINT monitoring_trace").await {
+            tracing::warn!(request_id=%task.request_id,task_id=%task.id,%error,"failed to create node claim trace savepoint");
+            return;
+        }
+        let trace_result = async {
+            tx.execute_unprepared("SET LOCAL statement_timeout = '250ms'")
+                .await?;
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"INSERT INTO gateway_request_attempts(
+                       request_id,attempt_no,attempt_kind,route_type,model,status,
+                       node_task_id,node_id,session_id,lease_id,started_at)
+                   SELECT gr.request_id,
+                          COALESCE((SELECT MAX(a.attempt_no) FROM gateway_request_attempts a WHERE a.request_id=gr.request_id),0)+1,
+                          CASE WHEN $2>0 THEN 'reclaim' ELSE 'primary' END,
+                          'node',$3,'running',$4,$5,$6,$7,$8
+                   FROM gateway_requests gr
+                   WHERE gr.request_id=$1 AND gr.finished_at IS NULL
+                     AND NOT EXISTS(SELECT 1 FROM gateway_request_attempts a WHERE a.node_task_id=$4 AND a.lease_id=$7)"#,
+                [
+                    task.request_id.into(),task.failure_count.into(),task.model.clone().into(),task.id.into(),
+                    task.assigned_node_id.into(),task.assigned_session_id.into(),task.lease_id.into(),
+                    task.claimed_at.unwrap_or_else(Utc::now).into(),
+                ],
+            )).await?;
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE gateway_requests SET route_type='node',status='running',updated_at=NOW() WHERE request_id=$1 AND finished_at IS NULL",
+                [task.request_id.into()],
+            )).await?;
+            tx.execute_unprepared("SET LOCAL statement_timeout = DEFAULT")
+                .await?;
+            Ok::<(), sea_orm::DbErr>(())
+        }.await;
+        match trace_result {
+            Ok(()) => {
+                if let Err(error) = tx
+                    .execute_unprepared("RELEASE SAVEPOINT monitoring_trace")
+                    .await
+                {
+                    tracing::warn!(request_id=%task.request_id,task_id=%task.id,%error,"failed to release node claim trace savepoint");
+                    if Self::rollback_trace_savepoint(
+                        tx,
+                        "monitoring_trace",
+                        task.request_id,
+                        "claim",
+                    )
+                    .await
+                    {
+                        Self::mark_node_trace_partial_savepoint(tx, task.request_id, "claim").await;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(request_id=%task.request_id,task_id=%task.id,%error,"node claim trace savepoint rolled back");
+                if Self::rollback_trace_savepoint(tx, "monitoring_trace", task.request_id, "claim")
+                    .await
+                {
+                    Self::mark_node_trace_partial_savepoint(tx, task.request_id, "claim").await;
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn finish_node_trace_savepoint(
+        tx: &DatabaseTransaction,
+        task: &NodeTask,
+        lease_id: Option<Uuid>,
+        action: NodeTaskCompleteAction,
+    ) {
+        if let Err(error) = tx.execute_unprepared("SAVEPOINT monitoring_trace").await {
+            tracing::warn!(request_id=%task.request_id,task_id=%task.id,%error,"failed to create node completion trace savepoint");
+            return;
+        }
+        let finish = node_completion_finish(
+            &action,
+            Uuid::nil(),
+            task.request_id,
+            task.finished_at.unwrap_or_else(Utc::now),
+        );
+        let attempt_status = finish.attempt_status.as_str();
+        let request_status = finish.request_status.as_str();
+        let is_final = finish.is_final;
+        let end_reason = finish
+            .stream_end_reason
+            .expect("Node completion always has an end reason")
+            .as_str();
+        let error_category = finish.error.as_ref().map(|error| error.category.as_str());
+        let error_code = finish.error.as_ref().map(|error| error.code.as_str());
+        let trace_result = async {
+            tx.execute_unprepared("SET LOCAL statement_timeout = '250ms'")
+                .await?;
+            let mut missing_attempt = false;
+            if let Some(lease_id)=lease_id {
+                let updated = tx.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    r#"UPDATE gateway_request_attempts SET status=$1,is_final=$2,stream_end_reason=$3,
+                         stream_error_count=CASE WHEN $1='succeeded' THEN 0 ELSE 1 END,
+                         error_origin=CASE WHEN $1='succeeded' THEN NULL ELSE 'node' END,
+                         error_category=$4,error_code=$5,finished_at=NOW(),updated_at=NOW()
+                       WHERE node_task_id=$6 AND lease_id=$7 AND finished_at IS NULL"#,
+                    [attempt_status.into(),is_final.into(),end_reason.into(),error_category.into(),error_code.into(),task.id.into(),lease_id.into()],
+                )).await?;
+                if updated.rows_affected() != 1 {
+                    // The request-side wait timeout can close this attempt
+                    // before the sweeper transitions the business task to
+                    // expired. That is an expected idempotent replay, not a
+                    // missing trace. Only degrade when the lease attempt is
+                    // absent or disagrees with the terminal state.
+                    let existing = tx.query_one(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT status,is_final FROM gateway_request_attempts WHERE node_task_id=$1 AND lease_id=$2",
+                        [task.id.into(), lease_id.into()],
+                    )).await?;
+                    let idempotent = existing
+                        .and_then(|row| {
+                            Some((
+                                row.try_get::<String>("", "status").ok()?,
+                                row.try_get::<bool>("", "is_final").ok()?,
+                            ))
+                        })
+                        .is_some_and(|(status, existing_is_final)| {
+                            status == attempt_status && existing_is_final == is_final
+                        });
+                    missing_attempt = !idempotent;
+                }
+            }
+            if missing_attempt {
+                tx.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE gateway_requests SET trace_quality='partial',updated_at=NOW() WHERE request_id=$1",
+                    [task.request_id.into()],
+                )).await?;
+            }
+            // Node completion owns the attempt only. The client-facing handler
+            // writes the terminal request outcome after delivery (or disconnect).
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE gateway_requests SET status=$1,updated_at=NOW() WHERE request_id=$2 AND finished_at IS NULL",
+                [request_status.into(),task.request_id.into()],
+            )).await?;
+            tx.execute_unprepared("SET LOCAL statement_timeout = DEFAULT")
+                .await?;
+            Ok::<(),sea_orm::DbErr>(())
+        }.await;
+        match trace_result {
+            Ok(()) => {
+                if let Err(error) = tx
+                    .execute_unprepared("RELEASE SAVEPOINT monitoring_trace")
+                    .await
+                {
+                    tracing::warn!(request_id=%task.request_id,task_id=%task.id,%error,"failed to release node completion trace savepoint");
+                    if Self::rollback_trace_savepoint(
+                        tx,
+                        "monitoring_trace",
+                        task.request_id,
+                        "completion",
+                    )
+                    .await
+                    {
+                        Self::mark_node_trace_partial_savepoint(tx, task.request_id, "completion")
+                            .await;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(request_id=%task.request_id,task_id=%task.id,%error,"node completion trace savepoint rolled back");
+                if Self::rollback_trace_savepoint(
+                    tx,
+                    "monitoring_trace",
+                    task.request_id,
+                    "completion",
+                )
+                .await
+                {
+                    Self::mark_node_trace_partial_savepoint(tx, task.request_id, "completion")
+                        .await;
+                }
+            }
+        }
+    }
+
     /// 完成任务提交（复杂的事务逻辑）
     pub async fn complete_task(
         &self,
@@ -510,6 +779,27 @@ impl NodeGatewayStore {
         authenticated_session_id: Uuid,
         result: NodeTaskResult,
     ) -> Result<NodeTaskCompleteResponse, DbError> {
+        Ok(self
+            .complete_task_with_outcome(
+                task_id,
+                lease_id,
+                authenticated_node_id,
+                authenticated_session_id,
+                result,
+            )
+            .await?
+            .response)
+    }
+
+    /// 与 `complete_task` 相同，但保留本次调用是否推进了任务状态，供指标去重。
+    pub(crate) async fn complete_task_with_outcome(
+        &self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        authenticated_node_id: Uuid,
+        authenticated_session_id: Uuid,
+        result: NodeTaskResult,
+    ) -> Result<NodeTaskCompletionOutcome, DbError> {
         let tx = self.pool.begin().await?;
 
         // 1. 查询任务（FOR UPDATE）
@@ -570,12 +860,17 @@ impl NodeGatewayStore {
                     .await?
                     .ok_or_else(|| DbError::not_found("Node", authenticated_node_id.to_string()))?;
 
-                    return Ok(NodeTaskCompleteResponse {
-                        action,
-                        task_status: submission.action.clone(),
-                        node_status: node.status,
-                        server_failure_count: node.consecutive_failure_count as u32,
-                        failure_threshold: node.failure_threshold as u32,
+                    return Ok(NodeTaskCompletionOutcome {
+                        response: NodeTaskCompleteResponse {
+                            action,
+                            task_status: submission.action.clone(),
+                            node_status: node.status,
+                            server_failure_count: node.consecutive_failure_count as u32,
+                            failure_threshold: node.failure_threshold as u32,
+                        },
+                        model: task.model.clone(),
+                        is_new_task_transition: false,
+                        attempt_started_at: task.claimed_at,
                     });
                 } else {
                     // request_hash 不同，冲突
@@ -594,12 +889,17 @@ impl NodeGatewayStore {
                 .await?
                 .ok_or_else(|| DbError::not_found("Node", authenticated_node_id.to_string()))?;
 
-                return Ok(NodeTaskCompleteResponse {
-                    action,
-                    task_status: submission.action.clone(),
-                    node_status: node.status,
-                    server_failure_count: node.consecutive_failure_count as u32,
-                    failure_threshold: node.failure_threshold as u32,
+                return Ok(NodeTaskCompletionOutcome {
+                    response: NodeTaskCompleteResponse {
+                        action,
+                        task_status: submission.action.clone(),
+                        node_status: node.status,
+                        server_failure_count: node.consecutive_failure_count as u32,
+                        failure_threshold: node.failure_threshold as u32,
+                    },
+                    model: task.model.clone(),
+                    is_new_task_transition: false,
+                    attempt_started_at: task.claimed_at,
                 });
             }
         }
@@ -640,17 +940,25 @@ impl NodeGatewayStore {
             if task.status == TASK_STATUS_EXPIRED
                 || (task.status == TASK_STATUS_LEASED && task.deadline_at < now)
             {
+                // Expiry changes the accepted action, not the caller's lease
+                // authority. An unrelated authenticated node must not be able
+                // to create an audit submission for another node's task.
+                if task.assigned_node_id != Some(authenticated_node_id)
+                    || task.assigned_session_id != Some(authenticated_session_id)
+                    || task.lease_id != Some(lease_id)
+                {
+                    return Err(DbError::Other("lease_mismatch".to_string()));
+                }
                 if now > task.complete_grace_until {
                     return Err(DbError::Other("grace_period_expired".to_string()));
                 }
 
                 // 在宽限期内，写入 expired submission
-                let result_for_hash = NodeTaskResult::Failed {
-                    code: "expired".to_string(),
-                    message: "Task expired".to_string(),
-                    is_client_error: false,
-                };
-                let request_hash = Self::compute_request_hash(task_id, lease_id, &result_for_hash)?;
+                // Hash the actual submitted payload. The stored action is the
+                // server's Expired decision, but idempotency is defined over
+                // the client's original request; otherwise an exact retry
+                // conflicts with the synthetic expired payload.
+                let request_hash = Self::compute_request_hash(task_id, lease_id, &result)?;
 
                 let submission_req = CreateNodeTaskSubmissionRequest {
                     task_id,
@@ -683,8 +991,10 @@ impl NodeGatewayStore {
                 .await?
                 .ok_or_else(|| DbError::Other("Failed to insert expired submission".to_string()))?;
 
-                // 如果任务不是终态，标记为 expired
-                if !task.is_terminal() {
+                // 如果任务不是终态，标记为 expired。若 sweeper 已先完成
+                // 该迁移，本次仅保存幂等 submission，不再重复发出指标。
+                let is_new_task_transition = !task.is_terminal();
+                if is_new_task_transition {
                     NodeTask::find_by_statement(Statement::from_sql_and_values(
                         DbBackend::Postgres,
                         r#"
@@ -701,14 +1011,26 @@ impl NodeGatewayStore {
                     .await?;
                 }
 
+                Self::finish_node_trace_savepoint(
+                    &tx,
+                    &task,
+                    Some(lease_id),
+                    NodeTaskCompleteAction::Expired,
+                )
+                .await;
                 tx.commit().await?;
 
-                return Ok(NodeTaskCompleteResponse {
-                    action: NodeTaskCompleteAction::Expired,
-                    task_status: TASK_STATUS_EXPIRED.to_string(),
-                    node_status: node.status,
-                    server_failure_count: node.consecutive_failure_count as u32,
-                    failure_threshold: node.failure_threshold as u32,
+                return Ok(NodeTaskCompletionOutcome {
+                    response: NodeTaskCompleteResponse {
+                        action: NodeTaskCompleteAction::Expired,
+                        task_status: TASK_STATUS_EXPIRED.to_string(),
+                        node_status: node.status,
+                        server_failure_count: node.consecutive_failure_count as u32,
+                        failure_threshold: node.failure_threshold as u32,
+                    },
+                    model: task.model.clone(),
+                    is_new_task_transition,
+                    attempt_started_at: task.claimed_at,
                 });
             }
             // 条件 (c)：任务未过期但 session 过期，继续到优先级 2-4
@@ -725,6 +1047,15 @@ impl NodeGatewayStore {
             || task.lease_id != Some(lease_id)
         {
             return Err(DbError::Other("lease_mismatch".to_string()));
+        }
+
+        let payload: NodeTaskPayload = serde_json::from_value(task.payload_json.clone())
+            .map_err(|error| DbError::Other(format!("Invalid task payload: {error}")))?;
+        payload
+            .validate()
+            .map_err(|error| DbError::Other(format!("Invalid task payload: {error}")))?;
+        if !result_matches_payload(&payload, &result) {
+            return Err(DbError::Other("node_result_type_mismatch".to_string()));
         }
 
         // 8. 决策树：优先级 4 - 正常成功/失败流程
@@ -773,10 +1104,17 @@ impl NodeGatewayStore {
             }
         }?;
 
-        // 9. 提交事务
+        // 9. 在同一事务的 SAVEPOINT 中关闭 trace，再提交核心状态。
+        Self::finish_node_trace_savepoint(&tx, &task, Some(lease_id), response.action.clone())
+            .await;
         tx.commit().await?;
 
-        Ok(response)
+        Ok(NodeTaskCompletionOutcome {
+            response,
+            model: task.model,
+            is_new_task_transition: true,
+            attempt_started_at: task.claimed_at,
+        })
     }
 
     /// 处理成功提交（Chat 完成）
@@ -1203,5 +1541,80 @@ fn parse_action(action: &str) -> Result<NodeTaskCompleteAction, DbError> {
         "failed" => Ok(NodeTaskCompleteAction::Failed),
         "expired" => Ok(NodeTaskCompleteAction::Expired),
         _ => Err(DbError::Other(format!("Unknown action: {}", action))),
+    }
+}
+
+fn result_matches_payload(payload: &NodeTaskPayload, result: &NodeTaskResult) -> bool {
+    match result {
+        NodeTaskResult::Succeeded { .. } => payload.is_chat(),
+        NodeTaskResult::ImageSucceeded { .. } => {
+            payload.is_image_generation() || payload.is_image_edit()
+        }
+        NodeTaskResult::Failed { .. } => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ACTIVE_NODE_SESSION_FOR_UPDATE_SQL, result_matches_payload};
+    use keycompute_types::{ChatCompletionRequest, node::*};
+    use uuid::Uuid;
+
+    #[test]
+    fn heartbeat_locks_only_the_authenticated_active_session() {
+        assert!(ACTIVE_NODE_SESSION_FOR_UPDATE_SQL.contains("node_id = $2"));
+        assert!(ACTIVE_NODE_SESSION_FOR_UPDATE_SQL.contains("revoked_at IS NULL"));
+        assert!(ACTIVE_NODE_SESSION_FOR_UPDATE_SQL.contains("expires_at > NOW()"));
+        assert!(ACTIVE_NODE_SESSION_FOR_UPDATE_SQL.ends_with("FOR UPDATE"));
+    }
+
+    #[test]
+    fn successful_result_type_must_match_the_task_payload() {
+        let chat_payload = NodeTaskPayload {
+            request_id: Uuid::new_v4(),
+            chat: Some(ChatCompletionRequest::new("test-model", Vec::new())),
+            image_generation: None,
+            image_edit: None,
+        };
+        let image_payload = NodeTaskPayload {
+            request_id: Uuid::new_v4(),
+            chat: None,
+            image_generation: Some(ImageGenerationRequest {
+                prompt: "test".to_string(),
+                n: None,
+                size: None,
+            }),
+            image_edit: None,
+        };
+        let chat_result: NodeTaskResult = serde_json::from_value(serde_json::json!({
+            "status": "succeeded",
+            "response": {
+                "id": "response-id",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            }
+        }))
+        .expect("chat result should deserialize");
+        let image_result = NodeTaskResult::ImageSucceeded {
+            image_response: ImageGenerationResponse {
+                created: 0,
+                data: Vec::new(),
+            },
+        };
+        let failure = NodeTaskResult::Failed {
+            code: "execution_failed".to_string(),
+            message: "failed".to_string(),
+            is_client_error: false,
+        };
+
+        assert!(result_matches_payload(&chat_payload, &chat_result));
+        assert!(!result_matches_payload(&chat_payload, &image_result));
+        assert!(result_matches_payload(&image_payload, &image_result));
+        assert!(!result_matches_payload(&image_payload, &chat_result));
+        assert!(result_matches_payload(&chat_payload, &failure));
+        assert!(result_matches_payload(&image_payload, &failure));
     }
 }

@@ -73,7 +73,9 @@ RUN cargo fetch
 # 而不是构建时从 GitHub 下载（避免连接超时）。wasm-opt 优化不会被跳过。
 # 此前的 DX_SKIP_WASM_OPT 会被 dx 静默忽略，仍然触发网络下载。
 # API_BASE_URL 未设置时编译期缺省为空字符串（同源相对路径，经 Nginx 反代访问后端）；
-# 分域部署时可在此处注入绝对 URL（如 ENV API_BASE_URL=https://api.example.com）
+# 分域部署时由 Compose build args 注入绝对 URL。
+ARG API_BASE_URL=""
+ENV API_BASE_URL=${API_BASE_URL}
 ENV NO_DOWNLOADS=1
 RUN dx build --release --package web --platform web
 

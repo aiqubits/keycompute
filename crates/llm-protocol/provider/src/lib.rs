@@ -17,7 +17,10 @@ pub mod stream;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use http::{ByteStream, DefaultHttpTransport, GetBinaryResponse, HttpTransport};
+pub use http::{
+    ByteStream, DefaultHttpTransport, GetBinaryResponse, HttpTransport, UpstreamFailure,
+    UpstreamFailureKind, UpstreamResponse, UpstreamResponseMeta, summarize_http_failure_response,
+};
 pub use protocol::{ProtocolType, normalize_base_url};
 pub use request::{UpstreamMessage, UpstreamRequest};
 pub use stream::StreamEvent;
@@ -48,6 +51,36 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
         transport: &dyn HttpTransport,
         request: UpstreamRequest,
     ) -> Result<StreamBox>;
+
+    /// Structured variant used by the gateway tracing path. Legacy adapters
+    /// inherit a metadata-compatible wrapper; protocol adapters should override
+    /// it when their transport exposes real response headers.
+    async fn stream_chat_with_meta(
+        &self,
+        transport: &dyn HttpTransport,
+        request: UpstreamRequest,
+    ) -> std::result::Result<UpstreamResponse<StreamBox>, UpstreamFailure> {
+        self.stream_chat(transport, request)
+            .await
+            .map(|body| UpstreamResponse {
+                meta: UpstreamResponseMeta {
+                    status: 200,
+                    headers_received_at: chrono::Utc::now(),
+                    upstream_request_id: None,
+                    headers: Vec::new(),
+                },
+                body,
+            })
+            .map_err(|error| UpstreamFailure {
+                kind: UpstreamFailureKind::Protocol,
+                status: None,
+                headers_received_at: None,
+                upstream_request_id: None,
+                retryable: error.is_retryable(),
+                stable_error_code: "upstream_protocol".to_string(),
+                sanitized_summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+            })
+    }
 
     /// 非流式请求（默认通过 stream 实现）
     async fn chat(
@@ -105,8 +138,11 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
             "Authorization".to_string(),
             format!("Bearer {}", api_key.expose()),
         )];
-        let response = transport.get_binary(&url, headers).await?;
-        parse_models_response(&response.body)
+        let response = transport
+            .get_binary_response(&url, headers)
+            .await
+            .map_err(UpstreamFailure::into_keycompute_error)?;
+        parse_models_response(&response.body.body)
     }
 
     /// 验证上游 API Key 连通性（用于渠道账号测试）
@@ -159,9 +195,58 @@ pub type StreamBox = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 mod tests {
     use super::*;
     use crate::test_support::RecordingGetTransport;
+    use std::time::Duration;
 
     #[derive(Debug)]
     struct DefaultModelListAdapter;
+
+    #[derive(Debug)]
+    struct StructuredGetFailureTransport;
+
+    #[async_trait::async_trait]
+    impl HttpTransport for StructuredGetFailureTransport {
+        async fn post_json(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            _body: String,
+        ) -> Result<String> {
+            unreachable!()
+        }
+
+        async fn post_stream(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            _body: String,
+        ) -> Result<ByteStream> {
+            unreachable!()
+        }
+
+        fn request_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn stream_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        async fn get_binary_response(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+        ) -> std::result::Result<UpstreamResponse<GetBinaryResponse>, UpstreamFailure> {
+            Err(UpstreamFailure {
+                kind: UpstreamFailureKind::HttpStatus,
+                status: Some(429),
+                headers_received_at: Some(chrono::Utc::now()),
+                upstream_request_id: Some("models-rate-limit".to_string()),
+                retryable: true,
+                stable_error_code: "upstream_http_429".to_string(),
+                sanitized_summary: "rate limited".to_string(),
+            })
+        }
+    }
 
     #[async_trait::async_trait]
     impl ProviderAdapter for DefaultModelListAdapter {
@@ -243,5 +328,26 @@ mod tests {
                 vec![("Authorization".to_string(), "Bearer test-key".to_string())],
             )]
         );
+    }
+
+    #[test]
+    fn default_list_models_preserves_structured_http_failure() {
+        let adapter = DefaultModelListAdapter;
+        let error = futures::executor::block_on(adapter.list_models(
+            &StructuredGetFailureTransport,
+            "https://provider.example/v1",
+            &SensitiveString::new("test-key"),
+        ))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            KeyComputeError::UpstreamFailure {
+                status: Some(429),
+                ref stable_code,
+                retryable: true,
+                ..
+            } if stable_code == "upstream_http_429"
+        ));
     }
 }

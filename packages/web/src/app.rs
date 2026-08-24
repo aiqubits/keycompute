@@ -349,6 +349,7 @@ pub fn AppLayout() -> Element {
             site_name,
             home_title: i18n.t("layout.back_to_home"),
             open_menu_title: i18n.t("layout.open_menu"),
+            close_menu_title: i18n.t("layout.close_menu"),
             switch_to_light_theme_title: i18n.t("layout.switch_to_light"),
             switch_to_dark_theme_title: i18n.t("layout.switch_to_dark"),
             switch_to_zh_title: i18n.t("layout.switch_to_zh"),

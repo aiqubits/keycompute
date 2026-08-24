@@ -8,7 +8,10 @@ use crate::proxy::ProxyConfig;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use llm_protocol_provider::{ByteStream, GetBinaryResponse, HttpTransport};
+use llm_protocol_provider::{
+    ByteStream, GetBinaryResponse, HttpTransport, UpstreamFailure, UpstreamFailureKind,
+    UpstreamResponse, UpstreamResponseMeta, summarize_http_failure_response,
+};
 use reqwest::{Client, ClientBuilder, Proxy, RequestBuilder, Response};
 use std::time::Duration;
 
@@ -89,9 +92,10 @@ impl HttpClient {
 
     /// 执行请求并返回响应
     pub async fn execute(&self, request: RequestBuilder) -> keycompute_types::Result<Response> {
-        request.send().await.map_err(|e| {
-            keycompute_types::KeyComputeError::ProviderError(format!("HTTP request failed: {}", e))
-        })
+        request
+            .send()
+            .await
+            .map_err(|error| Self::transport_failure(&error).into_keycompute_error())
     }
 
     /// 执行流式请求
@@ -101,23 +105,16 @@ impl HttpClient {
         &self,
         request: RequestBuilder,
     ) -> keycompute_types::Result<impl Stream<Item = Result<Bytes, reqwest::Error>>> {
-        let response = request.send().await.map_err(|e| {
-            keycompute_types::KeyComputeError::ProviderError(format!(
-                "HTTP stream request failed: {}",
-                e
-            ))
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| Self::transport_failure(&error).into_keycompute_error())?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
+            let meta = Self::response_meta(&response);
+            return Err(Self::http_failure(response, meta)
                 .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(keycompute_types::KeyComputeError::ProviderError(format!(
-                "HTTP error ({}): {}",
-                status, error_text
-            )));
+                .into_keycompute_error());
         }
 
         Ok(response.bytes_stream())
@@ -142,52 +139,165 @@ impl HttpClient {
     pub fn config(&self) -> &ProxyConfig {
         &self.config
     }
+
+    fn response_meta(response: &Response) -> UpstreamResponseMeta {
+        Self::response_meta_from_parts(response.status().as_u16(), response.headers())
+    }
+
+    fn response_meta_from_parts(
+        status: u16,
+        response_headers: &reqwest::header::HeaderMap,
+    ) -> UpstreamResponseMeta {
+        let headers = response_headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect::<Vec<_>>();
+        let upstream_request_id = ["x-request-id", "request-id", "x-amzn-requestid"]
+            .iter()
+            .find_map(|name| response_headers.get(*name))
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.chars().take(128).collect());
+        UpstreamResponseMeta {
+            status,
+            headers_received_at: chrono::Utc::now(),
+            upstream_request_id,
+            headers,
+        }
+    }
+
+    fn transport_failure(error: &reqwest::Error) -> UpstreamFailure {
+        let timeout = error.is_timeout();
+        let definitely_pre_dispatch = error.is_connect();
+        let ambiguous_after_dispatch = !definitely_pre_dispatch;
+        UpstreamFailure {
+            kind: if timeout {
+                UpstreamFailureKind::Timeout
+            } else {
+                UpstreamFailureKind::Transport
+            },
+            status: None,
+            headers_received_at: None,
+            upstream_request_id: None,
+            retryable: definitely_pre_dispatch,
+            stable_error_code: if ambiguous_after_dispatch && timeout {
+                "upstream_ambiguous_timeout"
+            } else if ambiguous_after_dispatch {
+                "upstream_ambiguous_transport"
+            } else if timeout {
+                "upstream_timeout"
+            } else {
+                "upstream_transport"
+            }
+            .to_string(),
+            sanitized_summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+        }
+    }
+
+    async fn http_failure(response: Response, meta: UpstreamResponseMeta) -> UpstreamFailure {
+        let status = meta.status;
+        let summary = summarize_http_failure_response(response).await;
+        UpstreamFailure {
+            kind: UpstreamFailureKind::HttpStatus,
+            status: Some(status),
+            headers_received_at: Some(meta.headers_received_at),
+            upstream_request_id: meta.upstream_request_id,
+            retryable: status == 408 || status == 409 || status == 429 || status >= 500,
+            stable_error_code: format!("upstream_http_{status}"),
+            sanitized_summary: summary,
+        }
+    }
 }
 
 #[async_trait]
 impl HttpTransport for HttpClient {
+    async fn post_json_response(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: String,
+    ) -> std::result::Result<UpstreamResponse<String>, UpstreamFailure> {
+        let mut request = self.client.post(url);
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+        let response = request
+            .body(body)
+            .timeout(self.config.request_timeout)
+            .send()
+            .await
+            .map_err(|error| Self::transport_failure(&error))?;
+        let meta = Self::response_meta(&response);
+        if !response.status().is_success() {
+            return Err(Self::http_failure(response, meta).await);
+        }
+        let body = response.text().await.map_err(|error| UpstreamFailure {
+            kind: UpstreamFailureKind::BodyRead,
+            status: Some(meta.status),
+            headers_received_at: Some(meta.headers_received_at),
+            upstream_request_id: meta.upstream_request_id.clone(),
+            // A successful status proves that the paid POST reached the
+            // provider. Reissuing it without provider idempotency could charge
+            // the request twice even though no body reached the client.
+            retryable: false,
+            stable_error_code: "upstream_body_read".to_string(),
+            sanitized_summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+        })?;
+        Ok(UpstreamResponse { meta, body })
+    }
+
+    async fn post_stream_response(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: String,
+    ) -> std::result::Result<UpstreamResponse<ByteStream>, UpstreamFailure> {
+        let mut request = self.client.post(url);
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+        let response = request
+            .body(body)
+            .timeout(self.config.stream_timeout)
+            .send()
+            .await
+            .map_err(|error| Self::transport_failure(&error))?;
+        let meta = Self::response_meta(&response);
+        if !response.status().is_success() {
+            return Err(Self::http_failure(response, meta).await);
+        }
+        let status = meta.status;
+        let stream = response.bytes_stream().map(move |result| {
+            result.map_err(|error| keycompute_types::KeyComputeError::UpstreamFailure {
+                status: Some(status),
+                stable_code: "upstream_stream_read".to_string(),
+                // The provider has already accepted the paid POST. A read
+                // failure before the first chunk is still an ambiguous result,
+                // not permission to issue the inference again.
+                retryable: false,
+                summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+            })
+        });
+        Ok(UpstreamResponse {
+            meta,
+            body: Box::pin(stream),
+        })
+    }
+
     async fn post_json(
         &self,
         url: &str,
         headers: Vec<(String, String)>,
         body: String,
     ) -> keycompute_types::Result<String> {
-        let mut request = self.client.post(url);
-
-        for (key, value) in headers {
-            request = request.header(key, value);
-        }
-
-        let response = request
-            .body(body)
-            .timeout(self.config.request_timeout)
-            .send()
+        self.post_json_response(url, headers, body)
             .await
-            .map_err(|e| {
-                keycompute_types::KeyComputeError::ProviderError(format!(
-                    "HTTP request failed: {}",
-                    e
-                ))
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(keycompute_types::KeyComputeError::ProviderError(format!(
-                "HTTP error ({}): {}",
-                status, error_text
-            )));
-        }
-
-        response.text().await.map_err(|e| {
-            keycompute_types::KeyComputeError::ProviderError(format!(
-                "Failed to read response: {}",
-                e
-            ))
-        })
+            .map(|response| response.body)
+            .map_err(UpstreamFailure::into_keycompute_error)
     }
 
     async fn post_stream(
@@ -196,45 +306,10 @@ impl HttpTransport for HttpClient {
         headers: Vec<(String, String)>,
         body: String,
     ) -> keycompute_types::Result<ByteStream> {
-        let mut request = self.client.post(url);
-
-        for (key, value) in headers {
-            request = request.header(key, value);
-        }
-
-        let response = request
-            .body(body)
-            .timeout(self.config.stream_timeout)
-            .send()
+        self.post_stream_response(url, headers, body)
             .await
-            .map_err(|e| {
-                keycompute_types::KeyComputeError::ProviderError(format!(
-                    "HTTP stream request failed: {}",
-                    e
-                ))
-            })?;
-
-        let status = response.status();
-
-        if !status.is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(keycompute_types::KeyComputeError::ProviderError(format!(
-                "HTTP error ({}): {}",
-                status, error_text
-            )));
-        }
-
-        // 转换字节流
-        let stream = response.bytes_stream().map(|result| {
-            result.map_err(|e| {
-                keycompute_types::KeyComputeError::ProviderError(format!("Stream error: {}", e))
-            })
-        });
-
-        Ok(Box::pin(stream))
+            .map(|response| response.body)
+            .map_err(UpstreamFailure::into_keycompute_error)
     }
 
     async fn post_raw(
@@ -253,31 +328,28 @@ impl HttpTransport for HttpClient {
             .timeout(self.config.request_timeout)
             .send()
             .await
-            .map_err(|e| {
-                keycompute_types::KeyComputeError::ProviderError(format!(
-                    "HTTP request failed: {}",
-                    e
-                ))
-            })?;
+            .map_err(|error| Self::transport_failure(&error).into_keycompute_error())?;
 
+        let meta = Self::response_meta(&response);
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
+            return Err(Self::http_failure(response, meta)
                 .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(keycompute_types::KeyComputeError::ProviderError(format!(
-                "HTTP error ({}): {}",
-                status, error_text
-            )));
+                .into_keycompute_error());
         }
 
-        response.text().await.map_err(|e| {
-            keycompute_types::KeyComputeError::ProviderError(format!(
-                "Failed to read response: {}",
-                e
-            ))
-        })
+        response
+            .text()
+            .await
+            .map_err(|error| UpstreamFailure {
+                kind: UpstreamFailureKind::BodyRead,
+                status: Some(meta.status),
+                headers_received_at: Some(meta.headers_received_at),
+                upstream_request_id: meta.upstream_request_id,
+                retryable: false,
+                stable_error_code: "upstream_body_read".to_string(),
+                sanitized_summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+            })
+            .map_err(UpstreamFailure::into_keycompute_error)
     }
 
     fn request_timeout(&self) -> Duration {
@@ -293,6 +365,17 @@ impl HttpTransport for HttpClient {
         url: &str,
         headers: Vec<(String, String)>,
     ) -> keycompute_types::Result<GetBinaryResponse> {
+        self.get_binary_response(url, headers)
+            .await
+            .map(|response| response.body)
+            .map_err(UpstreamFailure::into_keycompute_error)
+    }
+
+    async fn get_binary_response(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+    ) -> std::result::Result<UpstreamResponse<GetBinaryResponse>, UpstreamFailure> {
         let mut builder = self.client.get(url);
         for (key, value) in headers {
             builder = builder.header(key, value);
@@ -302,23 +385,52 @@ impl HttpTransport for HttpClient {
             .timeout(self.config.request_timeout)
             .send()
             .await
-            .map_err(|e| {
-                keycompute_types::KeyComputeError::ProviderError(format!(
-                    "HTTP GET request failed: {}",
-                    e
-                ))
+            .map_err(|error| {
+                let timeout = error.is_timeout();
+                UpstreamFailure {
+                    kind: if timeout {
+                        UpstreamFailureKind::Timeout
+                    } else {
+                        UpstreamFailureKind::Transport
+                    },
+                    status: None,
+                    headers_received_at: None,
+                    upstream_request_id: None,
+                    retryable: timeout || error.is_connect(),
+                    stable_error_code: if timeout {
+                        "upstream_timeout"
+                    } else {
+                        "upstream_transport"
+                    }
+                    .to_string(),
+                    sanitized_summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+                }
             })?;
 
+        let response_headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect::<Vec<_>>();
+        let upstream_request_id = ["x-request-id", "request-id", "x-amzn-requestid"]
+            .iter()
+            .find_map(|name| response.headers().get(*name))
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.chars().take(128).collect());
+        let meta = UpstreamResponseMeta {
+            status: response.status().as_u16(),
+            headers_received_at: chrono::Utc::now(),
+            upstream_request_id,
+            headers: response_headers,
+        };
+
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(keycompute_types::KeyComputeError::ProviderError(format!(
-                "HTTP error ({}): {}",
-                status, error_text
-            )));
+            return Err(Self::http_failure(response, meta).await);
         }
 
         let content_type = response
@@ -327,19 +439,22 @@ impl HttpTransport for HttpClient {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        response
-            .bytes()
-            .await
-            .map(|b| GetBinaryResponse {
-                body: b.to_vec(),
+        let body = response.bytes().await.map_err(|error| UpstreamFailure {
+            kind: UpstreamFailureKind::BodyRead,
+            status: Some(meta.status),
+            headers_received_at: Some(meta.headers_received_at),
+            upstream_request_id: meta.upstream_request_id.clone(),
+            retryable: true,
+            stable_error_code: "upstream_body_read".to_string(),
+            sanitized_summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+        })?;
+        Ok(UpstreamResponse {
+            meta,
+            body: GetBinaryResponse {
+                body: body.to_vec(),
                 content_type,
-            })
-            .map_err(|e| {
-                keycompute_types::KeyComputeError::ProviderError(format!(
-                    "Failed to read response: {}",
-                    e
-                ))
-            })
+            },
+        })
     }
 }
 
@@ -399,5 +514,18 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let _request =
             client.post_with_tracing("https://api.example.com/v1/chat", request_id, "openai");
+    }
+
+    #[test]
+    fn structured_post_metadata_keeps_status_and_upstream_request_id() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-request-id", "provider-request-id".parse().unwrap());
+        let metadata = HttpClient::response_meta_from_parts(401, &headers);
+
+        assert_eq!(metadata.status, 401);
+        assert_eq!(
+            metadata.upstream_request_id.as_deref(),
+            Some("provider-request-id")
+        );
     }
 }

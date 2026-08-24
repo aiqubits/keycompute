@@ -801,6 +801,7 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
+            Uuid::new_v4(),
             "gpt-4o",
             vec![],
             true,
@@ -1390,6 +1391,10 @@ mod tests {
             enabled: true,
             models_supported: vec!["gpt-4o".to_string()],
             visibility: "tenant".to_string(),
+            last_probe_at: None,
+            last_probe_latency_ms: None,
+            last_probe_status: None,
+            last_probe_error_code: None,
             created_at: now,
             updated_at: now,
         }

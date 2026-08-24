@@ -110,8 +110,14 @@ CREATE TABLE IF NOT EXISTS accounts (
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     models_supported TEXT[] NOT NULL DEFAULT '{}',
     visibility VARCHAR(20) NOT NULL DEFAULT 'tenant',
+    last_probe_at TIMESTAMPTZ,
+    last_probe_latency_ms BIGINT,
+    last_probe_status VARCHAR(32),
+    last_probe_error_code VARCHAR(128),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_accounts_probe_status
+        CHECK (last_probe_status IS NULL OR last_probe_status IN ('succeeded', 'failed'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_accounts_tenant_id ON accounts(tenant_id);
@@ -170,6 +176,114 @@ CREATE INDEX IF NOT EXISTS idx_usage_logs_user ON usage_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_usage_logs_produce_ai_key ON usage_logs(produce_ai_key_id);
 CREATE INDEX IF NOT EXISTS idx_usage_logs_created ON usage_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_logs_request ON usage_logs(request_id);
+
+-- ============================================================================
+-- Gateway 请求监控追踪
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS gateway_requests (
+    request_id UUID PRIMARY KEY,
+    client_request_id VARCHAR(128),
+    tenant_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+    produce_ai_key_id UUID NOT NULL,
+    protocol VARCHAR(32) NOT NULL,
+    request_path VARCHAR(255) NOT NULL,
+    requested_model VARCHAR(255) NOT NULL,
+    is_stream BOOLEAN NOT NULL,
+    route_type VARCHAR(32),
+    status VARCHAR(32) NOT NULL,
+    error_origin VARCHAR(32),
+    error_category VARCHAR(32),
+    error_code VARCHAR(128),
+    received_at TIMESTAMPTZ NOT NULL,
+    client_first_content_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    billing_status VARCHAR(32) NOT NULL,
+    trace_quality VARCHAR(16) NOT NULL DEFAULT 'actual',
+    trace_version INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_gateway_requests_protocol CHECK (protocol IN ('openai', 'anthropic')),
+    CONSTRAINT ck_gateway_requests_route_type CHECK (route_type IS NULL OR route_type IN ('provider_account', 'node')),
+    CONSTRAINT ck_gateway_requests_status CHECK (status IN ('received', 'routing', 'queued', 'running', 'succeeded', 'failed', 'timed_out', 'cancelled')),
+    CONSTRAINT ck_gateway_requests_error_origin CHECK (error_origin IS NULL OR error_origin IN ('client', 'gateway', 'upstream', 'node')),
+    CONSTRAINT ck_gateway_requests_error_category CHECK (error_category IS NULL OR error_category IN ('authorization', 'invalid_request', 'balance', 'rate_limit', 'transport', 'timeout', 'upstream_4xx', 'upstream_5xx', 'protocol', 'client_disconnect', 'node_expired', 'node_failed', 'internal')),
+    CONSTRAINT ck_gateway_requests_billing_status CHECK (billing_status IN ('pending', 'succeeded', 'failed', 'not_applicable')),
+    CONSTRAINT ck_gateway_requests_trace_quality CHECK (trace_quality IN ('actual', 'derived', 'partial')),
+    CONSTRAINT ck_gateway_requests_terminal_time CHECK ((status IN ('succeeded', 'failed', 'timed_out', 'cancelled')) = (finished_at IS NOT NULL)),
+    CONSTRAINT ck_gateway_requests_first_content_time CHECK (client_first_content_at IS NULL OR client_first_content_at >= received_at),
+    CONSTRAINT ck_gateway_requests_finished_time CHECK (finished_at IS NULL OR finished_at >= received_at)
+);
+
+CREATE TABLE IF NOT EXISTS gateway_request_attempts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id UUID NOT NULL REFERENCES gateway_requests(request_id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL,
+    attempt_kind VARCHAR(16) NOT NULL,
+    route_type VARCHAR(32) NOT NULL,
+    model VARCHAR(255) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    is_final BOOLEAN NOT NULL DEFAULT FALSE,
+    provider_name VARCHAR(64),
+    account_id UUID,
+    node_task_id UUID,
+    node_id UUID,
+    session_id UUID,
+    lease_id UUID,
+    upstream_request_id VARCHAR(128),
+    http_status INTEGER,
+    retryable BOOLEAN,
+    error_origin VARCHAR(32),
+    error_category VARCHAR(32),
+    error_code VARCHAR(128),
+    error_summary VARCHAR(512),
+    started_at TIMESTAMPTZ NOT NULL,
+    headers_received_at TIMESTAMPTZ,
+    first_content_at TIMESTAMPTZ,
+    stream_end_reason VARCHAR(32),
+    stream_error_count INTEGER,
+    finished_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uk_gateway_request_attempt_no UNIQUE (request_id, attempt_no),
+    CONSTRAINT ck_gateway_attempt_no CHECK (attempt_no > 0),
+    CONSTRAINT ck_gateway_attempt_kind CHECK (attempt_kind IN ('primary', 'fallback', 'retry', 'reclaim')),
+    CONSTRAINT ck_gateway_attempt_route_type CHECK (route_type IN ('provider_account', 'node')),
+    CONSTRAINT ck_gateway_attempt_status CHECK (status IN ('running', 'succeeded', 'failed', 'timed_out', 'cancelled', 'expired')),
+    CONSTRAINT ck_gateway_attempt_error_origin CHECK (error_origin IS NULL OR error_origin IN ('upstream', 'gateway', 'node')),
+    CONSTRAINT ck_gateway_attempt_error_category CHECK (error_category IS NULL OR error_category IN ('authorization', 'invalid_request', 'balance', 'rate_limit', 'transport', 'timeout', 'upstream_4xx', 'upstream_5xx', 'protocol', 'client_disconnect', 'node_expired', 'node_failed', 'internal')),
+    CONSTRAINT ck_gateway_attempt_stream_end CHECK (stream_end_reason IS NULL OR stream_end_reason IN ('completed', 'upstream_error', 'protocol_error', 'client_disconnect', 'cancelled', 'timeout', 'truncated')),
+    CONSTRAINT ck_gateway_attempt_stream_errors CHECK (stream_error_count IS NULL OR stream_error_count >= 0),
+    CONSTRAINT ck_gateway_attempt_headers_time CHECK (headers_received_at IS NULL OR headers_received_at >= started_at),
+    CONSTRAINT ck_gateway_attempt_first_time CHECK (first_content_at IS NULL OR first_content_at >= started_at),
+    CONSTRAINT ck_gateway_attempt_finished_time CHECK (finished_at IS NULL OR finished_at >= started_at),
+    CONSTRAINT ck_gateway_attempt_content_finished CHECK (first_content_at IS NULL OR finished_at IS NULL OR first_content_at <= finished_at),
+    CONSTRAINT ck_gateway_attempt_terminal_time CHECK ((status = 'running') = (finished_at IS NULL)),
+    CONSTRAINT ck_gateway_attempt_target CHECK (
+        (route_type = 'provider_account' AND provider_name IS NOT NULL AND account_id IS NOT NULL AND node_task_id IS NULL AND node_id IS NULL AND session_id IS NULL AND lease_id IS NULL)
+        OR
+        (route_type = 'node' AND provider_name IS NULL AND account_id IS NULL AND node_task_id IS NOT NULL AND node_id IS NOT NULL AND session_id IS NOT NULL AND lease_id IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_gateway_requests_received ON gateway_requests(received_at DESC, request_id DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_requests_status_received ON gateway_requests(status, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_requests_route_received ON gateway_requests(route_type, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_requests_tenant_received ON gateway_requests(tenant_id, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_requests_user_received ON gateway_requests(user_id, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_requests_key_received ON gateway_requests(produce_ai_key_id, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_requests_model_received ON gateway_requests(requested_model, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_requests_client_id ON gateway_requests(client_request_id) WHERE client_request_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_gateway_requests_pending_billing_finished ON gateway_requests(finished_at)
+    WHERE billing_status = 'pending' AND finished_at IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uk_gateway_request_final_attempt ON gateway_request_attempts(request_id) WHERE is_final;
+CREATE UNIQUE INDEX IF NOT EXISTS uk_gateway_node_attempt_lease ON gateway_request_attempts(node_task_id, lease_id) WHERE route_type = 'node';
+CREATE INDEX IF NOT EXISTS idx_gateway_attempt_account_started ON gateway_request_attempts(account_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_attempt_provider_started ON gateway_request_attempts(provider_name, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_attempt_node_started ON gateway_request_attempts(node_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_attempt_upstream_id ON gateway_request_attempts(upstream_request_id) WHERE upstream_request_id IS NOT NULL;
+
 -- distribution_records: 二级分销记录
 CREATE TABLE IF NOT EXISTS distribution_records (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

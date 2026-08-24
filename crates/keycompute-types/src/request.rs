@@ -2,11 +2,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{PricingSnapshot, UsageAccumulator};
+use crate::{PricingSnapshot, RequestExecutionFailure, UsageAccumulator};
 
 /// 请求上下文：贯穿全链路的唯一状态载体
 ///
@@ -47,14 +48,28 @@ pub struct RequestContext {
     /// 网关在向 handler 发出终止事件前写入该值。这样当 primary 在尚未
     /// 向客户端提交内容时发生 fallback，结算仍会归属到真正执行成功的账号。
     executed_provider_account: Arc<RwLock<Option<ExecutedProviderAccount>>>,
+    /// 当前 usage 快照所属的 Provider 账号。
+    ///
+    /// 该值在上游接受请求并返回成功响应头、executor 即将为本次尝试重置
+    /// usage 时更新。它与 `executed_provider_account` 分离：fallback 即使在
+    /// 产生部分用量后断流，也必须把该部分账单归属到 fallback 账号，但不能
+    /// 被误标记为“成功完成请求”。
+    usage_provider_account: Arc<RwLock<Option<ExecutedProviderAccount>>>,
     /// 客户端是否已断开（仅流式路径使用）。
     ///
-    /// OpenAI 路径的 SSE 流由 async_stream 持有 receiver，客户端断开时
-    /// receiver 被 drop，executor 的 `tx.is_closed()` 会立即生效；Anthropic
-    /// 路径的后台任务持有 receiver 直到结算完成（这是有意设计），因此需要
-    /// handler 在检测到 SSE 发送失败时通过此标志显式通知 executor，避免在
-    /// 客户端断开后仍对 fallback 上游发起无人接收的调用。
-    client_disconnected: Arc<AtomicBool>,
+    /// OpenAI 与 Anthropic 的后台结算任务会继续持有 executor receiver，确保
+    /// 断流后仍能完成一次结算。因此不能只依赖 `tx.is_closed()`；handler 必须
+    /// 通过这个可等待的取消令牌通知 executor 立即终止当前上游流和 fallback。
+    client_disconnect: CancellationToken,
+    /// Handler 对客户端响应的最终处理结果。
+    ///
+    /// Provider 的 `Done` 只代表上游 attempt 完成；非流式响应仍可能校验失败，
+    /// 流式响应也可能在终止帧写入前断开。handler 用第一个结果关闭 request trace，
+    /// executor 只负责 attempt 生命周期。
+    client_response_outcome: watch::Sender<Option<ClientResponseOutcome>>,
+    /// Final execution failure waiting for the response handler to decide the
+    /// client-visible request outcome.
+    execution_failure: Arc<RwLock<Option<RequestExecutionFailure>>>,
     pub pricing_snapshot: PricingSnapshot, // 请求开始时固化
     usage: Arc<UsageAccumulator>,          // streaming 中累积（共享状态）
     pub started_at: DateTime<Utc>,
@@ -83,7 +98,15 @@ impl fmt::Debug for RequestContext {
             )
             .field("native_anthropic_headers", &self.native_anthropic_headers)
             .field("executed_provider_account", &self.executed_provider_account)
-            .field("client_disconnected", &self.client_disconnected)
+            .field("usage_provider_account", &self.usage_provider_account)
+            .field("client_disconnected", &self.is_client_disconnected())
+            .field("client_response_outcome", &self.client_response_outcome())
+            .field(
+                "execution_failure",
+                &self
+                    .execution_failure()
+                    .map(|failure| (failure.status, failure.error.code)),
+            )
             .field("pricing_snapshot", &self.pricing_snapshot)
             .field("usage", &self.usage)
             .field("started_at", &self.started_at)
@@ -92,7 +115,12 @@ impl fmt::Debug for RequestContext {
 }
 
 impl RequestContext {
+    // Keep the immutable request identity and execution inputs explicit at call sites. Grouping
+    // these fields only to satisfy Clippy would obscure construction and churn every protocol,
+    // routing, billing, and integration-test caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        request_id: Uuid,
         user_id: Uuid,
         tenant_id: Uuid,
         produce_ai_key_id: Uuid,
@@ -101,8 +129,9 @@ impl RequestContext {
         stream: bool,
         pricing_snapshot: PricingSnapshot,
     ) -> Self {
+        let (client_response_outcome, _) = watch::channel(None);
         Self {
-            request_id: Uuid::new_v4(),
+            request_id,
             user_id,
             tenant_id,
             produce_ai_key_id,
@@ -116,7 +145,10 @@ impl RequestContext {
             native_anthropic_request: None,
             native_anthropic_headers: BTreeMap::new(),
             executed_provider_account: Arc::new(RwLock::new(None)),
-            client_disconnected: Arc::new(AtomicBool::new(false)),
+            usage_provider_account: Arc::new(RwLock::new(None)),
+            client_disconnect: CancellationToken::new(),
+            client_response_outcome,
+            execution_failure: Arc::new(RwLock::new(None)),
             pricing_snapshot,
             usage: Arc::new(UsageAccumulator::new()),
             started_at: Utc::now(),
@@ -205,11 +237,15 @@ impl RequestContext {
 
     /// 记录实际成功完成请求的上游账号。
     pub fn set_executed_provider_account(&self, provider: impl Into<String>, account_id: Uuid) {
-        if let Ok(mut target) = self.executed_provider_account.write() {
-            *target = Some(ExecutedProviderAccount {
-                provider: provider.into(),
-                account_id,
-            });
+        let target = ExecutedProviderAccount {
+            provider: provider.into(),
+            account_id,
+        };
+        if let Ok(mut completed_target) = self.executed_provider_account.write() {
+            *completed_target = Some(target.clone());
+        }
+        if let Ok(mut usage_target) = self.usage_provider_account.write() {
+            *usage_target = Some(target);
         }
     }
 
@@ -221,34 +257,125 @@ impl RequestContext {
             .and_then(|target| target.clone())
     }
 
+    /// 记录当前 usage 快照所属的上游账号，不表示该账号已成功完成请求。
+    pub fn set_usage_provider_account(&self, provider: impl Into<String>, account_id: Uuid) {
+        if let Ok(mut target) = self.usage_provider_account.write() {
+            *target = Some(ExecutedProviderAccount {
+                provider: provider.into(),
+                account_id,
+            });
+        }
+    }
+
+    /// 获取当前 usage 快照所属的上游账号。
+    pub fn usage_provider_account(&self) -> Option<ExecutedProviderAccount> {
+        self.usage_provider_account
+            .read()
+            .ok()
+            .and_then(|target| target.clone())
+    }
+
     /// Return the target that should be used for billing.
     ///
-    /// A successfully completed fallback must be attributed to its own
-    /// provider account. If no target completed, retain the primary target so
-    /// failed attempts still have a deterministic attribution.
+    /// A fallback that produced the retained usage snapshot must be attributed
+    /// to its own provider account even if its stream ended incompletely. If no
+    /// upstream response owned a usage snapshot, retain the primary target so
+    /// pre-response failures still have deterministic attribution.
     pub fn billing_target(
         &self,
         primary_provider: &str,
         primary_account_id: Uuid,
     ) -> (String, Uuid) {
-        self.executed_provider_account()
+        self.usage_provider_account()
+            .or_else(|| self.executed_provider_account())
             .map(|target| (target.provider, target.account_id))
             .unwrap_or_else(|| (primary_provider.to_string(), primary_account_id))
     }
 
     /// 标记客户端已断开。
     ///
-    /// Anthropic 流式路径在 SSE 发送失败时调用：executor 的 receiver 由
-    /// 后台结算任务持有，`tx.is_closed()` 不会因客户端断开而触发，需要
-    /// 该标志让 executor 在 primary 失败后中止 fallback 链。
+    /// 流式 handler 在 SSE 发送失败时调用：executor 的 receiver 由后台结算
+    /// 任务持有，`tx.is_closed()` 不会因客户端断开而触发，需要该令牌同时
+    /// 取消当前上游调用并阻止 fallback。若 handler 已先记录成功（例如
+    /// Anthropic `message_stop` 后 SDK 主动关闭 body），该关闭属于正常协议
+    /// 收尾，不再取消仍需消费的内部 `Done` 与结算流程。
     pub fn mark_client_disconnected(&self) {
-        self.client_disconnected.store(true, Ordering::SeqCst);
+        if self.set_client_response_outcome(ClientResponseOutcome::ClientDisconnected)
+            == ClientResponseOutcome::ClientDisconnected
+        {
+            self.client_disconnect.cancel();
+        }
     }
 
     /// 客户端是否已断开。
     pub fn is_client_disconnected(&self) -> bool {
-        self.client_disconnected.load(Ordering::SeqCst)
+        self.client_disconnect.is_cancelled()
     }
+
+    /// 等待客户端断开；已断开时立即返回。
+    pub async fn wait_for_client_disconnect(&self) {
+        self.client_disconnect.cancelled().await;
+    }
+
+    /// Mark a validated response as handed to the client-facing response stream.
+    pub fn mark_client_response_succeeded(&self) {
+        self.set_client_response_outcome(ClientResponseOutcome::Succeeded);
+    }
+
+    /// Mark handler-side response validation or construction as failed after upstream completion.
+    pub fn mark_client_response_failed(&self) {
+        self.set_client_response_outcome(ClientResponseOutcome::ResponseFailed);
+    }
+
+    /// Mark the client-facing response path as timed out after upstream completion.
+    pub fn mark_client_response_timed_out(&self) {
+        self.set_client_response_outcome(ClientResponseOutcome::TimedOut);
+    }
+
+    /// Return the first terminal client response outcome, if the handler has supplied one.
+    pub fn client_response_outcome(&self) -> Option<ClientResponseOutcome> {
+        *self.client_response_outcome.borrow()
+    }
+
+    /// Preserve the first terminal execution failure for the response handler.
+    /// Retries and fallback attempts do not call this method; only the exhausted
+    /// execution path supplies a failure.
+    pub fn set_execution_failure(&self, failure: RequestExecutionFailure) {
+        if let Ok(mut current) = self.execution_failure.write()
+            && current.is_none()
+        {
+            *current = Some(failure);
+        }
+    }
+
+    /// Return the terminal execution failure, if execution ended unsuccessfully.
+    pub fn execution_failure(&self) -> Option<RequestExecutionFailure> {
+        self.execution_failure
+            .read()
+            .ok()
+            .and_then(|failure| failure.clone())
+    }
+
+    fn set_client_response_outcome(&self, outcome: ClientResponseOutcome) -> ClientResponseOutcome {
+        self.client_response_outcome.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(outcome);
+                true
+            }
+        });
+        self.client_response_outcome().unwrap_or(outcome)
+    }
+}
+
+/// Handler-owned terminal result for the client-facing response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientResponseOutcome {
+    Succeeded,
+    ClientDisconnected,
+    ResponseFailed,
+    TimedOut,
 }
 
 /// 已成功完成请求的具体上游账号。
@@ -556,7 +683,9 @@ mod tests {
 
     #[test]
     fn test_request_context_new() {
+        let request_id = Uuid::new_v4();
         let ctx = RequestContext::new(
+            request_id,
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
@@ -565,6 +694,7 @@ mod tests {
             false,
             PricingSnapshot::default(),
         );
+        assert_eq!(ctx.request_id, request_id);
         assert_eq!(ctx.model, "gpt-4");
         assert!(!ctx.stream);
     }
@@ -572,6 +702,7 @@ mod tests {
     #[test]
     fn test_request_context_usage_shared() {
         let ctx = RequestContext::new(
+            Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
@@ -605,6 +736,7 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
+            Uuid::new_v4(),
             "claude-test",
             Vec::new(),
             false,
@@ -629,6 +761,7 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
+            Uuid::new_v4(),
             "gpt-test",
             Vec::new(),
             false,
@@ -650,6 +783,7 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
+            Uuid::new_v4(),
             "gpt-test",
             Vec::new(),
             false,
@@ -663,8 +797,119 @@ mod tests {
     }
 
     #[test]
+    fn billing_target_uses_the_account_that_owns_partial_fallback_usage() {
+        let primary_account_id = Uuid::new_v4();
+        let fallback_account_id = Uuid::new_v4();
+        let ctx = RequestContext::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "gpt-test",
+            Vec::new(),
+            true,
+            PricingSnapshot::default(),
+        );
+
+        ctx.set_usage_provider_account("anthropic", fallback_account_id);
+
+        assert_eq!(ctx.executed_provider_account(), None);
+        assert_eq!(
+            ctx.billing_target("openai", primary_account_id),
+            ("anthropic".to_string(), fallback_account_id)
+        );
+    }
+
+    #[test]
+    fn client_response_outcome_is_shared_and_first_terminal_result_wins() {
+        let ctx = RequestContext::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "gpt-test",
+            Vec::new(),
+            true,
+            PricingSnapshot::default(),
+        );
+        let cloned = ctx.clone();
+
+        cloned.mark_client_disconnected();
+        ctx.mark_client_response_succeeded();
+
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(ClientResponseOutcome::ClientDisconnected)
+        );
+        assert!(ctx.is_client_disconnected());
+
+        let completed = RequestContext::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "claude-test",
+            Vec::new(),
+            true,
+            PricingSnapshot::default(),
+        );
+        completed.mark_client_response_succeeded();
+        completed.mark_client_disconnected();
+        assert_eq!(
+            completed.client_response_outcome(),
+            Some(ClientResponseOutcome::Succeeded)
+        );
+        assert!(
+            !completed.is_client_disconnected(),
+            "a normal close after protocol completion must not cancel internal settlement"
+        );
+    }
+
+    #[test]
+    fn execution_failure_is_shared_and_first_value_wins() {
+        let ctx = RequestContext::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "gpt-test",
+            Vec::new(),
+            false,
+            PricingSnapshot::default(),
+        );
+        let cloned = ctx.clone();
+        cloned.set_execution_failure(RequestExecutionFailure {
+            status: crate::RequestStatus::Failed,
+            error: crate::TraceErrorInfo {
+                origin: crate::ErrorOrigin::Upstream,
+                category: crate::TraceErrorCategory::Upstream5xx,
+                code: "first_failure".to_string(),
+                summary: None,
+                retryable: Some(true),
+            },
+            billing_status: crate::BillingStatus::Pending,
+        });
+        ctx.set_execution_failure(RequestExecutionFailure {
+            status: crate::RequestStatus::TimedOut,
+            error: crate::TraceErrorInfo {
+                origin: crate::ErrorOrigin::Gateway,
+                category: crate::TraceErrorCategory::Timeout,
+                code: "later_failure".to_string(),
+                summary: None,
+                retryable: Some(false),
+            },
+            billing_status: crate::BillingStatus::NotApplicable,
+        });
+
+        let failure = ctx.execution_failure().expect("execution failure");
+        assert_eq!(failure.status, crate::RequestStatus::Failed);
+        assert_eq!(failure.error.code, "first_failure");
+    }
+
+    #[test]
     fn request_context_debug_redacts_native_anthropic_body() {
         let mut ctx = RequestContext::new(
+            Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),

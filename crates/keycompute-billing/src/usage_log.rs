@@ -12,8 +12,30 @@ use keycompute_distribution::{
 };
 use keycompute_types::{KeyComputeError, RequestContext, Result};
 use rust_decimal::Decimal;
-use std::sync::Arc;
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
+
+const MARK_BILLING_FAILED_SQL: &str = "UPDATE gateway_requests SET billing_status='failed',updated_at=NOW() WHERE request_id=$1 AND billing_status='pending'";
+
+async fn mark_billing_failed_best_effort(pool: &DbRouter, request_id: Uuid) {
+    let update = pool.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        MARK_BILLING_FAILED_SQL,
+        [request_id.into()],
+    ));
+    match tokio::time::timeout(Duration::from_millis(250), update).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            // Preserve the original billing error. The stale-trace reconciler
+            // retries this transition after the database becomes available.
+            tracing::warn!(%request_id, %error, "failed to mark billing trace failed; reconciliation will retry");
+        }
+        Err(_) => {
+            tracing::warn!(%request_id, "timed out marking billing trace failed; reconciliation will retry");
+        }
+    }
+}
 
 /// 计费服务
 #[derive(Clone)]
@@ -206,11 +228,44 @@ impl BillingService {
             finished_at: new_log.finished_at,
         };
 
-        let saved_log = UsageLog::create(pool.as_ref(), &create_req)
-            .await
-            .map_err(|e| {
-                KeyComputeError::DatabaseError(format!("Failed to save usage log: {}", e))
-            })?;
+        let tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                keycompute_observability::metrics::BILLING_WRITE_FAILURE_TOTAL.inc();
+                mark_billing_failed_best_effort(pool.as_ref(), ctx.request_id).await;
+                return Err(KeyComputeError::DatabaseError(format!(
+                    "Failed to begin billing transaction: {error}"
+                )));
+            }
+        };
+        let saved_log = match UsageLog::create(&tx, &create_req).await {
+            Ok(log) => log,
+            Err(error) => {
+                keycompute_observability::metrics::BILLING_WRITE_FAILURE_TOTAL.inc();
+                let _ = tx.rollback().await;
+                mark_billing_failed_best_effort(pool.as_ref(), ctx.request_id).await;
+                return Err(KeyComputeError::DatabaseError(format!(
+                    "Failed to save usage log: {error}"
+                )));
+            }
+        };
+        if let Err(error) = tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE gateway_requests SET billing_status='succeeded',updated_at=NOW() WHERE request_id=$1",
+            [ctx.request_id.into()],
+        )).await {
+            keycompute_observability::metrics::BILLING_WRITE_FAILURE_TOTAL.inc();
+            let _ = tx.rollback().await;
+            mark_billing_failed_best_effort(pool.as_ref(), ctx.request_id).await;
+            return Err(KeyComputeError::DatabaseError(format!("Failed to update billing trace: {error}")));
+        }
+        if let Err(error) = tx.commit().await {
+            keycompute_observability::metrics::BILLING_WRITE_FAILURE_TOTAL.inc();
+            mark_billing_failed_best_effort(pool.as_ref(), ctx.request_id).await;
+            return Err(KeyComputeError::DatabaseError(format!(
+                "Failed to commit billing transaction: {error}"
+            )));
+        }
 
         tracing::info!(
             request_id = %ctx.request_id,
@@ -815,12 +870,19 @@ mod tests {
     use keycompute_types::PricingSnapshot;
     use rust_decimal::Decimal;
 
+    #[test]
+    fn billing_failure_transition_never_overwrites_a_committed_status() {
+        assert!(MARK_BILLING_FAILED_SQL.contains("billing_status='failed'"));
+        assert!(MARK_BILLING_FAILED_SQL.contains("billing_status='pending'"));
+    }
+
     #[tokio::test]
     async fn finalize_records_attributed_provider_account() {
         // 调用方传入的 provider/account（fallback 场景由 ctx.billing_target
         // 提供实际完成账号）必须原样写入 usage log 的归属字段。
         let service = BillingService::new();
         let ctx = RequestContext::new(
+            Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
@@ -857,6 +919,7 @@ mod tests {
         let service = BillingService::new();
         let new_ctx = || {
             RequestContext::new(
+                Uuid::new_v4(),
                 Uuid::new_v4(),
                 Uuid::new_v4(),
                 Uuid::new_v4(),

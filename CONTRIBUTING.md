@@ -159,6 +159,18 @@ If your change touches `desktop` or `mobile`, run the relevant package commands 
 - Add or update tests when behavior changes.
 - Keep logging and error messages actionable.
 
+### Example security configuration policy
+
+- `.env.example`, `config.example.toml`, and the fallback values in the Compose
+  files are development examples. Operators must override them for production.
+- Production startup rejects placeholder JWT and node-registration secrets,
+  default or weak administrator passwords, and an omitted Provider API-key
+  encryption key. Keep code, templates, and tests aligned with this
+  fail-closed policy.
+- New example credentials must be clearly marked, remain overridable through
+  documented configuration, and have tests that keep code, templates, and
+  Compose fallbacks aligned.
+
 ### Frontend changes
 
 - This repository uses Dioxus 0.7. Do not introduce older Dioxus APIs.
@@ -167,9 +179,11 @@ If your change touches `desktop` or `mobile`, run the relevant package commands 
 
 ### Database changes
 
-- Update `crates/keycompute-db/src/schema.sql` with the complete final schema.
+- Update `crates/keycompute-db/migrations/V0001__baseline.sql`; it is the complete
+  schema and the only SQL source of truth for fresh deployments.
 - Update the relevant data models and query code in `crates/keycompute-db/src/models/`.
-- Recreate the development database after schema changes; incremental migrations and old-data compatibility are not supported.
+- Recreate the database after changing the baseline; incremental upgrades,
+  compatibility migrations, and old-data backfills are not supported.
 - Verify the server can initialize an empty database and boot cleanly.
 
 ### Adding a new provider

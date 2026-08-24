@@ -3383,6 +3383,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap",
+ "deadpool-redis",
  "dotenv",
  "futures",
  "hex",
@@ -3693,6 +3694,7 @@ dependencies = [
  "keycompute-config",
  "keycompute-db",
  "keycompute-distribution",
+ "keycompute-observability",
  "keycompute-types",
  "rust_decimal",
  "sea-orm",
@@ -3726,6 +3728,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3738,6 +3741,7 @@ dependencies = [
  "hex",
  "hmac",
  "keycompute-config",
+ "keycompute-observability",
  "keycompute-types",
  "parking_lot",
  "rand 0.8.5",
@@ -3928,11 +3932,15 @@ dependencies = [
 name = "keycompute-types"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
+ "regex",
  "rust_decimal",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -4210,11 +4218,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "futures",
  "keycompute-types",
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4621,6 +4631,7 @@ dependencies = [
  "fastrand",
  "keycompute-config",
  "keycompute-db",
+ "keycompute-observability",
  "keycompute-routing",
  "keycompute-runtime",
  "keycompute-types",

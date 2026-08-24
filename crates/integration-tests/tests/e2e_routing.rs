@@ -44,6 +44,7 @@ fn create_test_context() -> RequestContext {
         Uuid::new_v4(),
         Uuid::new_v4(),
         Uuid::new_v4(),
+        Uuid::new_v4(),
         "gpt-4o",
         vec![],
         true,

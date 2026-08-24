@@ -71,9 +71,10 @@ pub fn parse_openai_stream(
                     }
                 }
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(KeyComputeError::ProviderError(e.to_string())))
-                        .await;
+                    // Preserve structured transport/body-read failures. The
+                    // executor separately normalizes parser-generated legacy
+                    // ProviderError values as non-retryable protocol failures.
+                    let _ = tx.send(Err(e)).await;
                     return;
                 }
             }

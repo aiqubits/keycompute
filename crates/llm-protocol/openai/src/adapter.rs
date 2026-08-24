@@ -17,7 +17,8 @@
 use async_trait::async_trait;
 use keycompute_types::{KeyComputeError, Result};
 use llm_protocol_provider::{
-    ByteStream, HttpTransport, ProviderAdapter, StreamBox, StreamEvent, UpstreamRequest,
+    ByteStream, HttpTransport, ProviderAdapter, StreamBox, StreamEvent, UpstreamFailure,
+    UpstreamFailureKind, UpstreamRequest, UpstreamResponse, UpstreamResponseMeta,
 };
 use serde_json;
 
@@ -73,12 +74,39 @@ impl OpenAIProvider {
     /// 某些中转代理）不识别 `stream_options` 字段会返回 400/422。
     /// 有意排除 401/403/404/429 等与请求体无关的错误，
     /// 避免对无效 Key / 限流场景重发注定失败的请求。
-    fn is_client_error(err: &KeyComputeError) -> bool {
-        matches!(
-            err,
-            KeyComputeError::ProviderError(msg)
-                if msg.contains("HTTP error (400") || msg.contains("HTTP error (422")
-        )
+    fn is_structured_client_error(err: &UpstreamFailure) -> bool {
+        matches!(err.status, Some(400 | 422))
+            && err
+                .sanitized_summary
+                .to_ascii_lowercase()
+                .contains("stream_options")
+    }
+
+    fn protocol_failure(error: impl std::fmt::Display) -> UpstreamFailure {
+        UpstreamFailure {
+            kind: UpstreamFailureKind::Protocol,
+            status: None,
+            headers_received_at: None,
+            upstream_request_id: None,
+            retryable: false,
+            stable_error_code: "upstream_protocol".to_string(),
+            sanitized_summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+        }
+    }
+
+    fn protocol_failure_with_meta(
+        meta: &UpstreamResponseMeta,
+        error: impl std::fmt::Display,
+    ) -> UpstreamFailure {
+        UpstreamFailure {
+            kind: UpstreamFailureKind::Protocol,
+            status: Some(meta.status),
+            headers_received_at: Some(meta.headers_received_at),
+            upstream_request_id: meta.upstream_request_id.clone(),
+            retryable: false,
+            stable_error_code: "upstream_protocol".to_string(),
+            sanitized_summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+        }
     }
 
     /// 构建 OpenAI 请求体（支持 Vision 多模态）
@@ -103,7 +131,7 @@ impl OpenAIProvider {
             temperature: request.temperature,
             top_p: request.top_p,
             stop: None,
-            stream_options: if request.stream {
+            stream_options: if request.stream && request.include_stream_usage {
                 Some(StreamOptions {
                     include_usage: Some(true),
                 })
@@ -119,11 +147,22 @@ impl OpenAIProvider {
         transport: &dyn HttpTransport,
         request: UpstreamRequest,
     ) -> Result<(String, Option<(u32, u32)>, Option<String>)> {
-        // 返回 (content, usage, finish_reason) 元组
+        self.chat_internal_with_meta(transport, request)
+            .await
+            .map(|response| response.body)
+            .map_err(UpstreamFailure::into_keycompute_error)
+    }
+
+    async fn chat_internal_with_meta(
+        &self,
+        transport: &dyn HttpTransport,
+        request: UpstreamRequest,
+    ) -> std::result::Result<
+        UpstreamResponse<(String, Option<(u32, u32)>, Option<String>)>,
+        UpstreamFailure,
+    > {
         let body = self.build_request_body(&request);
-        let body_json = serde_json::to_string(&body).map_err(|e| {
-            KeyComputeError::ProviderError(format!("Failed to serialize request: {}", e))
-        })?;
+        let body_json = serde_json::to_string(&body).map_err(Self::protocol_failure)?;
 
         let headers = vec![
             (
@@ -133,14 +172,12 @@ impl OpenAIProvider {
             ("Content-Type".to_string(), "application/json".to_string()),
         ];
 
-        let response_text = transport
-            .post_json(&Self::chat_url(&request.endpoint), headers, body_json)
+        let response = transport
+            .post_json_response(&Self::chat_url(&request.endpoint), headers, body_json)
             .await?;
 
-        let openai_response: OpenAIResponse =
-            serde_json::from_str(&response_text).map_err(|e| {
-                KeyComputeError::ProviderError(format!("Failed to parse response: {}", e))
-            })?;
+        let openai_response: OpenAIResponse = serde_json::from_str(&response.body)
+            .map_err(|error| Self::protocol_failure_with_meta(&response.meta, error))?;
 
         // 使用 OpenAIResponse 的方法一次性提取所有字段
         let content = openai_response.extract_text();
@@ -151,19 +188,20 @@ impl OpenAIProvider {
             .usage
             .map(|u| (u.prompt_tokens as u32, u.completion_tokens as u32));
 
-        Ok((content, usage, finish_reason))
+        Ok(UpstreamResponse {
+            meta: response.meta,
+            body: (content, usage, finish_reason),
+        })
     }
 
     /// 执行流式请求
-    async fn stream_chat_internal(
+    async fn stream_chat_internal_with_meta(
         &self,
         transport: &dyn HttpTransport,
         request: UpstreamRequest,
-    ) -> Result<StreamBox> {
+    ) -> std::result::Result<UpstreamResponse<StreamBox>, UpstreamFailure> {
         let body = self.build_request_body(&request);
-        let body_json = serde_json::to_string(&body).map_err(|e| {
-            KeyComputeError::ProviderError(format!("Failed to serialize request: {}", e))
-        })?;
+        let body_json = serde_json::to_string(&body).map_err(Self::protocol_failure)?;
 
         let headers = vec![
             (
@@ -175,30 +213,25 @@ impl OpenAIProvider {
         ];
 
         let url = Self::chat_url(&request.endpoint);
-        let byte_stream: ByteStream = match transport
-            .post_stream(&url, headers.clone(), body_json)
+        let response = match transport
+            .post_stream_response(&url, headers, body_json)
             .await
         {
-            Ok(stream) => stream,
-            // 部分 OpenAI 兼容上游不认识 stream_options 字段而返回 4xx，
-            // 去掉该字段重试一次（代价：收不到精确 Usage，计费退化为估算）
-            Err(e) if body.stream_options.is_some() && Self::is_client_error(&e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Upstream rejected stream_options, retrying without it"
-                );
-                let mut fallback_body = body;
-                fallback_body.stream_options = None;
-                let fallback_json = serde_json::to_string(&fallback_body).map_err(|e| {
-                    KeyComputeError::ProviderError(format!("Failed to serialize request: {}", e))
-                })?;
-                transport.post_stream(&url, headers, fallback_json).await?
+            Ok(response) => response,
+            // 将兼容性重试边界交给 executor。这样第一次 400/422 的状态、
+            // Request ID、耗时和随后不带 stream_options 的请求各自拥有 attempt。
+            Err(mut error)
+                if body.stream_options.is_some() && Self::is_structured_client_error(&error) =>
+            {
+                error.retryable = true;
+                error.stable_error_code = "upstream_stream_options_unsupported".to_string();
+                return Err(error);
             }
             Err(e) => return Err(e),
         };
 
         // 转换字节流为 SSE 事件流
-        Ok(parse_openai_stream(byte_stream))
+        Ok(response.map_body(parse_openai_stream))
     }
 
     // ========================================================================
@@ -648,7 +681,10 @@ impl ProviderAdapter for OpenAIProvider {
         request: UpstreamRequest,
     ) -> Result<StreamBox> {
         if request.stream {
-            self.stream_chat_internal(transport, request).await
+            self.stream_chat_internal_with_meta(transport, request)
+                .await
+                .map(|response| response.body)
+                .map_err(|error| KeyComputeError::ProviderError(error.to_string()))
         } else {
             // 非流式请求，包装为单事件流
             let (content, usage, finish_reason) = self.chat_internal(transport, request).await?;
@@ -673,6 +709,35 @@ impl ProviderAdapter for OpenAIProvider {
 
             let stream = futures::stream::iter(events);
             Ok(Box::pin(stream))
+        }
+    }
+
+    async fn stream_chat_with_meta(
+        &self,
+        transport: &dyn HttpTransport,
+        request: UpstreamRequest,
+    ) -> std::result::Result<UpstreamResponse<StreamBox>, UpstreamFailure> {
+        if request.stream {
+            self.stream_chat_internal_with_meta(transport, request)
+                .await
+        } else {
+            let response = self.chat_internal_with_meta(transport, request).await?;
+            let (content, usage, finish_reason) = response.body;
+            let mut events: Vec<Result<StreamEvent>> = vec![Ok(StreamEvent::Delta {
+                content,
+                finish_reason: Some(finish_reason.unwrap_or_else(|| "stop".to_string())),
+            })];
+            if let Some((input_tokens, output_tokens)) = usage {
+                events.push(Ok(StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                }));
+            }
+            events.push(Ok(StreamEvent::Done));
+            Ok(UpstreamResponse {
+                meta: response.meta,
+                body: Box::pin(futures::stream::iter(events)),
+            })
         }
     }
 
@@ -712,8 +777,112 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct MetadataTransport {
+        fail_stream: bool,
+    }
+
+    #[async_trait]
+    impl HttpTransport for MetadataTransport {
+        async fn post_json_response(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            _body: String,
+        ) -> std::result::Result<UpstreamResponse<String>, UpstreamFailure> {
+            let mut meta = UpstreamResponseMeta::synthetic_success();
+            meta.upstream_request_id = Some("upstream-json-id".to_string());
+            Ok(UpstreamResponse {
+                meta,
+                body: "not-json".to_string(),
+            })
+        }
+
+        async fn post_stream_response(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            _body: String,
+        ) -> std::result::Result<UpstreamResponse<ByteStream>, UpstreamFailure> {
+            if self.fail_stream {
+                let received_at = UpstreamResponseMeta::synthetic_success().headers_received_at;
+                Err(UpstreamFailure {
+                    kind: UpstreamFailureKind::HttpStatus,
+                    status: Some(429),
+                    headers_received_at: Some(received_at),
+                    upstream_request_id: Some("upstream-rate-id".to_string()),
+                    retryable: true,
+                    stable_error_code: "upstream_http_429".to_string(),
+                    sanitized_summary: "rate limited".to_string(),
+                })
+            } else {
+                unreachable!("stream response is not used by the non-stream test")
+            }
+        }
+
+        async fn post_json(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            _body: String,
+        ) -> Result<String> {
+            unreachable!("structured method must be used")
+        }
+
+        async fn post_stream(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            _body: String,
+        ) -> Result<ByteStream> {
+            unreachable!("structured method must be used")
+        }
+
+        fn request_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn stream_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+    }
+
     #[async_trait]
     impl HttpTransport for DegradingTransport {
+        async fn post_stream_response(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            body: String,
+        ) -> std::result::Result<UpstreamResponse<ByteStream>, UpstreamFailure> {
+            let mut bodies = self.bodies.lock().unwrap();
+            let has_stream_options = body.contains("stream_options");
+            bodies.push(body);
+            if bodies.len() == 1 && has_stream_options {
+                let status = [400_u16, 401, 422, 429]
+                    .into_iter()
+                    .find(|status| self.first_error.contains(&format!("({status} ")));
+                Err(UpstreamFailure {
+                    kind: UpstreamFailureKind::HttpStatus,
+                    status,
+                    headers_received_at: Some(
+                        UpstreamResponseMeta::synthetic_success().headers_received_at,
+                    ),
+                    upstream_request_id: None,
+                    retryable: status == Some(429),
+                    stable_error_code: status
+                        .map(|status| format!("upstream_http_{status}"))
+                        .unwrap_or_else(|| "upstream_transport".to_string()),
+                    sanitized_summary: self.first_error.clone(),
+                })
+            } else {
+                Ok(UpstreamResponse {
+                    meta: UpstreamResponseMeta::synthetic_success(),
+                    body: Box::pin(futures::stream::empty()),
+                })
+            }
+        }
+
         async fn post_json(
             &self,
             _url: &str,
@@ -730,8 +899,9 @@ mod tests {
             body: String,
         ) -> Result<ByteStream> {
             let mut bodies = self.bodies.lock().unwrap();
+            let has_stream_options = body.contains("stream_options");
             bodies.push(body);
-            if bodies.len() == 1 {
+            if bodies.len() == 1 && has_stream_options {
                 Err(KeyComputeError::ProviderError(self.first_error.clone()))
             } else {
                 Ok(Box::pin(futures::stream::empty()))
@@ -754,37 +924,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_options_degradation_on_400() {
-        // 上游不认识 stream_options 返回 400 时，应去掉该字段重试一次
+    async fn stream_options_400_requests_an_executor_tracked_retry() {
         let provider = OpenAIProvider::new();
         let transport =
             DegradingTransport::new("HTTP error (400 Bad Request): unknown field stream_options");
 
-        let result = provider.stream_chat(&transport, stream_request()).await;
-        assert!(result.is_ok(), "degraded retry should succeed");
+        let error = match provider
+            .stream_chat_with_meta(&transport, stream_request())
+            .await
+        {
+            Ok(_) => panic!("adapter must not hide the compatibility retry"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.stable_error_code,
+            "upstream_stream_options_unsupported"
+        );
+        assert!(error.retryable);
 
         let bodies = transport.bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 2, "should retry exactly once");
+        assert_eq!(
+            bodies.len(),
+            1,
+            "adapter must issue exactly one HTTP request"
+        );
         assert!(
             bodies[0].contains("stream_options"),
             "first request should carry stream_options"
         );
-        assert!(
-            !bodies[1].contains("stream_options"),
-            "retry request should drop stream_options"
-        );
     }
 
     #[tokio::test]
-    async fn test_stream_options_degradation_on_422() {
+    async fn stream_options_422_requests_an_executor_tracked_retry() {
         let provider = OpenAIProvider::new();
         let transport = DegradingTransport::new(
             "HTTP error (422 Unprocessable Entity): extra field stream_options",
         );
 
-        let result = provider.stream_chat(&transport, stream_request()).await;
+        let error = match provider
+            .stream_chat_with_meta(&transport, stream_request())
+            .await
+        {
+            Ok(_) => panic!("adapter must expose the first HTTP failure"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.stable_error_code,
+            "upstream_stream_options_unsupported"
+        );
+        assert_eq!(transport.bodies.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn executor_can_retry_without_stream_options() {
+        let provider = OpenAIProvider::new();
+        let transport =
+            DegradingTransport::new("HTTP error (400 Bad Request): unknown field stream_options");
+        let mut request = stream_request();
+        request.include_stream_usage = false;
+
+        let result = provider.stream_chat_with_meta(&transport, request).await;
         assert!(result.is_ok());
-        assert_eq!(transport.bodies.lock().unwrap().len(), 2);
+        let bodies = transport.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(!bodies[0].contains("stream_options"));
     }
 
     #[tokio::test]
@@ -805,6 +1008,66 @@ mod tests {
                 "{error} should only be sent once"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stream_options_is_not_removed_for_an_unrelated_client_error() {
+        let transport = DegradingTransport::new("HTTP error (400 Bad Request): invalid model");
+        let provider = OpenAIProvider::new();
+
+        let error = match provider
+            .stream_chat_with_meta(&transport, stream_request())
+            .await
+        {
+            Ok(_) => panic!("unrelated 400 should not trigger compatibility retry"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, Some(400));
+        assert_ne!(
+            error.stable_error_code,
+            "upstream_stream_options_unsupported"
+        );
+        assert_eq!(transport.bodies.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn structured_http_failure_preserves_status_and_upstream_request_id() {
+        let provider = OpenAIProvider::new();
+        let transport = MetadataTransport { fail_stream: true };
+        let error = match provider
+            .stream_chat_with_meta(&transport, stream_request())
+            .await
+        {
+            Ok(_) => panic!("429 response must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, Some(429));
+        assert_eq!(
+            error.upstream_request_id.as_deref(),
+            Some("upstream-rate-id")
+        );
+        assert_eq!(error.stable_error_code, "upstream_http_429");
+        assert!(error.retryable);
+    }
+
+    #[tokio::test]
+    async fn protocol_failure_keeps_response_metadata_separate_from_first_content() {
+        let provider = OpenAIProvider::new();
+        let transport = MetadataTransport { fail_stream: false };
+        let request = UpstreamRequest::new("https://provider.example/v1", "sk-test", "gpt-test")
+            .with_message("user", "hello");
+        let error = match provider.stream_chat_with_meta(&transport, request).await {
+            Ok(_) => panic!("invalid JSON must fail before producing protocol content"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, UpstreamFailureKind::Protocol);
+        assert_eq!(error.status, Some(200));
+        assert!(error.headers_received_at.is_some());
+        assert_eq!(
+            error.upstream_request_id.as_deref(),
+            Some("upstream-json-id")
+        );
     }
 
     #[test]

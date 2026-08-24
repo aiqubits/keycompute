@@ -33,6 +33,12 @@ pub struct UpstreamRequest {
     pub messages: Vec<UpstreamMessage>,
     /// 是否流式输出
     pub stream: bool,
+    /// 是否请求上游在流中返回精确 usage。
+    ///
+    /// OpenAI 兼容上游可能不支持 `stream_options`。该开关只由执行器在一次
+    /// 已被完整追踪的兼容性重试中关闭，协议适配器本身不得隐藏发起第二个请求。
+    #[serde(default = "default_true")]
+    pub include_stream_usage: bool,
     /// 最大 token 数（可选）
     pub max_tokens: Option<u32>,
     /// 温度参数（可选）
@@ -60,6 +66,7 @@ impl fmt::Debug for UpstreamRequest {
             .field("model", &self.model)
             .field("messages", &self.messages)
             .field("stream", &self.stream)
+            .field("include_stream_usage", &self.include_stream_usage)
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
             .field("top_p", &self.top_p)
@@ -85,6 +92,7 @@ impl UpstreamRequest {
             model: model.into(),
             messages: Vec::new(),
             stream: false,
+            include_stream_usage: true,
             max_tokens: None,
             temperature: None,
             top_p: None,
@@ -123,6 +131,10 @@ impl UpstreamRequest {
         self.temperature = Some(temperature);
         self
     }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// 上游消息结构

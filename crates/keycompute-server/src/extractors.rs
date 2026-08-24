@@ -10,6 +10,7 @@ use axum::{
     extract::FromRequestParts,
     http::{HeaderMap, request::Parts},
 };
+use chrono::{DateTime, Utc};
 use keycompute_auth::{AuthContext, Permission};
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,9 @@ use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::sync::Arc;
 use uuid::Uuid;
+
+const ACTIVE_NODE_SESSION_TOKEN_QUERY: &str = "SELECT node_id, id FROM node_sessions \
+     WHERE session_token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()";
 
 /// 认证提取器
 ///
@@ -172,21 +176,63 @@ impl<S> FromRequestParts<S> for RequestId
 where
     S: Send + Sync,
 {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        parts.extensions.get::<RequestId>().cloned().ok_or_else(|| {
+            ApiError::Internal("canonical request ID middleware is not installed".to_string())
+        })
+    }
+}
+
+/// Timestamp captured when the request first enters the application middleware stack.
+#[derive(Debug, Clone)]
+pub struct RequestReceivedAt(pub DateTime<Utc>);
+
+impl<S> FromRequestParts<S> for RequestReceivedAt
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<RequestReceivedAt>()
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::Internal(
+                    "request ingress timestamp middleware is not installed".to_string(),
+                )
+            })
+    }
+}
+
+/// Validated client-supplied correlation ID. It never participates in internal joins.
+#[derive(Debug, Clone, Default)]
+pub struct ClientRequestId(pub Option<String>);
+
+impl<S> FromRequestParts<S> for ClientRequestId
+where
+    S: Send + Sync,
+{
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(
         parts: &mut Parts,
         _state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
-        // 尝试从 X-Request-ID 头获取，否则生成新的
-        let id = parts
-            .headers
-            .get("X-Request-ID")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .unwrap_or_else(Uuid::new_v4);
-
-        Ok(Self(id))
+        Ok(parts
+            .extensions
+            .get::<ClientRequestId>()
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
@@ -230,14 +276,19 @@ impl FromRequestParts<AppState> for NodeSessionAuth {
             .ok_or_else(|| ApiError::Internal("Database pool not configured".to_string()))?;
 
         // 4. 查询 node_sessions, 匹配 session_token_hash
-        let row = pool.query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT node_id, id FROM node_sessions WHERE session_token_hash = $1 AND revoked_at IS NULL",
-            [token_hash.as_str().into()],
-        ))
-        .await
-        .map_err(|e| ApiError::Internal(format!("Database query failed: {}", e)))?
-        .ok_or_else(|| ApiError::Auth("Invalid session token".to_string()))?;
+        // Session validity is security-sensitive and must be writer-fresh.
+        // A lagging replica could otherwise continue accepting a revoked or
+        // expired session (and can also reject a newly issued session).
+        let row = pool
+            .write_conn()
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                ACTIVE_NODE_SESSION_TOKEN_QUERY,
+                [token_hash.as_str().into()],
+            ))
+            .await
+            .map_err(|e| ApiError::Internal(format!("Database query failed: {}", e)))?
+            .ok_or_else(|| ApiError::Auth("Invalid session token".to_string()))?;
 
         let node_id: Uuid = row
             .try_get_by_index(0)
@@ -332,6 +383,12 @@ mod tests {
             keycompute_auth::AuthService::new(keycompute_auth::ProduceAiKeyValidator::default());
         let result = AuthExtractor::from_header_with_auth(&headers, &auth_service).await;
         assert!(matches!(result, Err(ApiError::Auth(_))));
+    }
+
+    #[test]
+    fn node_session_token_lookup_rejects_expired_sessions() {
+        assert!(ACTIVE_NODE_SESSION_TOKEN_QUERY.contains("revoked_at IS NULL"));
+        assert!(ACTIVE_NODE_SESSION_TOKEN_QUERY.contains("expires_at > NOW()"));
     }
 
     #[tokio::test]

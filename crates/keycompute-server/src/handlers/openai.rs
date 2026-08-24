@@ -5,7 +5,7 @@
 
 use crate::{
     error::{ApiError, Result},
-    extractors::{AuthExtractor, RequestId},
+    extractors::{AuthExtractor, ClientRequestId, RequestId, RequestReceivedAt},
     state::AppState,
 };
 use axum::{
@@ -16,14 +16,18 @@ use axum::{
         sse::{Event, Sse},
     },
 };
-use futures::stream::Stream;
+use futures::{StreamExt, stream::Stream};
+use keycompute_auth::Permission;
 use keycompute_db::models::account::Account;
 use keycompute_types::{
-    ContentPart, ExecutionTarget, Message, MessageContent, MessageRole, RequestContext,
+    ClientResponseOutcome, ContentPart, ErrorOrigin, ExecutionTarget, Message, MessageContent,
+    MessageRole, NoopRequestLifecycleRecorder, RequestContext, RequestLifecycleRecorder,
+    RequestStatus, RequestTraceStart, RouteType, TraceErrorCategory,
 };
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc, time::Duration};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 // ==================== Chat Completions ====================
 
@@ -329,6 +333,15 @@ pub struct ChatCompletionChunkDelta {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
+async fn finish_unexecuted_trace(
+    guard: &mut super::PreExecutionTraceGuard,
+    origin: ErrorOrigin,
+    category: TraceErrorCategory,
+    code: &str,
+) {
+    guard.finish_failed(origin, category, code).await;
+}
+
 /// Chat Completions 处理器
 /// POST /v1/chat/completions
 ///
@@ -337,29 +350,99 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     auth: AuthExtractor,
     request_id: RequestId,
+    client_request_id: ClientRequestId,
+    received_at: RequestReceivedAt,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<axum::response::Response> {
+    let mut lifecycle: Arc<dyn RequestLifecycleRecorder> = Arc::clone(&state.lifecycle);
+    let mut pre_execution_guard =
+        super::PreExecutionTraceGuard::new(Arc::clone(&lifecycle), request_id.0);
+    if let Err(error) = lifecycle
+        .start_request(RequestTraceStart {
+            request_id: request_id.0,
+            client_request_id: client_request_id.0,
+            tenant_id: auth.tenant_id,
+            user_id: auth.user_id,
+            produce_ai_key_id: auth.produce_ai_key_id,
+            protocol: "openai".to_string(),
+            request_path: "/v1/chat/completions".to_string(),
+            requested_model: request.model.clone(),
+            is_stream: request.stream,
+            received_at: received_at.0,
+        })
+        .await
+    {
+        tracing::warn!(request_id=%request_id.0, %error, "request tracing disabled for this request");
+        pre_execution_guard.disarm();
+        lifecycle = Arc::new(NoopRequestLifecycleRecorder);
+        pre_execution_guard =
+            super::PreExecutionTraceGuard::new(Arc::clone(&lifecycle), request_id.0);
+    }
+    if !auth.has_permission(&Permission::UseApi) {
+        finish_unexecuted_trace(
+            &mut pre_execution_guard,
+            ErrorOrigin::Client,
+            TraceErrorCategory::Authorization,
+            "permission_denied",
+        )
+        .await;
+        return Err(ApiError::Forbidden(
+            "API-use permission is required for /v1/chat/completions".to_string(),
+        ));
+    }
     // 0. 采样参数范围校验（越界直接 400，不进入路由/上游调用）
-    request.validate_sampling_params()?;
+    if let Err(error) = request.validate_sampling_params() {
+        finish_unexecuted_trace(
+            &mut pre_execution_guard,
+            ErrorOrigin::Client,
+            TraceErrorCategory::InvalidRequest,
+            "invalid_sampling_parameters",
+        )
+        .await;
+        return Err(error);
+    }
 
     // 1. 余额预检查
     // 如果余额低于阈值（0.1元），直接拒绝请求
-    if let Some(balance_service) = state.billing.balance_service() {
-        balance_service
+    if let Some(balance_service) = state.billing.balance_service()
+        && let Err(error) = balance_service
             .check_balance_for_tenant(auth.user_id, auth.tenant_id)
             .await
-            .map_err(ApiError::from)?;
+    {
+        finish_unexecuted_trace(
+            &mut pre_execution_guard,
+            ErrorOrigin::Client,
+            TraceErrorCategory::Balance,
+            "insufficient_balance",
+        )
+        .await;
+        return Err(ApiError::from(error));
     }
 
     // 1. 构建 PricingSnapshot
     // 注意：此时 provider 尚未确定（路由在之后执行）
     // Node 模型（node:前缀）使用 empty provider，其他使用 openai
     let provider = keycompute_pricing::resolve_pricing_provider(&request.model);
-    let pricing = state
+    let pricing = match state
         .pricing
         .create_snapshot(&request.model, &auth.tenant_id, Some(provider))
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to create pricing snapshot: {}", e)))?;
+    {
+        Ok(pricing) => pricing,
+        Err(error) => {
+            finish_unexecuted_trace(
+                &mut pre_execution_guard,
+                ErrorOrigin::Gateway,
+                TraceErrorCategory::Internal,
+                "pricing_failed",
+            )
+            .await;
+            return Err(ApiError::Internal(format!(
+                "Failed to create pricing snapshot: {}",
+                error
+            )));
+        }
+    };
 
     // 3. 转换消息格式
     let messages: Vec<Message> = request
@@ -385,6 +468,7 @@ pub async fn chat_completions(
 
     // 4. 构建 RequestContext
     let mut request_ctx = RequestContext::new(
+        request_id.0,
         auth.user_id,
         auth.tenant_id,
         auth.produce_ai_key_id,
@@ -401,11 +485,26 @@ pub async fn chat_completions(
     let mut ctx = Arc::new(request_ctx);
 
     // 5. 智能路由
-    let plan = state
-        .routing
-        .route(&ctx)
+    let plan = match state.routing.route(&ctx).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            finish_unexecuted_trace(
+                &mut pre_execution_guard,
+                ErrorOrigin::Gateway,
+                TraceErrorCategory::Internal,
+                "routing_failed",
+            )
+            .await;
+            return Err(crate::error::map_routing_error(error, "openai"));
+        }
+    };
+    let (route_type, route_status) = initial_route_trace_state(&plan.primary);
+    if let Err(error) = lifecycle
+        .set_route(request_id.0, route_type, route_status)
         .await
-        .map_err(|e| crate::error::map_routing_error(e, "openai"))?;
+    {
+        tracing::warn!(request_id=%request_id.0, %error, "failed to record request route");
+    }
 
     // 5. 根据 ExecutionTarget 分流执行路径
     match &plan.primary {
@@ -426,10 +525,18 @@ pub async fn chat_completions(
             ctx_mut.set_provider(keycompute_pricing::NODE_PRICING_PROVIDER);
 
             // 调用 node-gateway 执行
-            let node_gateway = state
-                .node_gateway
-                .as_ref()
-                .ok_or_else(|| ApiError::Internal("node gateway not configured".to_string()))?;
+            let Some(node_gateway) = state.node_gateway.as_ref() else {
+                finish_unexecuted_trace(
+                    &mut pre_execution_guard,
+                    ErrorOrigin::Gateway,
+                    TraceErrorCategory::Internal,
+                    "node_gateway_unavailable",
+                )
+                .await;
+                return Err(ApiError::Internal(
+                    "node gateway not configured".to_string(),
+                ));
+            };
 
             // 构建 NodeTaskPayload
             let payload = keycompute_types::node::NodeTaskPayload {
@@ -450,38 +557,78 @@ pub async fn chat_completions(
 
             // 防御性校验 payload 互斥性
             if let Err(e) = payload.validate() {
+                finish_unexecuted_trace(
+                    &mut pre_execution_guard,
+                    ErrorOrigin::Gateway,
+                    TraceErrorCategory::Internal,
+                    "invalid_node_task_payload",
+                )
+                .await;
                 return Err(ApiError::Internal(format!(
                     "Invalid NodeTaskPayload: {}",
                     e
                 )));
             }
 
+            let mut client_response_guard =
+                super::ClientResponseGuard::new(Arc::clone(&lifecycle), Arc::clone(&ctx));
+            pre_execution_guard.disarm();
+
             if request.stream {
                 // 流式路径：获取完整响应后模拟流式输出
-                let response = node_gateway
+                let response = match node_gateway
                     .enqueue_and_wait(auth.user_id, model.clone(), payload)
                     .await
-                    .map_err(ApiError::from)?;
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let outcome = error.client_response_outcome();
+                        ctx.set_execution_failure(error.request_failure());
+                        client_response_guard.finish_with_outcome(outcome).await;
+                        return Err(ApiError::from(error));
+                    }
+                };
 
                 // 更新 token 计数到 ctx（用于计费）
                 ctx.set_input_tokens(response.usage.prompt_tokens);
                 ctx.add_output_tokens(response.usage.completion_tokens);
 
+                // Node 返回在这里已经完整可用，计费必须在创建 HTTP body 前完成；
+                // 否则客户端在 [DONE] 前后断开都会 drop body 并跳过结算。
+                finalize_openai_billing(
+                    &state.billing,
+                    &ctx,
+                    keycompute_pricing::NODE_PRICING_PROVIDER,
+                    uuid::Uuid::nil(),
+                    "success",
+                )
+                .await;
+
                 // 将完整响应转换为模拟流式输出
                 let stream = simulate_node_stream(
                     response,
-                    ctx,
+                    Arc::clone(&ctx),
                     model.clone(),
-                    Arc::clone(&state.billing),
                     request.stream_options,
+                    Arc::clone(&lifecycle),
                 );
+                // The spawned stream task now owns client-delivery completion.
+                client_response_guard.disarm();
                 Ok(Sse::new(stream).into_response())
             } else {
                 // 非流式路径：保持现有逻辑
-                let response = node_gateway
+                let response = match node_gateway
                     .enqueue_and_wait(auth.user_id, model.clone(), payload)
                     .await
-                    .map_err(ApiError::from)?;
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let outcome = error.client_response_outcome();
+                        ctx.set_execution_failure(error.request_failure());
+                        client_response_guard.finish_with_outcome(outcome).await;
+                        return Err(ApiError::from(error));
+                    }
+                };
 
                 // 更新 token 计数到 ctx（用于计费）
                 ctx.set_input_tokens(response.usage.prompt_tokens);
@@ -528,17 +675,29 @@ pub async fn chat_completions(
                 };
 
                 // 触发计费（使用 NODE_PRICING_PROVIDER 常量，与路由层定价维度一致）
-                let billing = Arc::clone(&state.billing);
-                let _ = billing
-                    .finalize_and_trigger_distribution(
-                        &ctx,
-                        keycompute_pricing::NODE_PRICING_PROVIDER,
-                        uuid::Uuid::nil(),
-                        "success",
-                        auth.user_id,
-                    )
-                    .await;
+                finalize_openai_billing(
+                    &state.billing,
+                    &ctx,
+                    keycompute_pricing::NODE_PRICING_PROVIDER,
+                    uuid::Uuid::nil(),
+                    "success",
+                )
+                .await;
 
+                if let Err(error) =
+                    super::record_final_client_first_content(&lifecycle, ctx.request_id).await
+                {
+                    tracing::warn!(request_id=%ctx.request_id,%error,"failed to record Node client first content");
+                }
+
+                super::finish_client_response_trace(
+                    &lifecycle,
+                    &ctx,
+                    ClientResponseOutcome::Succeeded,
+                )
+                .await;
+
+                client_response_guard.disarm();
                 Ok(Json(openai_response).into_response())
             }
         }
@@ -576,24 +735,37 @@ pub async fn chat_completions(
 
             let timeout_duration =
                 std::time::Duration::from_secs(state.gateway_config.timeout_secs);
+            let mut client_response_guard =
+                super::ClientResponseGuard::new(Arc::clone(&lifecycle), Arc::clone(&ctx));
+            pre_execution_guard.disarm();
             let rx = match tokio::time::timeout(
                 timeout_duration,
-                state.gateway.execute(
+                state.gateway.execute_with_recorder(
                     Arc::clone(&ctx),
                     plan,
                     Arc::clone(&state.account_states),
                     Some(Arc::clone(&state.provider_health)),
+                    Arc::clone(&lifecycle),
                 ),
             )
             .await
             {
-                Ok(result) => result.map_err(crate::error::map_execution_error)?,
+                Ok(Ok(rx)) => rx,
+                Ok(Err(error)) => {
+                    client_response_guard
+                        .finish_with_outcome(ClientResponseOutcome::ResponseFailed)
+                        .await;
+                    return Err(crate::error::map_execution_error(error));
+                }
                 Err(_) => {
                     tracing::error!(
                         request_id = %request_id.0,
                         timeout_secs = state.gateway_config.timeout_secs,
                         "Gateway execute timeout"
                     );
+                    client_response_guard
+                        .finish_with_outcome(ClientResponseOutcome::TimedOut)
+                        .await;
                     return Err(ApiError::Internal(format!(
                         "Gateway execute timeout after {}s",
                         state.gateway_config.timeout_secs
@@ -616,50 +788,70 @@ pub async fn chat_completions(
                 // 流式响应
                 if has_image_content(&ctx.messages) {
                     // 流式 + 多模态：SSE keepalive 防止图片下载超时
-                    let stream = create_openai_stream_with_keepalive(
+                    let stream = create_openai_stream_with_keepalive_and_lifecycle(
                         rx,
-                        ctx,
-                        model,
-                        primary_provider,
-                        primary_account_id,
-                        billing,
-                        stream_options,
+                        OpenAiStreamContext {
+                            ctx,
+                            model,
+                            provider_name: primary_provider,
+                            account_id: primary_account_id,
+                            billing,
+                            stream_options,
+                            lifecycle: Arc::clone(&lifecycle),
+                        },
+                        timeout_duration,
                     );
+                    client_response_guard.disarm();
                     Ok(Sse::new(stream).into_response())
                 } else {
                     // 流式 + 纯文本：原逻辑，无 keepalive
-                    let stream = create_openai_stream(
+                    let stream = create_openai_stream_with_lifecycle(
                         rx,
-                        ctx,
-                        model,
-                        primary_provider,
-                        primary_account_id,
-                        billing,
-                        stream_options,
+                        OpenAiStreamContext {
+                            ctx,
+                            model,
+                            provider_name: primary_provider,
+                            account_id: primary_account_id,
+                            billing,
+                            stream_options,
+                            lifecycle: Arc::clone(&lifecycle),
+                        },
                     );
+                    client_response_guard.disarm();
                     Ok(Sse::new(stream).into_response())
                 }
             } else {
                 // 非流式响应
                 if has_image_content(&ctx.messages) {
                     // 多模态请求：使用 chunked keepalive 防止图片下载超时
-                    Ok(create_non_streaming_json_with_keepalive(
+                    let response = create_non_streaming_json_with_keepalive_and_lifecycle(
                         rx,
-                        ctx,
-                        model,
-                        primary_provider,
-                        primary_account_id,
-                        billing,
-                    ))
+                        OpenAiNonStreamingResponseContext {
+                            ctx,
+                            model,
+                            provider_name: primary_provider,
+                            account_id: primary_account_id,
+                            billing,
+                            lifecycle: Arc::clone(&lifecycle),
+                            response_timeout: timeout_duration,
+                        },
+                    );
+                    client_response_guard.disarm();
+                    Ok(response)
                 } else {
                     // 纯文本请求：直接返回 JSON（原快速路径）
-                    let response = create_openai_response(
+                    // The nested response helper installs its own guard before
+                    // its first await, so ownership can be transferred without
+                    // leaving a cancellation gap.
+                    client_response_guard.disarm();
+                    let response = create_openai_response_with_lifecycle(
                         rx,
                         ctx,
                         model,
                         primary_provider,
                         primary_account_id,
                         billing,
+                        Arc::clone(&lifecycle),
                     )
                     .await?;
                     Ok(Json(response).into_response())
@@ -669,84 +861,137 @@ pub async fn chat_completions(
     }
 }
 
-/// 创建 OpenAI 格式的非流式响应（纯文本快速路径）
-async fn create_openai_response(
+/// Selecting a Node route does not mean a task has been queued yet. The Node
+/// gateway advances the trace to `queued` only after its PostgreSQL task row is
+/// created, which also keeps the queued-task metric aligned with real tasks.
+fn initial_route_trace_state(target: &ExecutionTarget) -> (RouteType, RequestStatus) {
+    match target {
+        ExecutionTarget::Node { .. } => (RouteType::Node, RequestStatus::Routing),
+        ExecutionTarget::ProviderAccount { .. } => {
+            (RouteType::ProviderAccount, RequestStatus::Routing)
+        }
+    }
+}
+
+async fn create_openai_response_with_lifecycle(
     mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
     ctx: Arc<RequestContext>,
     model: String,
     provider_name: String,
     account_id: uuid::Uuid,
     billing: Arc<keycompute_billing::BillingService>,
+    lifecycle: Arc<dyn keycompute_types::RequestLifecycleRecorder>,
 ) -> Result<ChatCompletionResponse> {
-    let completion_id = generate_completion_id();
-    let created = chrono::Utc::now().timestamp();
-    let mut collector = StreamCollector::new();
+    let mut client_response_guard =
+        super::ClientResponseGuard::new(Arc::clone(&lifecycle), Arc::clone(&ctx));
+    let (mut response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let worker_ctx = Arc::clone(&ctx);
+    tokio::spawn(async move {
+        let completion_id = generate_completion_id();
+        let created = chrono::Utc::now().timestamp();
+        let mut collector = StreamCollector::new();
+        let mut handler_connected = true;
+        let mut terminal_error = None;
 
-    // 收集所有事件
-    while let Some(event) = rx.recv().await {
-        match collector.process_event(event) {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(message) => {
-                tracing::error!(
-                    request_id = %ctx.request_id,
-                    error = %message,
-                    "Stream error during non-streaming response"
-                );
-                finalize_openai_billing(
-                    &billing,
-                    &ctx,
-                    &provider_name,
-                    account_id,
-                    &collector.status,
-                )
-                .await;
-                return Err(ApiError::Internal(message));
+        // The worker owns the upstream receiver and billing state. If Axum
+        // drops the handler before a response exists, cancel upstream work but
+        // keep draining until executor supplies its terminal event.
+        loop {
+            tokio::select! {
+                biased;
+                _ = response_tx.closed(), if handler_connected => {
+                    handler_connected = false;
+                    worker_ctx.mark_client_disconnected();
+                }
+                event = rx.recv() => {
+                    let Some(event) = event else { break };
+                    match collector.process_event(event) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(message) => {
+                            tracing::error!(
+                                request_id = %worker_ctx.request_id,
+                                error = %message,
+                                "Stream error during non-streaming response"
+                            );
+                            terminal_error = Some(ApiError::Internal(message));
+                            break;
+                        }
+                    }
+                }
             }
         }
-    }
 
-    // 检查流完成状态
-    collector.check_completion(&ctx.request_id);
+        if terminal_error.is_none() {
+            collector.check_completion(&worker_ctx.request_id);
+            if collector.status == "incomplete" {
+                terminal_error = Some(ApiError::Internal(
+                    "Stream ended unexpectedly: channel closed without Done/Error event"
+                        .to_string(),
+                ));
+            }
+        }
 
-    // 流意外结束：先执行计费，再返回错误而非空 content 的 200 响应
-    if collector.status == "incomplete" {
         finalize_openai_billing(
             &billing,
-            &ctx,
+            &worker_ctx,
             &provider_name,
             account_id,
             &collector.status,
         )
         .await;
-        return Err(ApiError::Internal(
-            "Stream ended unexpectedly: channel closed without Done/Error event".to_string(),
-        ));
+
+        let result = if let Some(error) = terminal_error {
+            Err(error)
+        } else {
+            let (prompt_tokens, completion_tokens) = worker_ctx.usage_snapshot();
+            Ok(build_chat_completion_response(
+                completion_id,
+                created,
+                model,
+                collector.content,
+                collector.finish_reason,
+                prompt_tokens,
+                completion_tokens,
+                provider_name,
+            ))
+        };
+        if handler_connected && response_tx.send(result).is_err() {
+            worker_ctx.mark_client_disconnected();
+        }
+    });
+
+    let response = match response_rx.await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            super::finish_client_response_trace(
+                &lifecycle,
+                &ctx,
+                ClientResponseOutcome::ResponseFailed,
+            )
+            .await;
+            client_response_guard.disarm();
+            return Err(error);
+        }
+        Err(_) => {
+            super::finish_client_response_trace(
+                &lifecycle,
+                &ctx,
+                ClientResponseOutcome::ResponseFailed,
+            )
+            .await;
+            client_response_guard.disarm();
+            return Err(ApiError::Internal(
+                "Non-streaming response worker stopped unexpectedly".to_string(),
+            ));
+        }
+    };
+    if let Err(error) = super::record_final_client_first_content(&lifecycle, ctx.request_id).await {
+        tracing::warn!(request_id = %ctx.request_id, %error, "failed to record client first content");
     }
-
-    // 执行 billing
-    finalize_openai_billing(
-        &billing,
-        &ctx,
-        &provider_name,
-        account_id,
-        &collector.status,
-    )
-    .await;
-
-    // 获取用量信息
-    let (prompt_tokens, completion_tokens) = ctx.usage_snapshot();
-
-    Ok(build_chat_completion_response(
-        completion_id,
-        created,
-        model,
-        collector.content,
-        collector.finish_reason,
-        prompt_tokens,
-        completion_tokens,
-        provider_name,
-    ))
+    super::finish_client_response_trace(&lifecycle, &ctx, ClientResponseOutcome::Succeeded).await;
+    client_response_guard.disarm();
+    Ok(response)
 }
 
 /// 检测消息列表中是否包含需要网络下载的图片 URL
@@ -908,6 +1153,38 @@ fn generate_completion_id() -> String {
     )
 }
 
+struct OpenAiNonStreamingResponseContext {
+    ctx: Arc<RequestContext>,
+    model: String,
+    provider_name: String,
+    account_id: uuid::Uuid,
+    billing: Arc<keycompute_billing::BillingService>,
+    lifecycle: Arc<dyn keycompute_types::RequestLifecycleRecorder>,
+    response_timeout: Duration,
+}
+
+const OPENAI_JSON_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn forward_openai_json_chunk(
+    body_tx: &mpsc::Sender<bytes::Bytes>,
+    ctx: &RequestContext,
+    client_connected: &mut bool,
+    chunk: bytes::Bytes,
+) -> bool {
+    if !*client_connected {
+        return false;
+    }
+    let sent = tokio::time::timeout(OPENAI_JSON_SEND_TIMEOUT, body_tx.send(chunk))
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false);
+    if !sent {
+        *client_connected = false;
+        ctx.mark_client_disconnected();
+    }
+    sent
+}
+
 /// 创建带 chunked keepalive 的非流式 JSON 响应
 ///
 /// 利用 HTTP chunked transfer encoding，在等待上游 Provider 响应期间，
@@ -929,17 +1206,27 @@ fn generate_completion_id() -> String {
 /// 首个 keepalive 在 ~10s 时发送（而非立即发送），为上游连接阶段的错误
 /// （如 DNS 解析失败、TLS 握手超时等）保留一个窗口期。上游 Provider
 /// 的连接错误通常在数秒内暴露，10s 间隔足以覆盖绝大多数场景。
-fn create_non_streaming_json_with_keepalive(
+fn create_non_streaming_json_with_keepalive_and_lifecycle(
     mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
-    ctx: Arc<RequestContext>,
-    model: String,
-    provider_name: String,
-    account_id: uuid::Uuid,
-    billing: Arc<keycompute_billing::BillingService>,
+    response_context: OpenAiNonStreamingResponseContext,
 ) -> axum::response::Response {
-    use std::time::Duration;
+    let OpenAiNonStreamingResponseContext {
+        ctx,
+        model,
+        provider_name,
+        account_id,
+        billing,
+        lifecycle,
+        response_timeout,
+    } = response_context;
 
-    let stream = async_stream::stream! {
+    let (body_tx, body_rx) = mpsc::channel(8);
+
+    // The worker owns the upstream receiver and billing context. Dropping the
+    // HTTP body therefore cancels upstream work through RequestContext while
+    // still allowing the terminal event to be drained and settled.
+    tokio::spawn(async move {
+        let mut client_connected = true;
         let completion_id = generate_completion_id();
         let created = chrono::Utc::now().timestamp();
         let mut collector = StreamCollector::new();
@@ -948,19 +1235,23 @@ fn create_non_streaming_json_with_keepalive(
         // sleep 分支延迟 ~10s 触发。这样为上游连接阶段的错误（DNS/TLS 等）
         // 保留一个窗口期，避免过早提交 HTTP 200 状态码。
         //
-        // 最大 keepalive 持续时间 120s，防止上游 Provider 后台任务停滞
-        // 导致循环无限期发送空格字节。120s 足够覆盖图片下载（~30-40s）+
-        // LLM 推理（~20-40s），同时避免服务端资源长期占用。
-        let max_keepalive = Duration::from_secs(120);
-        let deadline = tokio::time::sleep(max_keepalive);
+        // 响应期限与 executor 使用同一 Gateway timeout 配置，既防止上游
+        // 后台任务停滞导致无限 keepalive，也不会截断运维明确放宽的超时。
+        let deadline = tokio::time::sleep(response_timeout);
         tokio::pin!(deadline);
         loop {
             tokio::select! {
+                biased;
+                _ = body_tx.closed(), if client_connected => {
+                    client_connected = false;
+                    ctx.mark_client_disconnected();
+                }
                 _ = &mut deadline => {
                     collector.status = "timeout".to_string();
                     tracing::error!(
                         request_id = %ctx.request_id,
-                        "Non-streaming keepalive: max duration (120s) exceeded, terminating"
+                        timeout_secs = response_timeout.as_secs(),
+                        "Non-streaming keepalive response deadline exceeded"
                     );
                     finalize_openai_billing(
                         &billing,
@@ -970,19 +1261,35 @@ fn create_non_streaming_json_with_keepalive(
                         &collector.status,
                     )
                     .await;
-                    yield Ok(bytes::Bytes::from(openai_error_chunk(
-                        "Request timed out",
-                        "server_error",
-                        Some("timeout"),
-                    )));
+                    let _ = forward_openai_json_chunk(
+                        &body_tx,
+                        &ctx,
+                        &mut client_connected,
+                        bytes::Bytes::from(openai_error_chunk(
+                            "Request timed out",
+                            "server_error",
+                            Some("timeout"),
+                        )),
+                    )
+                    .await;
+                    super::finish_client_response_trace(
+                        &lifecycle,
+                        &ctx,
+                        ClientResponseOutcome::TimedOut,
+                    )
+                    .await;
                     return;
                 }
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                _ = tokio::time::sleep(Duration::from_secs(10)), if client_connected => {
                     // 空格是合法 JSON 前导空白 (RFC 8259 §2)，
                     // 作为 chunked encoding 的数据帧，重置 Nginx proxy_read_timeout
-                    yield Ok::<bytes::Bytes, Infallible>(
-                        bytes::Bytes::from_static(b" ")
-                    );
+                    let _ = forward_openai_json_chunk(
+                        &body_tx,
+                        &ctx,
+                        &mut client_connected,
+                        bytes::Bytes::from_static(b" "),
+                    )
+                    .await;
                 }
                 event = rx.recv() => {
                     match event {
@@ -1005,11 +1312,23 @@ fn create_non_streaming_json_with_keepalive(
                                 .await;
                                 // 错误格式与 OpenAI API 对齐，包含 param 字段。
                                 // 消息已脱敏：上游原始错误只记录日志，不暴露给客户端。
-                                yield Ok(bytes::Bytes::from(openai_error_chunk(
-                                    "Upstream request failed",
-                                    "api_error",
-                                    Some("internal_error"),
-                                )));
+                                let _ = forward_openai_json_chunk(
+                                    &body_tx,
+                                    &ctx,
+                                    &mut client_connected,
+                                    bytes::Bytes::from(openai_error_chunk(
+                                        "Upstream request failed",
+                                        "api_error",
+                                        Some("internal_error"),
+                                    )),
+                                )
+                                .await;
+                                super::finish_client_response_trace(
+                                    &lifecycle,
+                                    &ctx,
+                                    ClientResponseOutcome::ResponseFailed,
+                                )
+                                .await;
                                 return;
                             }
                         },
@@ -1035,11 +1354,23 @@ fn create_non_streaming_json_with_keepalive(
                 &collector.status,
             )
             .await;
-            yield Ok(bytes::Bytes::from(openai_error_chunk(
-                "Stream ended unexpectedly",
-                "server_error",
-                Some("incomplete"),
-            )));
+            let _ = forward_openai_json_chunk(
+                &body_tx,
+                &ctx,
+                &mut client_connected,
+                bytes::Bytes::from(openai_error_chunk(
+                    "Stream ended unexpectedly",
+                    "server_error",
+                    Some("incomplete"),
+                )),
+            )
+            .await;
+            super::finish_client_response_trace(
+                &lifecycle,
+                &ctx,
+                ClientResponseOutcome::ResponseFailed,
+            )
+            .await;
             return;
         }
 
@@ -1068,30 +1399,53 @@ fn create_non_streaming_json_with_keepalive(
             provider_name,
         );
 
-        let json = serde_json::to_string(&response)
-            .unwrap_or_else(|e| {
-                tracing::error!(
-                    request_id = %ctx.request_id,
-                    error = %e,
-                    "Failed to serialize chat completion response"
-                );
-                serde_json::json!({
-                    "error": {
-                        "message": "Internal error: failed to serialize response",
-                        "type": "server_error",
-                        "param": null,
-                        "code": null
-                    }
-                })
-                .to_string()
-            });
-        yield Ok(bytes::Bytes::from(json));
-    };
+        let json = serde_json::to_string(&response).unwrap_or_else(|e| {
+            tracing::error!(
+                request_id = %ctx.request_id,
+                error = %e,
+                "Failed to serialize chat completion response"
+            );
+            serde_json::json!({
+                "error": {
+                    "message": "Internal error: failed to serialize response",
+                    "type": "server_error",
+                    "param": null,
+                    "code": null
+                }
+            })
+            .to_string()
+        });
+        let sent = forward_openai_json_chunk(
+            &body_tx,
+            &ctx,
+            &mut client_connected,
+            bytes::Bytes::from(json),
+        )
+        .await;
+        if sent
+            && let Err(error) =
+                super::record_final_client_first_content(&lifecycle, ctx.request_id).await
+        {
+            tracing::warn!(request_id = %ctx.request_id, %error, "failed to record client first content");
+        }
+        super::finish_client_response_trace(
+            &lifecycle,
+            &ctx,
+            if sent {
+                ClientResponseOutcome::Succeeded
+            } else {
+                ClientResponseOutcome::ClientDisconnected
+            },
+        )
+        .await;
+    });
 
     axum::response::Response::builder()
         .status(200)
         .header("Content-Type", "application/json")
-        .body(axum::body::Body::from_stream(stream))
+        .body(axum::body::Body::from_stream(
+            ReceiverStream::new(body_rx).map(Ok::<bytes::Bytes, Infallible>),
+        ))
         .unwrap_or_else(|e| {
             tracing::error!(
                 error = %e,
@@ -1226,9 +1580,44 @@ fn openai_error_chunk(message: &str, error_type: &str, code: Option<&str>) -> St
     .to_string()
 }
 
+/// Bound SSE backpressure so a client that stops reading cannot indefinitely
+/// block the worker that owns upstream draining and billing settlement.
+const OPENAI_SSE_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct OpenAiStreamContext {
+    ctx: Arc<RequestContext>,
+    model: String,
+    provider_name: String,
+    account_id: uuid::Uuid,
+    billing: Arc<keycompute_billing::BillingService>,
+    stream_options: Option<StreamOptions>,
+    lifecycle: Arc<dyn keycompute_types::RequestLifecycleRecorder>,
+}
+
+async fn forward_openai_sse_event(
+    sse_tx: &mpsc::Sender<Event>,
+    ctx: &RequestContext,
+    client_connected: &mut bool,
+    event: Event,
+) -> bool {
+    if !*client_connected {
+        return false;
+    }
+    let sent = tokio::time::timeout(OPENAI_SSE_SEND_TIMEOUT, sse_tx.send(event))
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false);
+    if !sent {
+        *client_connected = false;
+        ctx.mark_client_disconnected();
+    }
+    sent
+}
+
 /// 创建 OpenAI 格式的 SSE 流
+#[cfg(test)]
 fn create_openai_stream(
-    mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
+    rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
     ctx: Arc<RequestContext>,
     model: String,
     provider_name: String,
@@ -1236,113 +1625,184 @@ fn create_openai_stream(
     billing: Arc<keycompute_billing::BillingService>,
     stream_options: Option<StreamOptions>,
 ) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
-    async_stream::stream! {
-        let mut status = "success".to_string();
-        let mut completed = false; // 跟踪流是否正常完成
+    create_openai_stream_with_lifecycle(
+        rx,
+        OpenAiStreamContext {
+            ctx,
+            model,
+            provider_name,
+            account_id,
+            billing,
+            stream_options,
+            lifecycle: Arc::new(keycompute_types::NoopRequestLifecycleRecorder),
+        },
+    )
+}
+
+fn create_openai_stream_with_lifecycle(
+    mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
+    stream_context: OpenAiStreamContext,
+) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
+    let (sse_tx, sse_rx) = mpsc::channel(100);
+    let OpenAiStreamContext {
+        ctx,
+        model,
+        provider_name,
+        account_id,
+        billing,
+        stream_options,
+        lifecycle,
+    } = stream_context;
+
+    // The worker, rather than the HTTP body, owns the upstream receiver and
+    // billing context. Dropping the response therefore cannot skip settlement.
+    tokio::spawn(async move {
+        let mut status = "success";
+        let mut completed = false;
         let mut first_chunk = true;
+        let mut client_connected = true;
+        let mut client_first_content_recorded = false;
         let completion_id = generate_completion_id();
         let created = chrono::Utc::now().timestamp();
 
-        while let Some(event) = rx.recv().await {
-            match event {
-                llm_protocol_provider::StreamEvent::Delta { content, finish_reason } => {
-                    let data = make_delta_chunk_data(
-                        content, &finish_reason, &mut first_chunk,
-                        &completion_id, created, &model, &provider_name,
-                    );
-                    yield Ok(Event::default().data(data));
-
-                    // `finish_reason` 不是传输层终止信号。特别是 Anthropic 会在
-                    // `message_delta` 后继续发送精确 Usage 和 `message_stop`；若
-                    // 在这里退出，会丢失用量并让执行器向已关闭的 receiver 写入。
+        loop {
+            tokio::select! {
+                _ = sse_tx.closed(), if client_connected => {
+                    client_connected = false;
+                    ctx.mark_client_disconnected();
                 }
-                llm_protocol_provider::StreamEvent::Done => {
-                    // 流正常结束
-                    completed = true;
-                    finalize_openai_billing(
-                        &billing,
-                        &ctx,
-                        &provider_name,
-                        account_id,
-                        &status,
-                    )
-                    .await;
-
-                    // 如果需要包含用量信息
-                    if stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false) {
-                        let (input_tokens, output_tokens) = ctx.usage_snapshot();
-                        let data = make_usage_chunk_data(
-                            input_tokens, output_tokens,
-                            &completion_id, created, &model, &provider_name,
-                        );
-                        yield Ok(Event::default().data(data));
+                event = rx.recv() => {
+                    let Some(event) = event else { break };
+                    match event {
+                        llm_protocol_provider::StreamEvent::Delta { content, finish_reason } => {
+                            let has_content = !content.is_empty();
+                            let data = make_delta_chunk_data(
+                                content, &finish_reason, &mut first_chunk,
+                                &completion_id, created, &model, &provider_name,
+                            );
+                            let sent = forward_openai_sse_event(
+                                &sse_tx,
+                                &ctx,
+                                &mut client_connected,
+                                Event::default().data(data),
+                            )
+                            .await;
+                            if sent && has_content && !client_first_content_recorded {
+                                if let Err(error) = lifecycle
+                                    .record_client_first_content(ctx.request_id, chrono::Utc::now())
+                                    .await
+                                {
+                                    tracing::warn!(request_id = %ctx.request_id, %error, "failed to record client first content");
+                                }
+                                client_first_content_recorded = true;
+                            }
+                        }
+                        llm_protocol_provider::StreamEvent::Done => {
+                            completed = true;
+                            finalize_openai_billing(
+                                &billing, &ctx, &provider_name, account_id, status,
+                            )
+                            .await;
+                            if stream_options.as_ref().is_some_and(|o| o.include_usage) {
+                                let (input_tokens, output_tokens) = ctx.usage_snapshot();
+                                let data = make_usage_chunk_data(
+                                    input_tokens, output_tokens,
+                                    &completion_id, created, &model, &provider_name,
+                                );
+                                let _ = forward_openai_sse_event(
+                                    &sse_tx, &ctx, &mut client_connected,
+                                    Event::default().data(data),
+                                )
+                                .await;
+                            }
+                            let _ = forward_openai_sse_event(
+                                &sse_tx, &ctx, &mut client_connected,
+                                Event::default().data("[DONE]"),
+                            )
+                            .await;
+                            super::finish_client_response_trace(
+                                &lifecycle,
+                                &ctx,
+                                ClientResponseOutcome::Succeeded,
+                            )
+                            .await;
+                            break;
+                        }
+                        llm_protocol_provider::StreamEvent::Error { message } => {
+                            completed = true;
+                            status = "error";
+                            finalize_openai_billing(
+                                &billing, &ctx, &provider_name, account_id, status,
+                            )
+                            .await;
+                            tracing::warn!(
+                                request_id = %ctx.request_id,
+                                error = %message,
+                                "OpenAI upstream stream failed"
+                            );
+                            let _ = forward_openai_sse_event(
+                                &sse_tx, &ctx, &mut client_connected,
+                                Event::default().data(openai_error_chunk(
+                                    "Upstream request failed", "api_error", Some("internal_error"),
+                                )),
+                            )
+                            .await;
+                            let _ = forward_openai_sse_event(
+                                &sse_tx, &ctx, &mut client_connected,
+                                Event::default().data("[DONE]"),
+                            )
+                            .await;
+                            super::finish_client_response_trace(
+                                &lifecycle,
+                                &ctx,
+                                ClientResponseOutcome::ResponseFailed,
+                            )
+                            .await;
+                            break;
+                        }
+                        llm_protocol_provider::StreamEvent::Usage { .. }
+                        | llm_protocol_provider::StreamEvent::InputUsage { .. }
+                        | llm_protocol_provider::StreamEvent::Raw { .. } => {}
                     }
-
-                    yield Ok(Event::default().data("[DONE]"));
-                    break;
-                }
-                llm_protocol_provider::StreamEvent::Error { message } => {
-                    completed = true;
-                    status = "error".to_string();
-                    finalize_openai_billing(
-                        &billing,
-                        &ctx,
-                        &provider_name,
-                        account_id,
-                        &status,
-                    )
-                    .await;
-                    // 不向客户端暴露上游错误细节：原始消息只记录日志，SSE
-                    // 错误体与 Anthropic 路径保持一致的通用文本。
-                    tracing::warn!(
-                        request_id = %ctx.request_id,
-                        error = %message,
-                        "OpenAI upstream stream failed"
-                    );
-                    yield Ok(Event::default().data(openai_error_chunk(
-                        "Upstream request failed",
-                        "api_error",
-                        Some("internal_error"),
-                    )));
-                    // 与 keepalive 变体一致，错误帧后仍以 [DONE] 终止，客户端
-                    // 不会把截断的流误认为“连接被重置”。
-                    yield Ok(Event::default().data("[DONE]"));
-                    break;
-                }
-                llm_protocol_provider::StreamEvent::Usage { .. }
-                | llm_protocol_provider::StreamEvent::InputUsage { .. }
-                | llm_protocol_provider::StreamEvent::Raw { .. } => {
-                    // Usage 由 executor 层通过 ctx.set_*_tokens() 消费，
-                    // Raw 为 provider 原始事件不需要透传
                 }
             }
         }
 
-        // 流意外结束（channel 关闭但没有收到完成事件）
         if !completed {
             tracing::warn!(
                 request_id = %ctx.request_id,
                 "Stream ended without Done or Error event"
             );
-            status = "incomplete".to_string();
-            finalize_openai_billing(
-                &billing,
+            status = "incomplete";
+            finalize_openai_billing(&billing, &ctx, &provider_name, account_id, status).await;
+            let _ = forward_openai_sse_event(
+                &sse_tx,
                 &ctx,
-                &provider_name,
-                account_id,
-                &status,
+                &mut client_connected,
+                Event::default().data(openai_error_chunk(
+                    "Stream ended unexpectedly",
+                    "api_error",
+                    Some("internal_error"),
+                )),
             )
             .await;
-            // 不能静默截断：客户端会把截断的流误认为完整响应。与 Error 分支
-            // 一致，输出显式错误帧后以 [DONE] 结束。
-            yield Ok(Event::default().data(openai_error_chunk(
-                "Stream ended unexpectedly",
-                "api_error",
-                Some("internal_error"),
-            )));
-            yield Ok(Event::default().data("[DONE]"));
+            let _ = forward_openai_sse_event(
+                &sse_tx,
+                &ctx,
+                &mut client_connected,
+                Event::default().data("[DONE]"),
+            )
+            .await;
+            super::finish_client_response_trace(
+                &lifecycle,
+                &ctx,
+                ClientResponseOutcome::ResponseFailed,
+            )
+            .await;
         }
-    }
+    });
+
+    ReceiverStream::new(sse_rx).map(Ok)
 }
 
 /// 创建带 keepalive 的 SSE 流式响应（多模态专用）
@@ -1353,106 +1813,138 @@ fn create_openai_stream(
 ///
 /// SSE 空事件（`data:\\n\\n`）对 OpenAI 兼容客户端透明，
 /// 客户端 parser 会忽略空 data 字段。
-fn create_openai_stream_with_keepalive(
+fn create_openai_stream_with_keepalive_and_lifecycle(
     mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
-    ctx: Arc<RequestContext>,
-    model: String,
-    provider_name: String,
-    account_id: uuid::Uuid,
-    billing: Arc<keycompute_billing::BillingService>,
-    stream_options: Option<StreamOptions>,
+    stream_context: OpenAiStreamContext,
+    response_timeout: Duration,
 ) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
-    async_stream::stream! {
-        let mut status = "success".to_string();
+    let (sse_tx, sse_rx) = mpsc::channel(100);
+    let OpenAiStreamContext {
+        ctx,
+        model,
+        provider_name,
+        account_id,
+        billing,
+        stream_options,
+        lifecycle,
+    } = stream_context;
+
+    tokio::spawn(async move {
+        let mut status = "success";
         let mut first_chunk = true;
+        let mut client_connected = true;
+        let mut client_first_content_recorded = false;
         let completion_id = generate_completion_id();
         let created = chrono::Utc::now().timestamp();
 
-        // 最大 keepalive 持续时间 120s，防止上游 Provider 后台任务停滞
-        // 导致循环无限期发送空事件。120s 足够覆盖图片下载（~30-40s）+
-        // LLM 推理（~20-40s），同时避免服务端资源长期占用。
-        //
-        // 注：此值与 GatewayConfig.timeout_secs 解耦，原因如下：
-        // - executor 超时由 tokio::time::timeout 在后台任务中实现
-        // - keepalive 是在 handler 层维护 TCP 连接存活，职责不同
-        // - 两者设为相同默认值（120s）是巧合；运维调大 timeout_secs 时
-        //   也应同步调整此值，反之亦然
-        let max_keepalive = std::time::Duration::from_secs(120);
-        let deadline = tokio::time::sleep(max_keepalive);
+        // 响应期限与 executor 使用同一 Gateway timeout 配置，既防止上游
+        // 后台任务停滞导致无限 keepalive，也不会截断运维明确放宽的超时。
+        let deadline = tokio::time::sleep(response_timeout);
         tokio::pin!(deadline);
 
         loop {
             tokio::select! {
+                _ = sse_tx.closed(), if client_connected => {
+                    client_connected = false;
+                    ctx.mark_client_disconnected();
+                }
                 _ = &mut deadline => {
-                    status = "timeout".to_string();
+                    status = "timeout";
                     tracing::error!(
                         request_id = %ctx.request_id,
-                        "SSE stream keepalive: max duration (120s) exceeded, terminating"
+                        timeout_secs = response_timeout.as_secs(),
+                        "SSE stream keepalive response deadline exceeded"
                     );
                     finalize_openai_billing(
-                        &billing,
-                        &ctx,
-                        &provider_name,
-                        account_id,
-                        &status,
+                        &billing, &ctx, &provider_name, account_id, status,
                     )
                     .await;
-                    yield Ok(Event::default().data(openai_error_chunk(
-                        "Request timed out",
-                        "server_error",
-                        Some("timeout"),
-                    )));
-                    yield Ok(Event::default().data("[DONE]"));
+                    let _ = forward_openai_sse_event(
+                        &sse_tx, &ctx, &mut client_connected,
+                        Event::default().data(openai_error_chunk(
+                            "Request timed out", "server_error", Some("timeout"),
+                        )),
+                    )
+                    .await;
+                    let _ = forward_openai_sse_event(
+                        &sse_tx, &ctx, &mut client_connected,
+                        Event::default().data("[DONE]"),
+                    )
+                    .await;
+                    super::finish_client_response_trace(
+                        &lifecycle,
+                        &ctx,
+                        ClientResponseOutcome::TimedOut,
+                    )
+                    .await;
                     return;
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                    // SSE 空事件作 keepalive：客户端 parser 忽略空 data，
-                    // 但 Nginx / 云平台网关将其视为有效数据流，重置 proxy_read_timeout
-                    yield Ok(Event::default().data(""));
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)), if client_connected => {
+                    let _ = forward_openai_sse_event(
+                        &sse_tx, &ctx, &mut client_connected, Event::default().data(""),
+                    )
+                    .await;
                 }
                 event = rx.recv() => {
                     match event {
                         Some(event) => match event {
                             llm_protocol_provider::StreamEvent::Delta { content, finish_reason } => {
+                                let has_content = !content.is_empty();
                                 let data = make_delta_chunk_data(
                                     content, &finish_reason, &mut first_chunk,
                                     &completion_id, created, &model, &provider_name,
                                 );
-                                yield Ok(Event::default().data(data));
-
-                                // 与普通流式路径一致，等待显式 Done。finish_reason
-                                // 后上游仍可能发送 Usage 与终止事件。
+                                let sent = forward_openai_sse_event(
+                                    &sse_tx, &ctx, &mut client_connected,
+                                    Event::default().data(data),
+                                )
+                                .await;
+                                if sent && has_content && !client_first_content_recorded {
+                                    if let Err(error) = lifecycle
+                                        .record_client_first_content(ctx.request_id, chrono::Utc::now())
+                                        .await
+                                    {
+                                        tracing::warn!(request_id = %ctx.request_id, %error, "failed to record client first content");
+                                    }
+                                    client_first_content_recorded = true;
+                                }
                             }
                             llm_protocol_provider::StreamEvent::Done => {
                                 finalize_openai_billing(
-                                    &billing,
-                                    &ctx,
-                                    &provider_name,
-                                    account_id,
-                                    &status,
+                                    &billing, &ctx, &provider_name, account_id, status,
                                 )
                                 .await;
 
-                                if stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false) {
+                                if stream_options.as_ref().is_some_and(|o| o.include_usage) {
                                     let (input_tokens, output_tokens) = ctx.usage_snapshot();
                                     let data = make_usage_chunk_data(
                                         input_tokens, output_tokens,
                                         &completion_id, created, &model, &provider_name,
                                     );
-                                    yield Ok(Event::default().data(data));
+                                    let _ = forward_openai_sse_event(
+                                        &sse_tx, &ctx, &mut client_connected,
+                                        Event::default().data(data),
+                                    )
+                                    .await;
                                 }
 
-                                yield Ok(Event::default().data("[DONE]"));
+                                let _ = forward_openai_sse_event(
+                                    &sse_tx, &ctx, &mut client_connected,
+                                    Event::default().data("[DONE]"),
+                                )
+                                .await;
+                                super::finish_client_response_trace(
+                                    &lifecycle,
+                                    &ctx,
+                                    ClientResponseOutcome::Succeeded,
+                                )
+                                .await;
                                 return;
                             }
                             llm_protocol_provider::StreamEvent::Error { message } => {
-                                status = "error".to_string();
+                                status = "error";
                                 finalize_openai_billing(
-                                    &billing,
-                                    &ctx,
-                                    &provider_name,
-                                    account_id,
-                                    &status,
+                                    &billing, &ctx, &provider_name, account_id, status,
                                 )
                                 .await;
                                 // 不向客户端暴露上游错误细节：原始消息只记录日志。
@@ -1461,12 +1953,24 @@ fn create_openai_stream_with_keepalive(
                                     error = %message,
                                     "OpenAI upstream stream failed"
                                 );
-                                yield Ok(Event::default().data(openai_error_chunk(
-                                    "Upstream request failed",
-                                    "api_error",
-                                    Some("internal_error"),
-                                )));
-                                yield Ok(Event::default().data("[DONE]"));
+                                let _ = forward_openai_sse_event(
+                                    &sse_tx, &ctx, &mut client_connected,
+                                    Event::default().data(openai_error_chunk(
+                                        "Upstream request failed", "api_error", Some("internal_error"),
+                                    )),
+                                )
+                                .await;
+                                let _ = forward_openai_sse_event(
+                                    &sse_tx, &ctx, &mut client_connected,
+                                    Event::default().data("[DONE]"),
+                                )
+                                .await;
+                                super::finish_client_response_trace(
+                                    &lifecycle,
+                                    &ctx,
+                                    ClientResponseOutcome::ResponseFailed,
+                                )
+                                .await;
                                 return;
                             }
                             llm_protocol_provider::StreamEvent::Usage { .. }
@@ -1489,23 +1993,35 @@ fn create_openai_stream_with_keepalive(
             request_id = %ctx.request_id,
             "SSE stream keepalive: ended without Done or Error event"
         );
-        status = "incomplete".to_string();
-        finalize_openai_billing(
-            &billing,
+        status = "incomplete";
+        finalize_openai_billing(&billing, &ctx, &provider_name, account_id, status).await;
+        let _ = forward_openai_sse_event(
+            &sse_tx,
             &ctx,
-            &provider_name,
-            account_id,
-            &status,
+            &mut client_connected,
+            Event::default().data(openai_error_chunk(
+                "Stream ended unexpectedly",
+                "api_error",
+                Some("internal_error"),
+            )),
         )
         .await;
-        // 不能静默截断：与 Error 分支一致，输出显式错误帧与 [DONE] 后结束。
-        yield Ok(Event::default().data(openai_error_chunk(
-            "Stream ended unexpectedly",
-            "api_error",
-            Some("internal_error"),
-        )));
-        yield Ok(Event::default().data("[DONE]"));
-    }
+        let _ = forward_openai_sse_event(
+            &sse_tx,
+            &ctx,
+            &mut client_connected,
+            Event::default().data("[DONE]"),
+        )
+        .await;
+        super::finish_client_response_trace(
+            &lifecycle,
+            &ctx,
+            ClientResponseOutcome::ResponseFailed,
+        )
+        .await;
+    });
+
+    ReceiverStream::new(sse_rx).map(Ok)
 }
 
 // ==================== Models ====================
@@ -1676,8 +2192,8 @@ fn simulate_node_stream(
     response: keycompute_types::ChatCompletionResponse,
     ctx: Arc<RequestContext>,
     model: String,
-    billing: Arc<keycompute_billing::BillingService>,
     stream_options: Option<StreamOptions>,
+    lifecycle: Arc<dyn RequestLifecycleRecorder>,
 ) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
     // 伪流式（simulated streaming）：
     // - Node 路径先通过 enqueue_and_wait() 获取完整响应
@@ -1685,33 +2201,82 @@ fn simulate_node_stream(
     // - 模拟真实 SSE 流式输出的用户体验
     //
     // 注：Node 响应目前仅包含单个 choice（n=1），多 choice 场景暂不支持。
-    async_stream::stream! {
-        let completion_id = generate_completion_id();
-        let created = chrono::Utc::now().timestamp();
+    let (sse_tx, sse_rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        let outcome = 'delivery: {
+            let completion_id = generate_completion_id();
+            let created = chrono::Utc::now().timestamp();
+            let mut client_connected = true;
 
-        // 获取第一个 choice 的文本内容
-        let content = response.choices.first().map(|c| c.message.content.clone()).unwrap_or_default();
+            // 获取第一个 choice 的文本内容
+            let content = response
+                .choices
+                .first()
+                .map(|c| c.message.content.clone())
+                .unwrap_or_default();
 
-        // 将内容拆分为字符级别的 chunk（模拟 token 级输出）
-        // 注：这里是简单实现，按字符拆分，实际可以按 token 拆分
-        let chars: Vec<char> = content.chars().collect();
-        let chunk_size = std::cmp::max(1, chars.len() / 20); // 至少 1 个字符，最多 20 个 chunk
+            // 将内容拆分为字符级别的 chunk（模拟 token 级输出）
+            // 注：这里是简单实现，按字符拆分，实际可以按 token 拆分
+            let chars: Vec<char> = content.chars().collect();
+            let chunk_size = std::cmp::max(1, chars.len() / 20); // 至少 1 个字符，最多 20 个 chunk
 
-        // 发送 content chunks，仅首个 chunk 携带 role（遵循 OpenAI SSE 协议）
-        let mut first_chunk = true;
-        for chunk in chars.chunks(chunk_size) {
-            let chunk_content: String = chunk.iter().collect();
-            let delta = if first_chunk {
-                first_chunk = false;
-                serde_json::json!({
-                    "role": "assistant",
-                    "content": chunk_content
-                })
-            } else {
-                serde_json::json!({
-                    "content": chunk_content
-                })
-            };
+            // 发送 content chunks，仅首个 chunk 携带 role（遵循 OpenAI SSE 协议）
+            let mut first_chunk = true;
+            let mut client_first_content_recorded = false;
+            for chunk in chars.chunks(chunk_size) {
+                let chunk_content: String = chunk.iter().collect();
+                let delta = if first_chunk {
+                    first_chunk = false;
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": chunk_content
+                    })
+                } else {
+                    serde_json::json!({
+                        "content": chunk_content
+                    })
+                };
+                let data = serde_json::json!({
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": null
+                    }]
+                });
+                let sent = forward_openai_sse_event(
+                    &sse_tx,
+                    &ctx,
+                    &mut client_connected,
+                    Event::default().data(data.to_string()),
+                )
+                .await;
+                if sent && !client_first_content_recorded {
+                    if let Err(error) = lifecycle
+                        .record_client_first_content(ctx.request_id, chrono::Utc::now())
+                        .await
+                    {
+                        tracing::warn!(request_id=%ctx.request_id,%error,"failed to record Node client first content");
+                    }
+                    client_first_content_recorded = true;
+                }
+                if !client_connected {
+                    break 'delivery ClientResponseOutcome::ClientDisconnected;
+                }
+
+                // 小延迟，模拟真实流式输出
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+
+            // 发送最后一个带有 finish_reason 的 chunk
+            let finish_reason = response
+                .choices
+                .first()
+                .and_then(|c| c.finish_reason.clone())
+                .unwrap_or("stop".to_string());
             let data = serde_json::json!({
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -1719,62 +2284,69 @@ fn simulate_node_stream(
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "delta": delta,
-                    "finish_reason": null
+                    "delta": {},
+                    "finish_reason": finish_reason
                 }]
             });
-            yield Ok(Event::default().data(data.to_string()));
-
-            // 小延迟，模拟真实流式输出
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-
-        // 发送最后一个带有 finish_reason 的 chunk
-        let finish_reason = response.choices.first().and_then(|c| c.finish_reason.clone()).unwrap_or("stop".to_string());
-        let data = serde_json::json!({
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": finish_reason
-            }]
-        });
-        yield Ok(Event::default().data(data.to_string()));
-
-        // 如果请求了 usage，发送 usage chunk
-        if stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false) {
-            let data = serde_json::json!({
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                }
-            });
-            yield Ok(Event::default().data(data.to_string()));
-        }
-
-        // 发送 [DONE] 标记，声明流式传输结束（OpenAI SSE 协议要求）
-        yield Ok(Event::default().data("[DONE]"));
-
-        // 计费（使用 NODE_PRICING_PROVIDER 常量，与路由层定价维度一致）
-        let _ = billing
-            .finalize_and_trigger_distribution(
+            let _sent = forward_openai_sse_event(
+                &sse_tx,
                 &ctx,
-                keycompute_pricing::NODE_PRICING_PROVIDER,
-                uuid::Uuid::nil(),
-                "success",
-                ctx.user_id,
+                &mut client_connected,
+                Event::default().data(data.to_string()),
             )
             .await;
-    }
+            if !client_connected {
+                break 'delivery ClientResponseOutcome::ClientDisconnected;
+            }
+
+            // 如果请求了 usage，发送 usage chunk
+            if stream_options
+                .as_ref()
+                .map(|o| o.include_usage)
+                .unwrap_or(false)
+            {
+                let data = serde_json::json!({
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens
+                    }
+                });
+                if !forward_openai_sse_event(
+                    &sse_tx,
+                    &ctx,
+                    &mut client_connected,
+                    Event::default().data(data.to_string()),
+                )
+                .await
+                {
+                    break 'delivery ClientResponseOutcome::ClientDisconnected;
+                }
+            }
+
+            // 发送 [DONE] 标记，声明流式传输结束（OpenAI SSE 协议要求）
+            if forward_openai_sse_event(
+                &sse_tx,
+                &ctx,
+                &mut client_connected,
+                Event::default().data("[DONE]"),
+            )
+            .await
+            {
+                ClientResponseOutcome::Succeeded
+            } else {
+                ClientResponseOutcome::ClientDisconnected
+            }
+        };
+        super::finish_client_response_trace(&lifecycle, &ctx, outcome).await;
+    });
+
+    ReceiverStream::new(sse_rx).map(Ok)
 }
 
 #[cfg(test)]
@@ -1782,6 +2354,238 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn chat_completion_trace_preserves_ingress_received_at() {
+        let received_at = chrono::DateTime::parse_from_rfc3339("2025-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let mut state = AppState::with_config(crate::state::AppStateConfig::default());
+        state.lifecycle = Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>;
+        let auth = AuthExtractor::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "user",
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let result = chat_completions(
+            State(state),
+            auth,
+            RequestId::new(),
+            ClientRequestId(None),
+            RequestReceivedAt(received_at),
+            Json(request),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::Forbidden(_))));
+        let starts = recorder.request_starts();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].protocol, "openai");
+        assert_eq!(starts[0].received_at, received_at);
+    }
+
+    #[test]
+    fn node_route_stays_routing_until_task_creation_succeeds() {
+        assert_eq!(
+            initial_route_trace_state(&ExecutionTarget::new_node("node-model")),
+            (RouteType::Node, RequestStatus::Routing)
+        );
+        assert_eq!(
+            initial_route_trace_state(&ExecutionTarget::new_provider(
+                "openai",
+                uuid::Uuid::new_v4(),
+                "https://provider.example/v1",
+                "secret",
+            )),
+            (RouteType::ProviderAccount, RequestStatus::Routing)
+        );
+    }
+
+    fn node_test_response(content: &str) -> keycompute_types::ChatCompletionResponse {
+        keycompute_types::ChatCompletionResponse {
+            id: "node-response".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "node-model".to_string(),
+            choices: vec![keycompute_types::response::CompletionChoice {
+                index: 0,
+                message: keycompute_types::response::ResponseMessage {
+                    role: "assistant".to_string(),
+                    content: content.to_string(),
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: keycompute_types::Usage {
+                prompt_tokens: 2,
+                completion_tokens: 3,
+                total_tokens: 5,
+            },
+        }
+    }
+
+    fn node_stream_test_context() -> Arc<RequestContext> {
+        Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "node-model",
+            Vec::new(),
+            true,
+            keycompute_types::PricingSnapshot::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn node_simulated_stream_finishes_request_after_done() {
+        let ctx = node_stream_test_context();
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let stream = simulate_node_stream(
+            node_test_response("complete response"),
+            Arc::clone(&ctx),
+            "node-model".to_string(),
+            Some(StreamOptions {
+                include_usage: true,
+            }),
+            Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>,
+        );
+
+        let events: Vec<_> = stream.collect().await;
+        assert!(
+            events.len() >= 3,
+            "content, terminal, usage, and DONE frames"
+        );
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(ClientResponseOutcome::Succeeded)
+        );
+        let finishes = recorder.request_finishes();
+        assert_eq!(finishes.len(), 1);
+        assert_eq!(finishes[0].status, RequestStatus::Succeeded);
+        assert!(finishes[0].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn node_empty_simulated_stream_does_not_record_client_first_content() {
+        let ctx = node_stream_test_context();
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let stream = simulate_node_stream(
+            node_test_response(""),
+            Arc::clone(&ctx),
+            "node-model".to_string(),
+            None,
+            Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>,
+        );
+
+        let _events: Vec<_> = stream.collect().await;
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(ClientResponseOutcome::Succeeded)
+        );
+        assert!(
+            recorder
+                .events()
+                .iter()
+                .all(|event| !event.starts_with("client_first_content:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn node_simulated_stream_disconnect_cancels_request_trace() {
+        let ctx = node_stream_test_context();
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let stream = simulate_node_stream(
+            node_test_response("not delivered"),
+            Arc::clone(&ctx),
+            "node-model".to_string(),
+            None,
+            Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>,
+        );
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recorder.request_finishes().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect should promptly finish the Node request trace");
+
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(ClientResponseOutcome::ClientDisconnected)
+        );
+        let finishes = recorder.request_finishes();
+        assert_eq!(finishes.len(), 1);
+        assert_eq!(finishes[0].status, RequestStatus::Cancelled);
+        let error = finishes[0].error.as_ref().expect("disconnect error");
+        assert_eq!(error.category, TraceErrorCategory::ClientDisconnect);
+        assert!(
+            recorder
+                .events()
+                .iter()
+                .all(|event| !event.starts_with("client_first_content:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_node_wait_guard_cancels_request_trace() {
+        let ctx = node_stream_test_context();
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let guard = crate::handlers::ClientResponseGuard::new(
+            Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>,
+            Arc::clone(&ctx),
+        );
+
+        // This models Axum dropping the handler future while it is awaiting a
+        // Node result. The guard is the only remaining cleanup opportunity.
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recorder.request_finishes().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the Node wait guard should promptly finish the trace");
+
+        assert!(ctx.is_client_disconnected());
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(ClientResponseOutcome::ClientDisconnected)
+        );
+        let finishes = recorder.request_finishes();
+        assert_eq!(finishes.len(), 1);
+        assert_eq!(finishes[0].status, RequestStatus::Cancelled);
+        assert_eq!(
+            finishes[0].error.as_ref().map(|error| error.category),
+            Some(TraceErrorCategory::ClientDisconnect)
+        );
+    }
+
+    #[tokio::test]
+    async fn disarmed_node_wait_guard_leaves_completion_to_response_path() {
+        let ctx = node_stream_test_context();
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let mut guard = crate::handlers::ClientResponseGuard::new(
+            Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>,
+            Arc::clone(&ctx),
+        );
+        guard.disarm();
+        drop(guard);
+
+        tokio::task::yield_now().await;
+        assert!(!ctx.is_client_disconnected());
+        assert!(recorder.request_finishes().is_empty());
+    }
 
     #[test]
     fn test_chat_completion_request_deserialize() {
@@ -1814,6 +2618,7 @@ mod tests {
     async fn openai_stream_waits_for_done_after_finish_reason() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
@@ -1890,6 +2695,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
             "claude-test",
             Vec::new(),
             true,
@@ -1928,19 +2734,24 @@ mod tests {
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
             "claude-test",
             Vec::new(),
             true,
             keycompute_types::PricingSnapshot::default(),
         ));
-        let stream = Box::pin(create_openai_stream_with_keepalive(
+        let stream = Box::pin(create_openai_stream_with_keepalive_and_lifecycle(
             rx,
-            ctx,
-            "claude-test".to_string(),
-            "anthropic".to_string(),
-            uuid::Uuid::new_v4(),
-            Arc::new(keycompute_billing::BillingService::new()),
-            None,
+            OpenAiStreamContext {
+                ctx,
+                model: "claude-test".to_string(),
+                provider_name: "anthropic".to_string(),
+                account_id: uuid::Uuid::new_v4(),
+                billing: Arc::new(keycompute_billing::BillingService::new()),
+                stream_options: None,
+                lifecycle: Arc::new(keycompute_types::NoopRequestLifecycleRecorder),
+            },
+            Duration::from_secs(120),
         ));
         drop(tx);
 
@@ -1957,12 +2768,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn openai_stream_keepalive_timeout_emits_error_frame_and_done() {
-        // 120s 无事件（首 token 延迟/上游静默）：keepalive 变体的 deadline 分支
-        // 必须以显式错误帧 + [DONE] 终止，不能静默截断；同时结算状态置为
-        // "timeout"（finalize 先于输出执行）。虚拟时间推进避免真实等待 120s。
+    async fn openai_stream_keepalive_honors_configured_timeout_and_emits_terminal_error() {
+        // 配置为 180s 时，旧的 120s 硬上限不能提前截断响应；到达配置期限后
+        // 必须以显式错误帧 + [DONE] 终止，并将结算状态置为 timeout。
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
@@ -1971,14 +2782,18 @@ mod tests {
             true,
             keycompute_types::PricingSnapshot::default(),
         ));
-        let stream = Box::pin(create_openai_stream_with_keepalive(
+        let stream = Box::pin(create_openai_stream_with_keepalive_and_lifecycle(
             rx,
-            Arc::clone(&ctx),
-            "claude-test".to_string(),
-            "anthropic".to_string(),
-            uuid::Uuid::new_v4(),
-            Arc::new(keycompute_billing::BillingService::new()),
-            None,
+            OpenAiStreamContext {
+                ctx: Arc::clone(&ctx),
+                model: "claude-test".to_string(),
+                provider_name: "anthropic".to_string(),
+                account_id: uuid::Uuid::new_v4(),
+                billing: Arc::new(keycompute_billing::BillingService::new()),
+                stream_options: None,
+                lifecycle: Arc::new(keycompute_types::NoopRequestLifecycleRecorder),
+            },
+            Duration::from_secs(180),
         ));
         // channel 保持打开且无事件：rx.recv() 挂起，只有 deadline 能触发终止
         let _keep_tx_alive = tx;
@@ -1990,8 +2805,20 @@ mod tests {
                 .unwrap()
         });
 
-        // 轮询推进虚拟时间：deadline（120s）触发后输出错误帧与 [DONE] 并结束
+        // 超过旧硬上限后仍应继续等待上游。
         for _ in 0..1300 {
+            if app_handle.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !app_handle.is_finished(),
+            "configured 180s timeout must not terminate at the old 120s cap"
+        );
+
+        // 推进到配置的 180s deadline，触发错误帧与 [DONE]。
+        for _ in 0..600 {
             if app_handle.is_finished() {
                 break;
             }
@@ -2014,12 +2841,183 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn openai_non_streaming_keepalive_honors_configured_timeout_above_120_seconds() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "gpt-4o",
+            Vec::new(),
+            false,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let response = create_non_streaming_json_with_keepalive_and_lifecycle(
+            rx,
+            OpenAiNonStreamingResponseContext {
+                ctx: Arc::clone(&ctx),
+                model: "gpt-4o".to_string(),
+                provider_name: "openai".to_string(),
+                account_id: uuid::Uuid::new_v4(),
+                billing: Arc::new(keycompute_billing::BillingService::new()),
+                lifecycle: Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>,
+                response_timeout: Duration::from_secs(180),
+            },
+        );
+        let body_handle = tokio::spawn(async move {
+            axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+
+        for _ in 0..1300 {
+            if body_handle.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !body_handle.is_finished(),
+            "configured 180s timeout must not terminate at the old 120s cap"
+        );
+
+        tx.send(llm_protocol_provider::StreamEvent::Delta {
+            content: "late multimodal response".to_string(),
+            finish_reason: Some("stop".to_string()),
+        })
+        .await
+        .unwrap();
+        tx.send(llm_protocol_provider::StreamEvent::Done)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let body = tokio::time::timeout(Duration::from_secs(1), body_handle)
+            .await
+            .expect("configured timeout should allow the late response")
+            .expect("body collection should succeed");
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("late multimodal response"));
+        assert!(!body.contains("Request timed out"));
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(ClientResponseOutcome::Succeeded)
+        );
+        assert_eq!(recorder.request_finishes().len(), 1);
+        assert_eq!(
+            recorder.request_finishes()[0].status,
+            RequestStatus::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_non_streaming_worker_settles_after_client_disconnect() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "gpt-4o",
+            Vec::new(),
+            false,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let response = create_non_streaming_json_with_keepalive_and_lifecycle(
+            rx,
+            OpenAiNonStreamingResponseContext {
+                ctx: Arc::clone(&ctx),
+                model: "gpt-4o".to_string(),
+                provider_name: "openai".to_string(),
+                account_id: uuid::Uuid::new_v4(),
+                billing: Arc::new(keycompute_billing::BillingService::new()),
+                lifecycle: Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>,
+                response_timeout: Duration::from_secs(30),
+            },
+        );
+        drop(response);
+
+        tx.send(llm_protocol_provider::StreamEvent::error(
+            "client disconnected",
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), tx.closed())
+            .await
+            .expect("worker must consume the terminal event and finish settlement");
+
+        assert!(ctx.is_client_disconnected());
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(ClientResponseOutcome::ClientDisconnected)
+        );
+        assert_eq!(recorder.request_finishes().len(), 1);
+        assert_eq!(
+            recorder.request_finishes()[0].status,
+            RequestStatus::Cancelled
+        );
+        assert!(
+            recorder
+                .events()
+                .iter()
+                .all(|event| !event.starts_with("client_first_content:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_plain_non_streaming_worker_survives_handler_cancellation() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "gpt-4o",
+            Vec::new(),
+            false,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let handler = tokio::spawn(create_openai_response_with_lifecycle(
+            rx,
+            Arc::clone(&ctx),
+            "gpt-4o".to_string(),
+            "openai".to_string(),
+            uuid::Uuid::new_v4(),
+            Arc::new(keycompute_billing::BillingService::new()),
+            Arc::new(keycompute_types::NoopRequestLifecycleRecorder),
+        ));
+        tokio::task::yield_now().await;
+        handler.abort();
+        let _ = handler.await;
+
+        tx.send(llm_protocol_provider::StreamEvent::error(
+            "client disconnected",
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), tx.closed())
+            .await
+            .expect("detached worker must consume the terminal event after handler cancellation");
+
+        assert!(ctx.is_client_disconnected());
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(ClientResponseOutcome::ClientDisconnected)
+        );
+    }
+
     #[tokio::test]
     async fn openai_stream_error_redacts_upstream_message() {
         // 流式错误事件中的上游消息绝不能原样进入 SSE：客户端只能看到
         // 通用错误文本，原始消息保留在服务端日志（与 Anthropic 路径一致）。
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
@@ -2054,6 +3052,94 @@ mod tests {
         assert!(!body.contains("upstream-secret-detail"));
         // 错误帧后以 [DONE] 终止，与 keepalive 变体一致。
         assert!(body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn openai_stream_worker_settles_cancellation_after_client_disconnect() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "gpt-4o",
+            Vec::new(),
+            true,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let stream = create_openai_stream(
+            rx,
+            Arc::clone(&ctx),
+            "gpt-4o".to_string(),
+            "openai".to_string(),
+            uuid::Uuid::new_v4(),
+            Arc::new(keycompute_billing::BillingService::new()),
+            None,
+        );
+        drop(stream);
+
+        // executor 观察到 RequestContext 的取消令牌后会丢弃当前上游流，
+        // 再用终止 Error 唤醒仍持有 receiver 的结算 worker。
+        tx.send(llm_protocol_provider::StreamEvent::error(
+            "client disconnected",
+        ))
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), tx.closed())
+            .await
+            .expect("worker must consume cancellation and finish settlement after disconnect");
+        assert!(ctx.is_client_disconnected());
+    }
+
+    #[tokio::test]
+    async fn failed_openai_sse_send_does_not_record_client_first_content() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "gpt-4o",
+            Vec::new(),
+            true,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let stream = create_openai_stream_with_lifecycle(
+            rx,
+            OpenAiStreamContext {
+                ctx: Arc::clone(&ctx),
+                model: "gpt-4o".to_string(),
+                provider_name: "openai".to_string(),
+                account_id: uuid::Uuid::new_v4(),
+                billing: Arc::new(keycompute_billing::BillingService::new()),
+                stream_options: None,
+                lifecycle: Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>,
+            },
+        );
+        drop(stream);
+
+        tx.send(llm_protocol_provider::StreamEvent::Delta {
+            content: "not delivered".to_string(),
+            finish_reason: None,
+        })
+        .await
+        .unwrap();
+        tx.send(llm_protocol_provider::StreamEvent::Done)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), tx.closed())
+            .await
+            .expect("worker should settle and stop after the failed client send");
+
+        assert!(ctx.is_client_disconnected());
+        assert!(
+            recorder
+                .events()
+                .iter()
+                .all(|event| !event.starts_with("client_first_content:"))
+        );
     }
 
     fn minimal_request(extra: &str) -> ChatCompletionRequest {
@@ -2232,6 +3318,10 @@ mod tests {
             enabled: true,
             models_supported: models.iter().map(|m| m.to_string()).collect(),
             visibility: "tenant".to_string(),
+            last_probe_at: None,
+            last_probe_latency_ms: None,
+            last_probe_status: None,
+            last_probe_error_code: None,
             created_at: now,
             updated_at: now,
         }

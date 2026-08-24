@@ -32,11 +32,17 @@ enum LogFormat {
 ///    - `compact`（大小写不敏感）→ `LogFormat::Compact`
 ///    - 其他值 → `LogFormat::Full`
 /// 2. `KC__ENV` 环境变量（`KC__LOG_FORMAT` 未设置时作为智能回退）：
-///    - `production` → `LogFormat::Json`
+///    - `production` / `prod` → `LogFormat::Json`
 ///    - 其他值或未设置 → `LogFormat::Full`（默认）
 fn get_log_format() -> LogFormat {
-    // 第一优先级：KC__LOG_FORMAT 显式设置
-    if let Ok(val) = std::env::var("KC__LOG_FORMAT") {
+    log_format_from_values(
+        std::env::var("KC__LOG_FORMAT").ok().as_deref(),
+        std::env::var("KC__ENV").ok().as_deref(),
+    )
+}
+
+fn log_format_from_values(log_format: Option<&str>, environment: Option<&str>) -> LogFormat {
+    if let Some(val) = log_format {
         let trimmed = val.trim();
         if trimmed.eq_ignore_ascii_case("json") {
             return LogFormat::Json;
@@ -48,9 +54,12 @@ fn get_log_format() -> LogFormat {
         return LogFormat::Full;
     }
 
-    // 第二优先级：KC__ENV 智能回退（生产环境默认 JSON，其他默认 Full）
-    match std::env::var("KC__ENV").as_deref() {
-        Ok(v) if v.trim().eq_ignore_ascii_case("production") => LogFormat::Json,
+    match environment.map(str::trim) {
+        Some(value)
+            if value.eq_ignore_ascii_case("production") || value.eq_ignore_ascii_case("prod") =>
+        {
+            LogFormat::Json
+        }
         _ => LogFormat::Full,
     }
 }
@@ -60,7 +69,7 @@ fn get_log_format() -> LogFormat {
 /// 根据 `KC__LOG_FORMAT` 环境变量决定日志格式：
 /// - `json` → JSON 格式
 /// - `compact` → 紧凑格式
-/// - 其他值或未设置 → 根据 `KC__ENV` 智能回退（`production` → JSON，其他 → Full）
+/// - 其他值或未设置 → 根据 `KC__ENV` 智能回退（`production` / `prod` → JSON，其他 → Full）
 ///
 /// 将格式分支提取为共享函数，消除各初始化函数之间的代码重复。
 ///
@@ -114,7 +123,7 @@ fn try_init_subscriber() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 /// - `json`：JSON 格式，适配日志采集系统
 /// - `compact`：紧凑格式，适合终端快速查看
 /// - 其他值：Full 格式
-/// - 未设置时：根据 `KC__ENV` 回退（`production` → JSON，其他 → Full）
+/// - 未设置时：根据 `KC__ENV` 回退（`production` / `prod` → JSON，其他 → Full）
 pub fn try_init_logger() -> bool {
     // 使用 compare_exchange 实现原子性的检查和设置，避免竞态条件
     // 如果已经是 true，直接返回成功
@@ -150,7 +159,7 @@ pub fn try_init_logger() -> bool {
 /// - `json`：JSON 格式，适配日志采集系统
 /// - `compact`：紧凑格式，适合终端快速查看
 /// - 其他值：Full 格式
-/// - 未设置时：根据 `KC__ENV` 回退（`production` → JSON，其他 → Full）
+/// - 未设置时：根据 `KC__ENV` 回退（`production` / `prod` → JSON，其他 → Full）
 ///
 /// 此函数是线程安全的，可以安全地多次调用。如果日志系统已经初始化
 /// （无论是本模块还是其他代码），后续调用会静默跳过。
@@ -211,4 +220,26 @@ pub fn init_test_logger() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("error")
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogFormat, log_format_from_values};
+
+    #[test]
+    fn prod_alias_uses_json_log_format() {
+        assert_eq!(log_format_from_values(None, Some("prod")), LogFormat::Json);
+        assert_eq!(
+            log_format_from_values(None, Some("production")),
+            LogFormat::Json
+        );
+    }
+
+    #[test]
+    fn explicit_log_format_still_has_priority() {
+        assert_eq!(
+            log_format_from_values(Some("compact"), Some("prod")),
+            LogFormat::Compact
+        );
+    }
 }

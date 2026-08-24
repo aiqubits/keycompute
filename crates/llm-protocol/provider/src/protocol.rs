@@ -85,6 +85,13 @@ pub fn normalize_base_url(url: &str) -> Result<String, String> {
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err("Base URL must start with http:// or https://".to_string());
     }
+    let parsed = reqwest::Url::parse(trimmed).map_err(|_| "Base URL is invalid".to_string())?;
+    if parsed.host_str().is_none() {
+        return Err("Base URL must include a host".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Base URL must not include username or password credentials".to_string());
+    }
     for suffix in ["/chat/completions", "/messages"] {
         if trimmed.ends_with(suffix) {
             return Err(format!(
@@ -151,6 +158,12 @@ mod tests {
             normalize_base_url("http://ollama:11434").unwrap(),
             "http://ollama:11434"
         );
+    }
+
+    #[test]
+    fn test_normalize_base_url_rejects_userinfo_credentials() {
+        assert!(normalize_base_url("https://user:secret@example.com/v1").is_err());
+        assert!(normalize_base_url("https://user@example.com/v1").is_err());
     }
 
     #[test]

@@ -9,8 +9,6 @@ pub struct ServerConfig {
     pub bind_addr: String,
     /// 监听端口
     pub port: u16,
-    /// 工作线程数（可选，默认使用 CPU 核心数）
-    pub workers: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -18,7 +16,6 @@ impl Default for ServerConfig {
         Self {
             bind_addr: "0.0.0.0".to_string(),
             port: 3000,
-            workers: None,
         }
     }
 }
@@ -32,6 +29,5 @@ mod tests {
         let config = ServerConfig::default();
         assert_eq!(config.bind_addr, "0.0.0.0");
         assert_eq!(config.port, 3000);
-        assert!(config.workers.is_none());
     }
 }

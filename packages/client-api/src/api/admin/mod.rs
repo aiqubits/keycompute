@@ -19,7 +19,10 @@ pub use account::{
     CreateAccountRequest, UpdateAccountRequest,
 };
 pub use monitoring::{
-    MonitoringNodeHealth, MonitoringOverviewResponse, MonitoringSummary, MonitoringTraceEntry,
+    MonitoringAttemptDetail, MonitoringNodeHealth, MonitoringOverviewResponse,
+    MonitoringProbeRequest, MonitoringQuery, MonitoringRequestDetail, MonitoringRequestItem,
+    MonitoringRequestPage, MonitoringSummary, MonitoringSummaryResponse,
+    MonitoringTargetHealthResponse, MonitoringTraceEntry, MonitoringTraceSummary,
 };
 pub use node_gateway::{
     ApproveTokenRequest, DeleteNodeResponse, ExcludeNodeResponse, NodeGatewayNodeInfo,
@@ -297,6 +300,75 @@ impl AdminApi {
     pub async fn monitoring_overview(&self, token: &str) -> Result<MonitoringOverviewResponse> {
         self.client
             .get_json("/api/v1/admin/monitoring/overview", Some(token))
+            .await
+    }
+
+    pub async fn monitoring_requests(
+        &self,
+        params: &MonitoringQuery,
+        token: &str,
+    ) -> Result<MonitoringRequestPage> {
+        let query = params.to_query_string();
+        let path = if query.is_empty() {
+            "/api/v1/admin/monitoring/requests".to_string()
+        } else {
+            format!("/api/v1/admin/monitoring/requests?{query}")
+        };
+        self.client.get_json(&path, Some(token)).await
+    }
+
+    pub async fn monitoring_request(
+        &self,
+        request_id: &str,
+        token: &str,
+    ) -> Result<MonitoringRequestDetail> {
+        self.client
+            .get_json(
+                &format!("/api/v1/admin/monitoring/requests/{request_id}"),
+                Some(token),
+            )
+            .await
+    }
+
+    pub async fn monitoring_summary(
+        &self,
+        params: &MonitoringQuery,
+        token: &str,
+    ) -> Result<MonitoringSummaryResponse> {
+        let query = params.to_query_string();
+        let path = if query.is_empty() {
+            "/api/v1/admin/monitoring/summary".to_string()
+        } else {
+            format!("/api/v1/admin/monitoring/summary?{query}")
+        };
+        self.client.get_json(&path, Some(token)).await
+    }
+
+    pub async fn monitoring_target_health(
+        &self,
+        params: &MonitoringQuery,
+        token: &str,
+    ) -> Result<MonitoringTargetHealthResponse> {
+        let query = params.to_query_string();
+        let path = if query.is_empty() {
+            "/api/v1/admin/monitoring/targets/health".to_string()
+        } else {
+            format!("/api/v1/admin/monitoring/targets/health?{query}")
+        };
+        self.client.get_json(&path, Some(token)).await
+    }
+
+    pub async fn probe_monitoring_targets(
+        &self,
+        account_ids: Option<Vec<String>>,
+        token: &str,
+    ) -> Result<serde_json::Value> {
+        self.client
+            .post_json(
+                "/api/v1/admin/monitoring/targets/probe",
+                &MonitoringProbeRequest { account_ids },
+                Some(token),
+            )
             .await
     }
 

@@ -7,7 +7,7 @@
 //! - 连接池管理
 
 use deadpool_redis::redis::AsyncCommands;
-use deadpool_redis::{Config, Pool, Runtime};
+use deadpool_redis::{Config, Pool, Runtime, Timeouts};
 use std::time::Duration;
 
 /// Redis 存储错误
@@ -72,14 +72,8 @@ impl RedisRuntimeStore {
 
     /// 从配置创建存储
     pub fn from_config(config: &RedisPoolConfig) -> Result<Self, RedisStoreError> {
-        let mut cfg = Config::from_url(&config.url);
-        cfg.pool = Some(deadpool_redis::PoolConfig {
-            max_size: config.pool_size,
-            ..Default::default()
-        });
-        let pool = cfg
-            .create_pool(Some(Runtime::Tokio1))
-            .map_err(|e| RedisStoreError::CreatePoolError(e.to_string()))?;
+        let pool =
+            Self::create_pool_with_options(&config.url, config.pool_size, config.connect_timeout)?;
 
         Ok(Self {
             pool,
@@ -119,6 +113,25 @@ impl RedisRuntimeStore {
     /// 避免外部模块直接依赖 `deadpool_redis::Config`。
     pub fn create_pool(redis_url: &str) -> Result<Pool, RedisStoreError> {
         let cfg = Config::from_url(redis_url);
+        cfg.create_pool(Some(Runtime::Tokio1))
+            .map_err(|e| RedisStoreError::CreatePoolError(e.to_string()))
+    }
+
+    /// 从 URL 和连接池参数创建共享连接池。
+    pub fn create_pool_with_options(
+        redis_url: &str,
+        pool_size: usize,
+        connect_timeout: Duration,
+    ) -> Result<Pool, RedisStoreError> {
+        let mut cfg = Config::from_url(redis_url);
+        cfg.pool = Some(deadpool_redis::PoolConfig {
+            max_size: pool_size,
+            timeouts: Timeouts {
+                create: Some(connect_timeout),
+                ..Timeouts::default()
+            },
+            ..Default::default()
+        });
         cfg.create_pool(Some(Runtime::Tokio1))
             .map_err(|e| RedisStoreError::CreatePoolError(e.to_string()))
     }
@@ -266,5 +279,22 @@ impl Default for RedisPoolConfig {
             default_ttl: Duration::from_secs(300),
             key_prefix: "keycompute:runtime".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_pool_uses_requested_size() {
+        let pool = RedisRuntimeStore::create_pool_with_options(
+            "redis://127.0.0.1:6379",
+            17,
+            Duration::from_secs(3),
+        )
+        .expect("pool construction should not require a live Redis server");
+
+        assert_eq!(pool.status().max_size, 17);
     }
 }

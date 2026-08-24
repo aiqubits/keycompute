@@ -34,6 +34,7 @@ async fn test_full_request_chain() {
     };
 
     let request_context = Arc::new(RequestContext::new(
+        uuid::Uuid::new_v4(),
         ctx.user_id,
         ctx.tenant_id,
         ctx.produce_ai_key_id,

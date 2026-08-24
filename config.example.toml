@@ -1,12 +1,18 @@
 # KeyCompute 配置文件示例
 # 复制此文件为 config.toml 并根据需要修改
 # 环境变量优先级高于配置文件，格式：KC__SECTION__KEY=value
+# 本文件中的密码和密钥是开发环境示例。生产环境保留示例值或不配置加密密钥
+# 会被拒绝启动；请通过环境变量提供独立的安全值。
 
 # ==================== 应用公开地址配置（全局） ====================
 # 用于密码重置邮件、邀请注册链接等中的公开链接
 # 除此之外，该值也可通过环境变量 APP_BASE_URL 覆盖（优先级最高）
-# 启用邮件服务或需要生成公开邀请链接时必须显式配置
-# app_base_url = "https://app.example.com"
+# 未显式配置时回退为 https://keycompute.cn
+# 非本地公开地址必须使用 https；仅 localhost / 回环地址可使用 http
+app_base_url = "https://keycompute.cn"
+
+# 读库连接 URL 列表（空数组表示不启用读写分离）
+database_read_urls = []
 
 # ==================== 服务器配置 ====================
 [server]
@@ -14,8 +20,6 @@
 bind_addr = "0.0.0.0"
 # 服务器监听端口
 port = 3000
-# 工作线程数（可选，默认使用 CPU 核心数）
-# workers = 4
 
 # ==================== 数据库配置 ====================
 [database]
@@ -32,13 +36,41 @@ idle_timeout_secs = 600
 # 连接最大生命周期（秒）
 max_lifetime_secs = 1800
 
+# ==================== 读写分离路由配置 ====================
+[database_routing]
+# 路由策略：round_robin / random / weighted
+strategy = "round_robin"
+# 读库权重（仅 weighted 策略生效；空数组表示等权）
+read_weights = []
+# 额外重试次数
+retry_attempts = 2
+# 熔断时间（毫秒）
+circuit_break_ms = 30000
+# 读库不可用时是否回退到写库
+fallback_to_write = true
+# 健康检查间隔（秒，0 表示禁用）
+health_check_interval_secs = 15
+
+# ==================== 读库连接池配置 ====================
+[database_read]
+# 最大连接数
+max_connections = 10
+# 最小连接数
+min_connections = 1
+# 连接超时时间（秒）
+connect_timeout_secs = 5
+# 连接空闲超时时间（秒）
+idle_timeout_secs = 600
+# 获取连接超时时间（秒）
+acquire_timeout_secs = 10
+# 连接最大生命周期（秒）
+max_lifetime_secs = 1800
+
 # ==================== Redis 配置（可选）====================
 [redis]
 # Redis 连接 URL（注意：需要包含密码，格式：redis://:password@host:port）
 # 生产环境请使用环境变量 KC__REDIS__URL 覆盖此配置
 url = "redis://:change-me-redis-password@127.0.0.1:6379"
-# 键前缀（用于多租户隔离）
-# key_prefix = "kc:prod:"
 # 连接池大小
 pool_size = 10
 # 连接超时（秒）
@@ -46,7 +78,7 @@ connect_timeout_secs = 5
 
 # ==================== 认证配置 ====================
 [auth]
-# JWT 密钥（生产环境必须修改！）
+# JWT 密钥（生产环境必须修改，至少 32 字符）
 jwt_secret = "change-me-in-production"
 # JWT 签发者
 jwt_issuer = "keycompute"
@@ -55,6 +87,12 @@ jwt_expiry_secs = 3600
 
 # ==================== Gateway 配置 ====================
 [gateway]
+# 管理端原始追踪查询允许的最大时间范围（小时）
+monitoring_raw_max_hours = 24
+# 自动真实推理探测间隔（秒）；默认 0 表示禁用，启用后会产生上游调用与费用
+account_probe_interval_secs = 0
+# 自动探测并发数（1-32）
+account_probe_concurrency = 4
 # 最大重试次数
 max_retries = 3
 # 请求超时时间（秒）
@@ -66,21 +104,13 @@ request_timeout_secs = 120
 # 流式请求超时（秒）
 stream_timeout_secs = 600
 
-[gateway.retry]
-# 初始退避时间（毫秒）
-initial_backoff_ms = 100
-# 最大退避时间（毫秒）
-max_backoff_ms = 10000
-# 退避倍数
-backoff_multiplier = 2.0
-
 # Gateway HTTP 代理配置（可选）
 # 用于多代理出口、按 Provider 路由到不同代理
 # [gateway.proxy]
 
 # ==================== 加密配置（可选）====================
 # 用于上游 Provider API Key 的加密存储
-# 生产环境强烈建议配置！
+# 生产环境必须配置；未配置时服务拒绝启动
 # 
 # [crypto]
 # 加密密钥（Base64 编码的 32 字节密钥）
@@ -103,7 +133,7 @@ smtp_port = 465
 # SMTP 用户名
 smtp_username = "noreply@example.com"
 # SMTP 密码
-smtp_password = "your-smtp-password"
+smtp_password = "change-me-smtp-password"
 # 发件人邮箱地址
 from_address = "noreply@example.com"
 # 发件人显示名称（可选）
@@ -113,28 +143,7 @@ use_tls = true
 # 邮件发送超时（秒，默认 30）
 timeout_secs = 30
 # 需求收集表单接收人邮箱（首页"提交算力需求"提交后发送至此邮箱，可选；未配置则该功能返回失败）
-requirement_recipient = "sales@example.com"
-
-# ==================== 分销配置（可选） ====================
-# 提供二级分销的默认比例配置
-# 注意：这里只配置默认分销比例，不配置分销开关。
-# 分销功能是否开启由 system 角色在后台系统设置中统一管理。
-# 一级分销比例范围：0 - 1.0（推荐 0.03 即 3%）
-# 二级分销比例范围：0 - 1.0（推荐 0.02 即 2%）
-# 注：max_total_ratio 为一级和二级分销的最大总和限制
-#
-[distribution]
-# 一级分销默认比例（如 0.03 表示 3%）
-default_level1_ratio = 0.03
-# 二级分销默认比例（如 0.02 表示 2%）
-default_level2_ratio = 0.02
-# 最大总分销比例限制（如 0.30 表示最多 30%）
-max_total_ratio = 0.30
-#
-# 环境变量方式：
-# KC__DISTRIBUTION__DEFAULT_LEVEL1_RATIO=0.03
-# KC__DISTRIBUTION__DEFAULT_LEVEL2_RATIO=0.02
-# KC__DISTRIBUTION__MAX_TOTAL_RATIO=0.30
+# requirement_recipient = "sales@example.com"
 
 # ==================== 节点网关配置（Node Gateway） ====================
 # 用于个人 PC 节点接入，支持 Ollama 本地模型执行
@@ -147,7 +156,7 @@ max_total_ratio = 0.30
 #
 [node_gateway]
 # HMAC 签名密钥（用于签发/验证节点注册 token）
-# 生产环境必须修改！生成命令：openssl rand -base64 32
+# 生产环境必须修改（至少 16 字符）；生成命令：openssl rand -base64 32
 # 环境变量: KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET
 registration_token_secret = "change-me-node-registration-token-secret"
 # 会话 TTL（秒），节点会话有效期，默认 300（5 分钟）
@@ -192,7 +201,7 @@ sweeper_repush_interval_secs = 10
 # ==================== 默认系统管理员（环境变量配置） ====================
 # 首次启动时自动创建的系统管理员账号
 # 注意：这些值不在 config.toml 中配置，而是通过环境变量设置
-# 生产环境部署后请立即修改默认密码！
+# 生产环境必须在首次启动前修改（至少 12 字符），否则服务拒绝启动
 #
 # 环境变量：
 # KC__DEFAULT_ADMIN_EMAIL=admin@keycompute.local

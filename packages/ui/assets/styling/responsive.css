@@ -9,9 +9,51 @@
 
 /* ── Mobile (< 640px) ───────────────────────── */
 @media (max-width: 639px) {
+  body:has(.sidebar.mobile-open) {
+    overflow: hidden;
+  }
+
   /* 隐藏侧边栏，改为抽屉式 */
   .sidebar {
+    width: min(86vw, 300px);
     transform: translateX(-100%);
+  }
+
+  /* 桌面折叠状态不能泄漏到移动抽屉。用户先折叠桌面侧栏再缩小视口时，
+     抽屉仍需恢复完整宽度、品牌和导航文字。 */
+  .sidebar.collapsed {
+    width: min(86vw, 300px);
+  }
+
+  .sidebar.collapsed .sidebar-logo-copy {
+    width: auto;
+    opacity: 1;
+  }
+
+  .sidebar.collapsed .sidebar-section-title {
+    opacity: 1;
+  }
+
+  .sidebar.collapsed .sidebar-item-label {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    padding: 0;
+    overflow: visible;
+    clip: auto;
+    white-space: nowrap;
+    opacity: 1;
+  }
+
+  .sidebar.collapsed .sidebar-item {
+    justify-content: flex-start;
+    gap: 12px;
+    padding: 10px 12px;
+  }
+
+  .sidebar.collapsed .sidebar-item.active::before {
+    display: block;
   }
 
   .sidebar.mobile-open {
@@ -31,7 +73,20 @@
 
   /* 内容区为底部导航留空间 */
   .content-area {
+    padding: var(--space-md) 12px;
     padding-bottom: calc(var(--bottom-nav-height) + var(--space-md));
+  }
+
+  .sidebar-logo {
+    padding-right: 10px;
+  }
+
+  .sidebar-mobile-close {
+    display: flex;
+  }
+
+  .sidebar-footer {
+    display: none;
   }
 
   /* 卡片全宽单列 */
@@ -58,6 +113,42 @@
 
   .main-area {
     margin-left: var(--sidebar-collapsed);
+  }
+
+  .sidebar-logo {
+    justify-content: center;
+    padding-inline: 0;
+  }
+
+  .sidebar-logo-copy,
+  .sidebar-section-title,
+  .sidebar-footer {
+    display: none;
+  }
+
+  .sidebar-item-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .sidebar-nav {
+    padding-inline: 10px;
+  }
+
+  .sidebar-section {
+    margin-bottom: 8px;
+  }
+
+  .sidebar-item {
+    justify-content: center;
+    gap: 0;
+    padding-inline: 0;
   }
 
   /* 双列卡片布局 */
@@ -112,3 +203,9 @@
 @media (min-width: 640px)  { .hide-mobile  { display: revert; } }
 @media (min-width: 640px) and (max-width: 1023px) { .hide-tablet  { display: none; } }
 @media (min-width: 1024px) { .hide-desktop { display: none; } }
+
+@media (max-width: 380px) {
+  .header-lang-btn {
+    display: none;
+  }
+}

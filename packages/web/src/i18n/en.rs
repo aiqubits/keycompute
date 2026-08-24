@@ -322,6 +322,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     // ── Layout ──────────────────────────────────
     m.insert("layout.back_to_home", "Back to Home");
     m.insert("layout.open_menu", "Open menu");
+    m.insert("layout.close_menu", "Close menu");
     m.insert("layout.switch_to_light", "Switch to light theme");
     m.insert("layout.switch_to_dark", "Switch to dark theme");
     m.insert("layout.switch_to_zh", "Switch to Chinese");
@@ -1181,7 +1182,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
 
     m.insert(
         "monitoring.subtitle",
-        "Trace gateway-to-node request lifecycles, node health, and usage logging state.",
+        "Unified Provider Account and Node request lifecycles, target health, and billing state.",
     );
     m.insert("monitoring.control_plane", "Execution Overview");
     m.insert(
@@ -1260,6 +1261,140 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("monitoring.map_gateway_subtitle", "OpenAI API");
     m.insert("monitoring.map_router_subtitle", "node: model");
     m.insert("monitoring.map_node", "Node");
+    m.insert("monitoring.time_range", "Time range");
+    m.insert("monitoring.range_1h", "Last 1 hour");
+    m.insert("monitoring.range_6h", "Last 6 hours");
+    m.insert("monitoring.range_24h", "Last 24 hours");
+    m.insert("monitoring.range_custom", "Custom UTC");
+    m.insert("monitoring.utc_from", "UTC start time");
+    m.insert("monitoring.utc_to", "UTC end time");
+    m.insert("monitoring.utc_to_title", "UTC end time (maximum 24 hours)");
+    m.insert("monitoring.status_filter", "Status filter");
+    m.insert("monitoring.all_statuses", "All statuses");
+    m.insert("monitoring.timed_out", "Timed out");
+    m.insert("monitoring.running", "Running");
+    m.insert("monitoring.queued", "Queued");
+    m.insert("monitoring.routing", "Routing");
+    m.insert("monitoring.cancelled", "Cancelled");
+    m.insert("monitoring.received", "Received");
+    m.insert("monitoring.online", "Online");
+    m.insert("monitoring.offline", "Offline");
+    m.insert("monitoring.route_filter", "Execution route filter");
+    m.insert("monitoring.all_routes", "All routes");
+    m.insert("monitoring.resume_auto_refresh", "Resume auto refresh");
+    m.insert("monitoring.pause_auto_refresh", "Pause auto refresh");
+    m.insert("monitoring.refresh_now", "Refresh now");
+    m.insert("monitoring.probe_in_progress", "Probing…");
+    m.insert("monitoring.probe_done", "Probe completed");
+    m.insert("monitoring.probe_failed", "Probe failed");
+    m.insert("monitoring.probe_all_accounts", "Probe all accounts");
+    m.insert("monitoring.last_updated", "Last updated");
+    m.insert(
+        "monitoring.empty_range",
+        "No traffic in the selected time range",
+    );
+    m.insert("monitoring.empty_filtered", "No results match the filters");
+    m.insert("monitoring.request_list", "Monitoring request list");
+    m.insert("monitoring.time", "Time");
+    m.insert("monitoring.request_id", "Request ID");
+    m.insert("monitoring.protocol_model", "Protocol / Model");
+    m.insert("monitoring.execution_route", "Execution Route");
+    m.insert("monitoring.route_provider_account", "Provider Account");
+    m.insert("monitoring.route_node", "Node");
+    m.insert("monitoring.status", "Status");
+    m.insert("monitoring.duration_ttft", "Duration / TTFT");
+    m.insert("monitoring.next_page", "Next page");
+    m.insert("monitoring.request_detail", "Request details");
+    m.insert("monitoring.tenant", "Tenant");
+    m.insert("monitoring.user", "User");
+    m.insert("monitoring.key", "Key");
+    m.insert("monitoring.billing", "Billing");
+    m.insert("monitoring.trace_quality", "Trace quality");
+    m.insert("monitoring.client_first_content", "Client first content");
+    m.insert("monitoring.not_collected", "Not collected");
+    m.insert("monitoring.none", "None");
+    m.insert("monitoring.billing_summary", "Billing summary");
+    m.insert("monitoring.detail_load_failed", "Failed to load details");
+    m.insert("monitoring.attempts", "Attempts");
+    m.insert(
+        "monitoring.node_task_submissions",
+        "Node Task / Submissions",
+    );
+    m.insert("monitoring.request_count", "Requests");
+    m.insert(
+        "monitoring.active_queued",
+        "Active {active} / Queued {queued}",
+    );
+    m.insert("monitoring.success_rate", "Success rate");
+    m.insert("monitoring.error_rate_value", "Error rate {rate}");
+    m.insert("monitoring.attempt_success_rate", "Attempt success rate");
+    m.insert("monitoring.attempt_count", "{count} attempts");
+    m.insert("monitoring.fallback_rate", "Fallback rate");
+    m.insert("monitoring.request_count_meta", "{count} requests");
+    m.insert(
+        "monitoring.total_duration_percentiles",
+        "Duration P50 / P95",
+    );
+    m.insert("monitoring.provider_ttft", "Provider TTFT");
+    m.insert("monitoring.p50_p95", "P50 / P95");
+    m.insert("monitoring.node_queue_execution", "Node queue / execution");
+    m.insert(
+        "monitoring.node_no_ttft",
+        "P50 (TTFT does not apply to Node)",
+    );
+    m.insert("monitoring.tokens_amount", "Tokens / Amount");
+    m.insert("monitoring.trends", "Trends");
+    m.insert("monitoring.no_trends", "No trend data");
+    m.insert("monitoring.utc_time", "UTC Time");
+    m.insert("monitoring.unrouted", "Unrouted");
+    m.insert("monitoring.unassigned_queue", "Unassigned queue");
+    m.insert("monitoring.view_request", "View request {request_id}");
+    m.insert("monitoring.provider_health", "Provider Account Health");
+    m.insert(
+        "monitoring.account_probe_link",
+        "Account management / single probe",
+    );
+    m.insert("monitoring.no_accounts", "No accounts");
+    m.insert("monitoring.node_health", "Node Health");
+    m.insert(
+        "monitoring.node_gateway_link",
+        "Open Node Gateway management",
+    );
+    m.insert("monitoring.attempt_target", "Target: {target}");
+    m.insert(
+        "monitoring.attempt_timing",
+        "Started: {start} · Finished: {end} · Stream end: {reason}",
+    );
+    m.insert(
+        "monitoring.attempt_http",
+        "HTTP: {http} · Upstream Request ID: {upstream}",
+    );
+    m.insert(
+        "monitoring.attempt_provider_timing",
+        "Headers: {headers} · First content: {first} · TTFT: {ttft}",
+    );
+    m.insert("monitoring.error", "Error");
+    m.insert("monitoring.enabled", "Enabled");
+    m.insert("monitoring.disabled", "Disabled");
+    m.insert(
+        "monitoring.provider_health_line",
+        "Real success rate {success} · Latency {latency}",
+    );
+    m.insert(
+        "monitoring.provider_probe_line",
+        "Probe: {probe} ({at}, {latency}, error {error}) · Attributable failures {failures}",
+    );
+    m.insert(
+        "monitoring.node_counts",
+        "Queued {queued} / Running {running} / Succeeded {succeeded} / Failed {failed} / Expired {expired}",
+    );
+    m.insert(
+        "monitoring.node_runtime",
+        "Heartbeat {heartbeat} · Session expires {session} · Models {models}",
+    );
+    m.insert("monitoring.quality_derived", "Historically derived");
+    m.insert("monitoring.quality_partial", "Partial information");
+    m.insert("monitoring.quality_actual", "Actually collected");
     m.insert(
         "users.subtitle",
         "View and manage all registered users on the platform",

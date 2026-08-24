@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod execution_plan;
+pub mod monitoring;
 pub mod node;
 pub mod pricing;
 pub mod request;
@@ -15,6 +16,7 @@ pub mod user;
 // 重新导出最常用的类型
 pub use error::{ErrorCategory, KeyComputeError, Result};
 pub use execution_plan::{ExecutionPlan, ExecutionTarget, SensitiveString};
+pub use monitoring::*;
 pub use node::{
     ImageData, ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse, NodeCapabilities,
     NodeHeartbeatRequest, NodeHeartbeatResponse, NodeId, NodeLeaseId, NodeModelCapability,
@@ -24,8 +26,8 @@ pub use node::{
 };
 pub use pricing::PricingSnapshot;
 pub use request::{
-    ChatCompletionRequest, ContentPart, ExecutedProviderAccount, ImageUrl, Message, MessageContent,
-    MessageRole, RequestContext,
+    ChatCompletionRequest, ClientResponseOutcome, ContentPart, ExecutedProviderAccount, ImageUrl,
+    Message, MessageContent, MessageRole, RequestContext,
 };
 pub use response::{
     ChatCompletionChunk, ChatCompletionResponse, Choice, ErrorResponse, MessageDelta, ModelInfo,

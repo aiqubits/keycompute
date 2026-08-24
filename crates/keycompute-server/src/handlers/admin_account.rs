@@ -17,7 +17,7 @@ use keycompute_db::models::account::{
 };
 use keycompute_types::SensitiveString;
 use llm_protocol_provider::{
-    DefaultHttpTransport, HttpTransport, ProtocolType, normalize_base_url,
+    HttpTransport, ProtocolType, UpstreamMessage, UpstreamRequest, normalize_base_url,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -392,16 +392,72 @@ pub async fn test_account(
         return Err(ApiError::Auth("Admin permission required".to_string()));
     }
 
+    Ok(Json(
+        probe_account_for_monitoring(&state, account_id).await?,
+    ))
+}
+
+pub async fn probe_account_for_monitoring(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<serde_json::Value> {
+    probe_account_for_monitoring_with_policy(state, account_id, AccountProbePolicy::Explicit)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Account not found: {}", account_id)))
+}
+
+/// Probe an account only while it is enabled on the writer.
+///
+/// Replica reads may still expose an account after it has been disabled or
+/// deleted. Automatic jobs must use this entry point so that a stale candidate
+/// never results in a real upstream inference request.
+pub async fn probe_enabled_account_for_monitoring(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<Option<serde_json::Value>> {
+    probe_account_for_monitoring_with_policy(state, account_id, AccountProbePolicy::EnabledOnly)
+        .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountProbePolicy {
+    Explicit,
+    EnabledOnly,
+}
+
+fn account_matches_probe_policy(enabled: bool, policy: AccountProbePolicy) -> bool {
+    policy == AccountProbePolicy::Explicit || enabled
+}
+
+async fn probe_account_for_monitoring_with_policy(
+    state: &AppState,
+    account_id: Uuid,
+    policy: AccountProbePolicy,
+) -> Result<Option<serde_json::Value>> {
     let pool = state
         .pool
         .as_deref()
         .ok_or_else(|| ApiError::Internal("Database not configured".to_string()))?;
+    let writer = pool.write_conn();
 
-    // 查找账号
-    let account = Account::find_by_id(pool, account_id)
+    // Reload on the writer immediately before the network call. The candidate
+    // list may have come from a lagging replica, but account deletion, disable,
+    // credentials, endpoint, and model configuration must all be fresh here.
+    let account = Account::find_by_id(writer, account_id)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to find account: {}", e)))?
-        .ok_or_else(|| ApiError::NotFound(format!("Account not found: {}", account_id)))?;
+        .and_then(|account| {
+            account_matches_probe_policy(account.enabled, policy).then_some(account)
+        });
+    let Some(account) = account else {
+        return match policy {
+            AccountProbePolicy::Explicit => Err(ApiError::NotFound(format!(
+                "Account not found: {}",
+                account_id
+            ))),
+            AccountProbePolicy::EnabledOnly => Ok(None),
+        };
+    };
 
     // 解密 API Key
     let api_key = decrypt_account_api_key(&account.upstream_api_key_encrypted)?;
@@ -421,43 +477,80 @@ pub async fn test_account(
         account.endpoint.clone()
     };
 
-    // 创建 HTTP 传输层
-    let transport = DefaultHttpTransport::new();
+    // Probe through the same provider/account proxy and timeout path as live
+    // traffic, otherwise health can disagree with the production route.
+    let transport = state
+        .http_proxy
+        .client_for_provider_and_account(protocol.as_str(), Some(account_id));
 
     let start = Instant::now();
 
     // 按协议分发调用上游模型列表接口，验证 API Key 连通性
-    let test_result = fetch_upstream_models(protocol, &transport, &endpoint, &api_key).await;
+    let test_result = probe_upstream_account(
+        protocol,
+        transport.as_ref(),
+        &endpoint,
+        &api_key,
+        &account.models_supported,
+    )
+    .await;
 
     let latency_ms = start.elapsed().as_millis() as i64;
+    let (probe_status, probe_error_code) = if test_result.is_ok() {
+        ("succeeded", None)
+    } else {
+        ("failed", test_result.as_ref().err().cloned())
+    };
+    keycompute_observability::metrics::ACCOUNT_PROBE_TOTAL
+        .with_label_values(&[probe_status])
+        .inc();
+    keycompute_observability::metrics::ACCOUNT_PROBE_LATENCY
+        .with_label_values(&[probe_status])
+        .observe(latency_ms.max(0) as f64 / 1000.0);
+    match Account::record_probe_snapshot_if_config_current(
+        writer,
+        account_id,
+        account.updated_at,
+        chrono::Utc::now(),
+        latency_ms,
+        probe_status,
+        probe_error_code.as_deref(),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            %account_id,
+            "discarded account probe snapshot because configuration changed during the probe"
+        ),
+        Err(error) => {
+            tracing::warn!(%account_id, %error, "failed to persist account probe snapshot");
+        }
+    }
 
     match test_result {
-        Ok(models) => {
-            // 测试成功：清除错误计数
-            state.account_states.clear_cooldown(account_id);
-            Ok(Json(account_test_response(
-                account_id,
-                &account.provider,
-                &endpoint,
-                latency_ms,
-                Some(models),
-            )))
-        }
+        Ok(models) => Ok(Some(account_test_response(
+            account_id,
+            &account.provider,
+            &endpoint,
+            latency_ms,
+            Some(models),
+            None,
+        ))),
         Err(_) => {
-            // 测试失败：标记错误（仅管理员测试时触发）
-            state.account_states.mark_error(account_id);
             // 上游响应可能包含供应商内部详情或凭据回显；不记录或返回其原始内容。
             tracing::warn!(
                 account_id = %account_id,
                 provider = %account.provider,
                 "Account connection test failed"
             );
-            Ok(Json(account_test_response(
+            Ok(Some(account_test_response(
                 account_id,
                 &account.provider,
                 &endpoint,
                 latency_ms,
                 None,
+                probe_error_code.as_deref(),
             )))
         }
     }
@@ -469,6 +562,7 @@ fn account_test_response(
     endpoint: &str,
     latency_ms: i64,
     models: Option<Vec<String>>,
+    error_code: Option<&str>,
 ) -> serde_json::Value {
     // Keep the summary at the response root: AccountTestResponse is shared by
     // dashboard clients and deliberately does not need to parse test_result.
@@ -495,6 +589,7 @@ fn account_test_response(
                 "is_healthy": false,
                 "latency_ms": latency_ms,
                 "error": "Upstream connection test failed",
+                "error_code": error_code.unwrap_or("probe_failed"),
                 "provider": provider,
                 "endpoint": endpoint,
             }
@@ -522,6 +617,71 @@ async fn fetch_upstream_models(
         .list_models(transport, endpoint, &key)
         .await
         .map_err(|e| e.to_string())
+}
+
+async fn probe_upstream_account(
+    protocol: ProtocolType,
+    transport: &dyn HttpTransport,
+    endpoint: &str,
+    api_key: &str,
+    configured_models: &[String],
+) -> std::result::Result<Vec<String>, String> {
+    let adapter = crate::providers::get_provider_definition(protocol.as_str())
+        .map(|definition| (definition.create_adapter)())
+        .ok_or_else(|| "provider_not_registered".to_string())?;
+    let key = SensitiveString::new(api_key);
+    // A configured model is sufficient for the real inference probe. Some
+    // OpenAI-compatible services intentionally expose chat completions without
+    // implementing GET /models, so requiring that endpoint would create a
+    // false-negative health result. Only discover models when configuration
+    // cannot provide one.
+    let (model, reported_models) = if let Some(model) = configured_models.first() {
+        (model.clone(), configured_models.to_vec())
+    } else {
+        let discovered = adapter
+            .list_models(transport, endpoint, &key)
+            .await
+            .map_err(|error| probe_error_code(&error))?;
+        let model = discovered
+            .first()
+            .ok_or_else(|| "probe_model_unavailable".to_string())?
+            .clone();
+        (model, discovered)
+    };
+    let request = UpstreamRequest {
+        endpoint: endpoint.to_string(),
+        upstream_api_key: key,
+        model,
+        messages: vec![UpstreamMessage {
+            role: "user".to_string(),
+            content: keycompute_types::MessageContent::text("ping"),
+        }],
+        stream: false,
+        include_stream_usage: true,
+        max_tokens: Some(1),
+        temperature: Some(0.0),
+        top_p: None,
+        native_anthropic_request: None,
+        native_anthropic_headers: std::collections::BTreeMap::new(),
+    };
+    adapter
+        .chat(transport, request)
+        .await
+        .map_err(|error| probe_error_code(&error))?;
+    Ok(reported_models)
+}
+
+fn probe_error_code(error: &keycompute_types::KeyComputeError) -> String {
+    match error {
+        keycompute_types::KeyComputeError::UpstreamFailure { stable_code, .. } => {
+            stable_code.clone()
+        }
+        keycompute_types::KeyComputeError::ProviderTimeout(_, _)
+        | keycompute_types::KeyComputeError::Timeout(_) => "upstream_timeout".to_string(),
+        keycompute_types::KeyComputeError::NetworkError(_) => "upstream_transport".to_string(),
+        keycompute_types::KeyComputeError::SerializationError(_) => "upstream_protocol".to_string(),
+        _ => "probe_failed".to_string(),
+    }
 }
 
 /// 刷新账号信息（重新获取模型列表等）
@@ -567,11 +727,12 @@ pub async fn refresh_account(
         account.endpoint.clone()
     };
 
-    // 创建 HTTP 传输层
-    let transport = DefaultHttpTransport::new();
+    let transport = state
+        .http_proxy
+        .client_for_provider_and_account(protocol.as_str(), Some(account_id));
 
     // 按协议分发获取上游模型列表
-    let fetched_models = fetch_upstream_models(protocol, &transport, &endpoint, &api_key)
+    let fetched_models = fetch_upstream_models(protocol, transport.as_ref(), &endpoint, &api_key)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to fetch models: {}", e)))?;
 
@@ -649,8 +810,79 @@ pub fn get_default_endpoint(provider: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_protocol_provider::test_support::RecordingGetTransport;
+    use llm_protocol_provider::{
+        ByteStream, GetBinaryResponse, test_support::RecordingGetTransport,
+    };
     use serde_json::json;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    #[derive(Debug, Default)]
+    struct ChatOnlyProbeTransport {
+        get_calls: AtomicUsize,
+        post_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpTransport for ChatOnlyProbeTransport {
+        async fn post_json(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            _body: String,
+        ) -> keycompute_types::Result<String> {
+            self.post_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(r#"{"id":"probe","object":"chat.completion","created":0,"model":"configured-model","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop","logprobs":null}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_string())
+        }
+
+        async fn post_stream(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            _body: String,
+        ) -> keycompute_types::Result<ByteStream> {
+            unreachable!("the account probe is non-streaming")
+        }
+
+        async fn get_binary(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+        ) -> keycompute_types::Result<GetBinaryResponse> {
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
+            Err(keycompute_types::KeyComputeError::ProviderError(
+                "GET /models is intentionally unavailable".to_string(),
+            ))
+        }
+
+        fn request_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn stream_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_probe_model_does_not_require_models_endpoint() {
+        let transport = ChatOnlyProbeTransport::default();
+        let models = probe_upstream_account(
+            ProtocolType::Openai,
+            &transport,
+            "https://provider.example/v1",
+            "test-key",
+            &["configured-model".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(models, vec!["configured-model"]);
+        assert_eq!(transport.post_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(transport.get_calls.load(Ordering::Relaxed), 0);
+    }
 
     #[tokio::test]
     async fn fetch_upstream_models_rejects_invalid_models_payload() {
@@ -713,6 +945,7 @@ mod tests {
             "https://provider.example/v1",
             42,
             Some(vec!["model-a".to_string()]),
+            None,
         );
         let failure = account_test_response(
             account_id,
@@ -720,6 +953,7 @@ mod tests {
             "https://provider.example/v1",
             42,
             None,
+            Some("upstream_http_401"),
         );
         let empty_models = account_test_response(
             account_id,
@@ -727,6 +961,7 @@ mod tests {
             "https://provider.example/v1",
             42,
             Some(Vec::new()),
+            None,
         );
 
         assert_eq!(success["success"], json!(true));
@@ -739,6 +974,34 @@ mod tests {
             failure["test_result"]["error"],
             "Upstream connection test failed"
         );
+        assert_eq!(failure["test_result"]["error_code"], "upstream_http_401");
+    }
+
+    #[test]
+    fn probe_snapshot_uses_stable_upstream_error_code() {
+        let error = keycompute_types::KeyComputeError::UpstreamFailure {
+            status: Some(429),
+            stable_code: "upstream_http_429".to_string(),
+            retryable: true,
+            summary: "sanitized".to_string(),
+        };
+        assert_eq!(probe_error_code(&error), "upstream_http_429");
+    }
+
+    #[test]
+    fn automatic_probe_skips_accounts_disabled_on_writer() {
+        assert!(!account_matches_probe_policy(
+            false,
+            AccountProbePolicy::EnabledOnly
+        ));
+        assert!(account_matches_probe_policy(
+            true,
+            AccountProbePolicy::EnabledOnly
+        ));
+        assert!(account_matches_probe_policy(
+            false,
+            AccountProbePolicy::Explicit
+        ));
     }
 
     #[test]

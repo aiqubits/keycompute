@@ -12,14 +12,16 @@
 //! - `node_index`: Node 能力索引实现
 
 pub mod config;
+mod metrics;
 pub mod node_index;
 pub mod redis;
 pub mod service;
 pub mod store;
 pub mod sweeper;
+mod trace;
 
 // 重新导出关键类型
-pub use config::{ConfigError, NodeGatewayAppConfig};
+pub use config::NodeGatewayAppConfig;
 pub use node_index::PostgresNodeIndex;
 pub use redis::NodeGatewayRedis;
 pub use service::{NodeExecutionError, NodeGatewayService};

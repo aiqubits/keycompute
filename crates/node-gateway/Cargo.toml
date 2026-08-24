@@ -9,6 +9,7 @@ keycompute-db = { path = "../keycompute-db" }
 keycompute-config = { path = "../keycompute-config" }
 keycompute-routing = { path = "../keycompute-routing" }
 keycompute-runtime = { path = "../keycompute-runtime", features = ["redis"] }
+keycompute-observability = { path = "../keycompute-observability" }
 
 anyhow = "1"
 async-trait = "0.1"

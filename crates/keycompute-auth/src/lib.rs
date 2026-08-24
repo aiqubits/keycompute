@@ -206,19 +206,8 @@ impl AuthService {
         // token_version 失效校验：
         // 与数据库中用户当前的 token_version 比对，密码重置/登出后旧 token 将被拒绝。
         // 仅在配置了 UserService（含数据库连接）时执行；无连接时保持结构性校验行为。
-        if let Some(user_service) = &self.user_service
-            && let Some(current_version) = user_service.load_token_version(ctx.user_id).await?
-            && current_version != ctx.token_version
-        {
-            tracing::warn!(
-                user_id = %ctx.user_id,
-                token_version = ctx.token_version,
-                current_version,
-                "JWT token_version mismatch; token has been invalidated"
-            );
-            return Err(KeyComputeError::AuthError(
-                "Token has been invalidated".into(),
-            ));
+        if let Some(user_service) = &self.user_service {
+            validate_user_token_version(&ctx, user_service.load_token_version(ctx.user_id).await?)?;
         }
 
         Ok(ctx)
@@ -286,6 +275,27 @@ impl AuthService {
     pub fn has_pool(&self) -> bool {
         self.produce_ai_key_validator.has_pool()
     }
+}
+
+fn validate_user_token_version(ctx: &AuthContext, current_version: Option<i32>) -> Result<()> {
+    // None means UserService has no database connection. A missing database
+    // subject is already returned as AuthError by load_token_version(), so keep
+    // the documented structural-validation behavior for this case.
+    let Some(current_version) = current_version else {
+        return Ok(());
+    };
+    if current_version != ctx.token_version {
+        tracing::warn!(
+            user_id = %ctx.user_id,
+            token_version = ctx.token_version,
+            current_version,
+            "JWT token_version mismatch; token has been invalidated"
+        );
+        return Err(KeyComputeError::AuthError(
+            "Token has been invalidated".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -379,5 +389,32 @@ mod tests {
 
         let result = auth_service.verify_jwt(&token);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn token_version_validation_skips_when_database_is_unavailable() {
+        let ctx = AuthContext::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::nil(), "admin");
+        assert!(validate_user_token_version(&ctx, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn jwt_with_database_less_user_service_keeps_structural_validation() {
+        let jwt_validator = JwtValidator::new("secret", "keycompute");
+        let token = jwt_validator
+            .generate_token(Uuid::new_v4(), Uuid::new_v4(), "user")
+            .unwrap();
+        let auth_service = AuthService::new(ProduceAiKeyValidator::default())
+            .with_jwt(jwt_validator)
+            .with_user_service(UserService::new());
+
+        assert!(auth_service.verify_token(&token).await.is_ok());
+    }
+
+    #[test]
+    fn token_version_validation_requires_current_version() {
+        let mut ctx = AuthContext::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::nil(), "user");
+        ctx.token_version = 4;
+        assert!(validate_user_token_version(&ctx, Some(4)).is_ok());
+        assert!(validate_user_token_version(&ctx, Some(3)).is_err());
     }
 }

@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-/// JWT 默认密钥（生产环境必须修改）
+/// JWT 默认密钥（生产环境强烈建议修改）
 pub const DEFAULT_JWT_SECRET: &str = "change-me-in-production";
 
 /// 认证配置

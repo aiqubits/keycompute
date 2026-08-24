@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 keycompute-types.workspace = true
 keycompute-config.workspace = true
+keycompute-observability.workspace = true
 sea-orm = { workspace = true }
 tokio = { version = "1.44", features = ["full"] }
 uuid = { version = "1.16", features = ["v4", "serde"] }

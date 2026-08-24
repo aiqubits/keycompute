@@ -10,6 +10,9 @@ use axum::{
 use serde_json::json;
 use std::fmt;
 
+const UPSTREAM_REQUEST_FAILED_MESSAGE: &str = "Upstream request failed";
+const UPSTREAM_REQUEST_TIMEOUT_MESSAGE: &str = "Upstream request timed out";
+
 /// API 错误类型
 #[derive(Debug)]
 pub enum ApiError {
@@ -164,6 +167,7 @@ impl From<keycompute_db::DbError> for ApiError {
                     | "grace_period_expired"
                     | "invalid_task_state"
                     | "lease_mismatch"
+                    | "node_result_type_mismatch"
                     | "task_expired_during_complete" => ApiError::NodeTaskConflict(msg),
                     _ => ApiError::Internal(msg),
                 }
@@ -181,7 +185,7 @@ impl From<node_gateway::NodeExecutionError> for ApiError {
             NE::ClientError { code, message } => {
                 ApiError::BadRequest(format!("{}: {}", code, message))
             }
-            NE::Other(e) => ApiError::Internal(e.to_string()),
+            NE::Other { source, .. } => ApiError::Internal(source.to_string()),
         }
     }
 }
@@ -211,10 +215,13 @@ impl From<keycompute_types::KeyComputeError> for ApiError {
             KeyComputeError::RoutingFailed(msg) => ApiError::Routing(msg),
             KeyComputeError::NoReadyNode(msg) => ApiError::Routing(msg),
 
-            // Provider
-            KeyComputeError::ProviderError(msg) => ApiError::Provider(msg),
-            KeyComputeError::ProviderTimeout(ms, msg) => {
-                ApiError::Provider(format!("timeout after {}ms: {}", ms, msg))
+            // Provider/transport 错误可能携带上游响应正文、endpoint 或底层网络
+            // 细节。通用转换必须是安全边界；原始信息只留在内部日志/追踪中。
+            KeyComputeError::ProviderError(_) | KeyComputeError::UpstreamFailure { .. } => {
+                ApiError::Provider(UPSTREAM_REQUEST_FAILED_MESSAGE.to_string())
+            }
+            KeyComputeError::ProviderTimeout(_, _) => {
+                ApiError::Provider(UPSTREAM_REQUEST_TIMEOUT_MESSAGE.to_string())
             }
 
             // 数据库
@@ -232,9 +239,11 @@ impl From<keycompute_types::KeyComputeError> for ApiError {
             KeyComputeError::NotFound(msg) => ApiError::NotFound(msg),
 
             // 网络
-            KeyComputeError::NetworkError(msg) => ApiError::Provider(msg),
-            KeyComputeError::Timeout(msg) => {
-                ApiError::Provider(format!("Request timeout: {}", msg))
+            KeyComputeError::NetworkError(_) => {
+                ApiError::Provider(UPSTREAM_REQUEST_FAILED_MESSAGE.to_string())
+            }
+            KeyComputeError::Timeout(_) => {
+                ApiError::Provider(UPSTREAM_REQUEST_TIMEOUT_MESSAGE.to_string())
             }
 
             // 内部错误
@@ -309,6 +318,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mismatched_node_result_is_a_client_visible_task_conflict() {
+        let error = ApiError::from(keycompute_db::DbError::Other(
+            "node_result_type_mismatch".to_string(),
+        ));
+
+        assert!(matches!(error, ApiError::NodeTaskConflict(_)));
+        assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+    }
+
     #[tokio::test]
     async fn internal_error_response_hides_details() {
         let response =
@@ -322,6 +341,36 @@ mod tests {
         assert!(body.contains("Internal server error"));
         assert!(!body.contains("secret_table_key"));
         assert!(!body.contains("duplicate key"));
+    }
+
+    #[tokio::test]
+    async fn generic_provider_error_responses_hide_upstream_details() {
+        let errors = [
+            keycompute_types::KeyComputeError::ProviderError(
+                "provider returned secret-token-123".to_string(),
+            ),
+            keycompute_types::KeyComputeError::UpstreamFailure {
+                status: Some(502),
+                stable_code: "upstream_http_502".to_string(),
+                retryable: true,
+                summary: "raw upstream body with secret-token-123".to_string(),
+            },
+            keycompute_types::KeyComputeError::NetworkError(
+                "https://internal.example/secret-token-123".to_string(),
+            ),
+        ];
+
+        for error in errors {
+            let response = ApiError::from(error).into_response();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains(UPSTREAM_REQUEST_FAILED_MESSAGE));
+            assert!(!body.contains("secret-token-123"));
+            assert!(!body.contains("internal.example"));
+        }
     }
 
     #[tokio::test]

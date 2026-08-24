@@ -1,0 +1,964 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KeyCompute · 监控追踪重构原型</title>
+  <link rel="stylesheet" href="../../packages/web/assets/main.css">
+  <link rel="stylesheet" href="../../packages/ui/assets/styling/variables.css">
+  <link rel="stylesheet" href="../../packages/ui/assets/styling/layout.css">
+  <link rel="stylesheet" href="../../packages/ui/assets/styling/components.css">
+  <link rel="stylesheet" href="../../packages/ui/assets/styling/dark.css">
+  <link rel="stylesheet" href="../../packages/ui/assets/styling/responsive.css">
+  <style>
+    @font-face {
+      font-family: "Inter";
+      src: url("../../packages/web/assets/fonts/inter-latin.woff2") format("woff2");
+      font-style: normal;
+      font-weight: 400 700;
+      font-display: swap;
+    }
+
+    /* 仅用于静态原型里的 SVG 图标和交互状态，不改变项目现有监控页面样式。 */
+    .prototype-icon {
+      display: block;
+      width: 20px;
+      height: 20px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .prototype-header-icon {
+      width: 18px;
+      height: 18px;
+    }
+
+    .prototype-table-row {
+      cursor: pointer;
+    }
+
+    .prototype-table-row:focus-visible {
+      outline: 2px solid var(--color-primary);
+      outline-offset: -2px;
+    }
+
+    .prototype-table-row.is-selected td {
+      background: color-mix(in srgb, var(--color-primary) 10%, transparent);
+    }
+
+    .prototype-custom-range {
+      display: contents;
+    }
+
+    .prototype-custom-range[hidden],
+    [hidden] {
+      display: none !important;
+    }
+
+    .prototype-probe-state {
+      align-self: center;
+      min-width: 64px;
+      font-size: 12px;
+    }
+
+    .prototype-probe-state:empty {
+      display: none;
+    }
+
+    .prototype-sidebar-close {
+      display: none;
+      width: 36px;
+      height: 36px;
+      margin-left: auto;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      color: var(--text-secondary);
+      background: transparent;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      cursor: pointer;
+    }
+
+    .monitoring-page,
+    .monitoring-health-grid > section,
+    .monitoring-detail.card {
+      min-width: 0;
+    }
+
+    .monitoring-detail.card {
+      padding: 20px;
+    }
+
+    .monitoring-detail h2,
+    .monitoring-detail h3 {
+      margin: 0 0 12px;
+    }
+
+    .monitoring-detail h3 {
+      margin-top: 22px;
+      font-size: 16px;
+    }
+
+    .monitoring-detail > p {
+      margin: 6px 0;
+      overflow-wrap: anywhere;
+    }
+
+    .monitoring-detail pre {
+      max-height: 320px;
+      margin: 10px 0 0;
+      padding: 16px;
+      overflow: auto;
+      color: #98f5c6;
+      background: #121827;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      font: 12px/1.65 var(--font-mono);
+    }
+
+    .monitoring-stage {
+      margin-top: 10px;
+      padding: 14px;
+      background: color-mix(in srgb, var(--bg-card) 86%, var(--bg-primary));
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+    }
+
+    .monitoring-stage p {
+      margin: 6px 0 0;
+      color: var(--text-secondary);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+
+    .monitoring-trends,
+    .monitoring-health-grid > section {
+      overflow: hidden;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+    }
+
+    .monitoring-trends > h2,
+    .monitoring-health-grid h2 {
+      margin: 0;
+      padding: 17px 20px;
+      font-size: 15px;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .monitoring-health-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .monitoring-health-grid section > a {
+      display: inline-block;
+      margin: 12px 16px 4px;
+      color: var(--color-primary-hover);
+      font-size: 12px;
+    }
+
+    .monitoring-node-row {
+      margin: 10px 14px;
+      padding: 13px 14px;
+      color: var(--text-secondary);
+      background: color-mix(in srgb, var(--bg-card) 84%, var(--bg-primary));
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1.65;
+      overflow-wrap: anywhere;
+    }
+
+    .monitoring-node-row strong {
+      color: var(--text-primary);
+      font-size: 13px;
+    }
+
+    .monitoring-toolbar select,
+    .monitoring-toolbar input {
+      max-width: 100%;
+      min-height: 36px;
+      padding: 7px 30px 7px 10px;
+      color: var(--text-primary);
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      outline: none;
+    }
+
+    .monitoring-toolbar input {
+      padding-right: 10px;
+      color-scheme: dark;
+    }
+
+    .monitoring-toolbar select:focus,
+    .monitoring-toolbar input:focus {
+      border-color: var(--color-primary);
+      box-shadow: 0 0 0 3px var(--color-accent-glow);
+    }
+
+    .monitoring-toolbar {
+      flex-wrap: wrap;
+      justify-content: flex-start;
+      align-items: center;
+    }
+
+    .monitoring-stat-grid {
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr));
+    }
+
+    .monitoring-trends + h2 {
+      font-size: 18px;
+    }
+
+    .table-container {
+      border: 1px solid var(--border-color);
+      overscroll-behavior-inline: contain;
+      scrollbar-gutter: stable;
+    }
+
+    .monitoring-trends .table-container {
+      border: 0;
+      border-radius: 0;
+    }
+
+    .monitoring-page > .text-secondary {
+      margin-top: -10px;
+      font-size: 12px;
+    }
+
+    .stat-meta {
+      margin-top: 8px;
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+
+    .mono {
+      font-family: var(--font-mono);
+    }
+
+    .footer {
+      min-height: 48px;
+    }
+
+    @media (min-width: 640px) and (max-width: 1023px) {
+      .sidebar-logo {
+        justify-content: center;
+        padding-inline: 0;
+      }
+
+      .sidebar-logo-copy,
+      .sidebar-section-title,
+      .sidebar-footer {
+        display: none;
+      }
+
+      .sidebar-item-label {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        padding: 0;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+      }
+
+      .sidebar-nav {
+        padding-inline: 10px;
+      }
+
+      .sidebar-section {
+        margin-bottom: 8px;
+      }
+
+      .sidebar-item {
+        justify-content: center;
+        gap: 0;
+        padding-inline: 0;
+      }
+
+      .monitoring-toolbar > select,
+      .monitoring-toolbar > input,
+      .monitoring-toolbar input,
+      .monitoring-toolbar > button {
+        flex: 1 1 180px;
+      }
+    }
+
+    @media (max-width: 1023px) {
+      .monitoring-health-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 639px) {
+      body.prototype-nav-open {
+        overflow: hidden;
+      }
+
+      .sidebar {
+        width: min(86vw, 300px);
+      }
+
+      .sidebar-logo {
+        padding-right: 10px;
+      }
+
+      .sidebar-footer {
+        display: none;
+      }
+
+      .prototype-sidebar-close {
+        display: flex;
+      }
+
+      .header {
+        gap: 8px;
+      }
+
+      .header-right {
+        gap: 6px;
+      }
+
+      .content-area {
+        padding: 16px 12px 28px;
+      }
+
+      .monitoring-page {
+        gap: 16px;
+      }
+
+      .page-title {
+        font-size: 1.75rem;
+      }
+
+      .monitoring-toolbar {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        width: 100%;
+        gap: 10px;
+        padding: 12px;
+      }
+
+      .monitoring-toolbar select,
+      .monitoring-toolbar input,
+      .monitoring-toolbar .btn,
+      .prototype-custom-range {
+        width: 100%;
+      }
+
+      .monitoring-toolbar select,
+      .monitoring-toolbar input,
+      .monitoring-toolbar .btn {
+        min-height: 44px;
+      }
+
+      .prototype-custom-range:not([hidden]) {
+        display: grid;
+        gap: 10px;
+      }
+
+      .monitoring-stat-grid {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+
+      .monitoring-page .stat-card {
+        min-height: 104px;
+        padding: 15px;
+      }
+
+      .stat-value {
+        padding-right: 30px;
+        font-size: 23px;
+        overflow-wrap: anywhere;
+      }
+
+      .monitoring-trends > h2,
+      .monitoring-health-grid h2 {
+        padding: 14px 16px;
+      }
+
+      .monitoring-trends .data-table {
+        min-width: 620px;
+      }
+
+      #requestTableContainer {
+        overflow: visible;
+        border: 0;
+        border-radius: 0;
+        scrollbar-gutter: auto;
+      }
+
+      #requestTableContainer .data-table,
+      #requestTableContainer tbody {
+        display: block;
+        min-width: 0;
+      }
+
+      #requestTableContainer thead {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        padding: 0;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      #requestTableContainer tbody {
+        display: grid;
+        gap: 10px;
+      }
+
+      #requestTableContainer .prototype-table-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 7px;
+        padding: 13px 14px;
+        background: var(--bg-card);
+        border: 1px solid var(--border-color);
+        border-radius: 10px;
+      }
+
+      #requestTableContainer .prototype-table-row.is-selected {
+        background: color-mix(in srgb, var(--color-primary) 7%, var(--bg-card));
+        border-color: color-mix(in srgb, var(--color-primary) 54%, var(--border-color));
+      }
+
+      #requestTableContainer .prototype-table-row.is-selected td {
+        background: transparent;
+      }
+
+      #requestTableContainer .prototype-table-row td {
+        display: grid;
+        grid-template-columns: 92px minmax(0, 1fr);
+        gap: 8px;
+        min-width: 0;
+        padding: 0;
+        color: var(--text-primary);
+        font-size: 12px;
+        line-height: 1.55;
+        border: 0;
+        overflow-wrap: anywhere;
+      }
+
+      #requestTableContainer .prototype-table-row td::before {
+        color: var(--text-tertiary);
+        font-family: var(--font-family);
+        font-weight: 600;
+      }
+
+      #requestTableContainer .prototype-table-row td:nth-child(1)::before { content: "时间"; }
+      #requestTableContainer .prototype-table-row td:nth-child(2)::before { content: "Request ID"; }
+      #requestTableContainer .prototype-table-row td:nth-child(3)::before { content: "协议 / 模型"; }
+      #requestTableContainer .prototype-table-row td:nth-child(4)::before { content: "执行路径"; }
+      #requestTableContainer .prototype-table-row td:nth-child(5)::before { content: "状态"; }
+      #requestTableContainer .prototype-table-row td:nth-child(6)::before { content: "总耗时 / TTFT"; }
+      #requestTableContainer .prototype-table-row td:nth-child(7)::before { content: "Tokens"; }
+      #requestTableContainer .prototype-table-row td:nth-child(8)::before { content: "金额"; }
+
+      #nextPageButton {
+        width: 100%;
+        min-height: 44px;
+      }
+
+      .monitoring-node-row {
+        margin: 9px 10px;
+        padding: 12px;
+      }
+
+      .monitoring-node-row span {
+        display: block;
+        margin-top: 3px;
+      }
+
+      .monitoring-detail.card {
+        padding: 14px;
+      }
+
+      .monitoring-detail pre {
+        padding: 12px;
+        font-size: 11px;
+      }
+
+      .monitoring-stage {
+        padding: 12px;
+      }
+
+      .footer {
+        height: auto;
+        padding: 14px 16px;
+        text-align: center;
+      }
+    }
+
+    @media (max-width: 380px) {
+      .header-lang-btn {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+    <nav class="sidebar" id="sidebar" aria-label="主导航">
+      <div class="sidebar-logo">
+        <div class="sidebar-logo-icon">K</div>
+        <div class="sidebar-logo-copy">
+          <span class="sidebar-logo-text">KeyCompute</span>
+          <span class="sidebar-logo-kicker">AI token platform</span>
+        </div>
+        <button class="prototype-sidebar-close hide-desktop hide-tablet" id="mobileSidebarClose" type="button" aria-label="关闭主导航">
+          <svg class="prototype-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+
+      <div class="sidebar-nav" id="sidebarNav">
+        <div class="sidebar-section">
+          <button class="sidebar-item">
+            <span class="sidebar-item-icon">
+              <svg class="prototype-icon" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+            </span>
+            <span class="sidebar-item-label">仪表盘</span>
+          </button>
+          <button class="sidebar-item">
+            <span class="sidebar-item-icon">
+              <svg class="prototype-icon" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>
+            </span>
+            <span class="sidebar-item-label">API Keys</span>
+          </button>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">用量</div>
+          <button class="sidebar-item">
+            <span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><line x1="12" x2="12" y1="20" y2="10"/><line x1="18" x2="18" y1="20" y2="4"/><line x1="6" x2="6" y1="20" y2="16"/></svg></span>
+            <span class="sidebar-item-label">用量统计</span>
+          </button>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">账务</div>
+          <button class="sidebar-item">
+            <span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg></span>
+            <span class="sidebar-item-label">支付中心</span>
+          </button>
+          <button class="sidebar-item">
+            <span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg></span>
+            <span class="sidebar-item-label">分销中心</span>
+          </button>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">账户</div>
+          <button class="sidebar-item">
+            <span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>
+            <span class="sidebar-item-label">个人资料</span>
+          </button>
+          <button class="sidebar-item">
+            <span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21H9.6v-.09A1.7 1.7 0 0 0 8.5 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.1 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H2V9.6h.09A1.7 1.7 0 0 0 4.1 8.5a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 8.5 4.1a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V2h4v.09A1.7 1.7 0 0 0 15 4.1a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 8.5a1.7 1.7 0 0 0 .6 1 1.7 1.7 0 0 0 1.1.4h.09v4h-.09A1.7 1.7 0 0 0 19.4 15Z"/></svg></span>
+            <span class="sidebar-item-label">账户设置</span>
+          </button>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">节点</div>
+          <button class="sidebar-item">
+            <span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg></span>
+            <span class="sidebar-item-label">注册令牌</span>
+          </button>
+          <button class="sidebar-item">
+            <span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg></span>
+            <span class="sidebar-item-label">收益管理</span>
+          </button>
+        </div>
+
+        <div class="sidebar-section" id="adminSection">
+          <div class="sidebar-section-title">管理</div>
+          <button class="sidebar-item"><span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span><span class="sidebar-item-label">用户管理 <span class="sidebar-admin-badge">A</span></span></button>
+          <button class="sidebar-item"><span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg></span><span class="sidebar-item-label">账号管理 <span class="sidebar-admin-badge">A</span></span></button>
+          <button class="sidebar-item"><span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/></svg></span><span class="sidebar-item-label">定价管理 <span class="sidebar-admin-badge">A</span></span></button>
+          <button class="sidebar-item"><span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/></svg></span><span class="sidebar-item-label">支付订单 <span class="sidebar-admin-badge">A</span></span></button>
+          <button class="sidebar-item"><span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/></svg></span><span class="sidebar-item-label">分销记录 <span class="sidebar-admin-badge">A</span></span></button>
+          <button class="sidebar-item"><span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></span><span class="sidebar-item-label">租户管理 <span class="sidebar-admin-badge">A</span></span></button>
+          <button class="sidebar-item"><span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></span><span class="sidebar-item-label">系统诊断 <span class="sidebar-admin-badge">A</span></span></button>
+          <button class="sidebar-item"><span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/></svg></span><span class="sidebar-item-label">节点网关 <span class="sidebar-admin-badge">A</span></span></button>
+          <button class="sidebar-item active" aria-current="page"><span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span><span class="sidebar-item-label">监控追踪 <span class="sidebar-admin-badge">A</span></span></button>
+          <button class="sidebar-item"><span class="sidebar-item-icon"><svg class="prototype-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></span><span class="sidebar-item-label">系统设置 <span class="sidebar-admin-badge">A</span></span></button>
+        </div>
+      </div>
+
+      <div class="sidebar-footer">
+        <button class="sidebar-item" id="collapseButton" title="折叠侧边栏">
+          <span class="sidebar-item-icon"><svg class="prototype-icon" id="collapseIcon" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></span>
+          <span class="sidebar-item-label" id="collapseLabel">折叠</span>
+        </button>
+      </div>
+    </nav>
+
+    <div class="main-area" id="mainArea">
+      <header class="header">
+        <div class="header-left">
+          <button class="header-toggle-btn hide-desktop hide-tablet" id="mobileMenuButton" type="button" title="打开主导航" aria-label="打开主导航" aria-controls="sidebar" aria-expanded="false">
+            <svg class="prototype-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+          </button>
+          <button class="header-toggle-btn hide-mobile" title="返回首页" aria-label="返回首页">
+            <svg class="prototype-icon" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+          </button>
+        </div>
+        <div class="header-right">
+          <a class="header-github-link hide-mobile" href="https://github.com/keycompute" target="_blank" rel="noopener noreferrer" title="GitHub" aria-label="GitHub">
+            <svg class="prototype-header-icon" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.4 3-.405 1.02.005 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
+          </a>
+          <button class="header-icon-btn header-theme-btn" id="themeButton" title="切换到亮色主题" aria-label="切换主题">
+            <svg class="prototype-header-icon" id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          </button>
+          <button class="header-icon-btn header-lang-btn" title="切换到英文"><span class="header-lang-btn-text">EN</span></button>
+          <div class="header-avatar" title="Admin">A</div>
+          <div class="header-user-dropdown" style="position:relative">
+            <button class="header-icon-btn hide-mobile" id="userMenuButton" style="gap:4px;width:auto;padding:0 8px">
+              <span style="font-size:13px;font-weight:500;color:var(--text-primary)">Admin</span>
+              <svg class="prototype-header-icon" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+            <div class="dropdown-menu" id="userMenu" hidden style="position:absolute;top:100%;right:0;margin-top:4px;min-width:160px;background:var(--bg-card);border:1px solid var(--border-color);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.25);z-index:1000;overflow:hidden">
+              <button class="dropdown-item" style="display:flex;align-items:center;gap:10px;width:100%;padding:10px 14px;border:0;background:none;color:var(--text-primary)">个人资料</button>
+              <button class="dropdown-item" style="display:flex;align-items:center;gap:10px;width:100%;padding:10px 14px;border:0;background:none;color:var(--text-primary)">账户设置</button>
+              <div style="height:1px;background:var(--border-color);margin:4px 0"></div>
+              <button class="dropdown-item" style="display:flex;align-items:center;gap:10px;width:100%;padding:10px 14px;border:0;background:none;color:var(--color-error)">退出登录</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="content-area">
+        <div class="content-inner">
+          <div class="page-container monitoring-page">
+            <div class="page-header">
+              <div>
+                <h1 class="page-title">监控追踪</h1>
+                <p class="page-description">统一 Provider Account 与 Node 请求生命周期</p>
+              </div>
+            </div>
+
+            <div class="monitoring-toolbar">
+              <select id="rangeFilter" aria-label="时间范围">
+                <option value="1h">最近 1 小时</option>
+                <option value="6h">最近 6 小时</option>
+                <option value="24h">最近 24 小时</option>
+                <option value="custom">自定义 UTC</option>
+              </select>
+              <span class="prototype-custom-range" id="customRange" hidden>
+                <input type="datetime-local" id="customFrom" title="UTC 起始时间" value="2026-08-22T00:00">
+                <input type="datetime-local" id="customTo" title="UTC 结束时间（最长 24 小时）" value="2026-08-22T01:00">
+              </span>
+              <select id="statusFilter" aria-label="状态筛选">
+                <option value="">全部状态</option>
+                <option value="succeeded">成功</option>
+                <option value="failed">失败</option>
+                <option value="timed_out">超时</option>
+                <option value="running">运行中</option>
+                <option value="queued">排队</option>
+              </select>
+              <select id="routeFilter" aria-label="执行路径筛选">
+                <option value="">全部路径</option>
+                <option value="provider_account">Provider Account</option>
+                <option value="node">Node</option>
+              </select>
+              <button class="btn btn-secondary" id="pauseButton">暂停自动刷新</button>
+              <button class="btn btn-primary" id="refreshButton">立即刷新</button>
+              <button class="btn btn-secondary" id="probeButton">探测全部账号</button>
+              <span class="text-secondary prototype-probe-state" id="probeMessage"></span>
+            </div>
+
+            <p class="text-secondary">最后更新：<span id="updatedAt">2026-08-22T01:18:42.106Z</span></p>
+
+            <div class="monitoring-stat-grid">
+              <div class="stat-card"><p class="stat-label">请求量</p><p class="stat-value" id="requestCount">1,284</p><p class="stat-meta">活跃 6 / 排队 2</p></div>
+              <div class="stat-card"><p class="stat-label">成功率</p><p class="stat-value">98.7%</p><p class="stat-meta">错误率 1.3%</p></div>
+              <div class="stat-card"><p class="stat-label">Attempt 成功率</p><p class="stat-value">97.9%</p><p class="stat-meta">1314 次 attempts</p></div>
+              <div class="stat-card"><p class="stat-label">Fallback 率</p><p class="stat-value">2.3%</p><p class="stat-meta">30 次请求</p></div>
+              <div class="stat-card"><p class="stat-label">总耗时 P50 / P95</p><p class="stat-value">842 ms / 1936 ms</p><p class="stat-meta">P99 3482 ms</p></div>
+              <div class="stat-card"><p class="stat-label">Provider TTFT</p><p class="stat-value">386 ms / 921 ms</p><p class="stat-meta">P50 / P95</p></div>
+              <div class="stat-card"><p class="stat-label">Node 排队 / 执行</p><p class="stat-value">74 ms / 1230 ms</p><p class="stat-meta">P50（Node 不展示 TTFT）</p></div>
+              <div class="stat-card"><p class="stat-label">Tokens / 金额</p><p class="stat-value">3,827,490</p><p class="stat-meta">¥286.04</p></div>
+            </div>
+
+            <section class="monitoring-trends">
+              <h2>趋势</h2>
+              <div class="table-container">
+                <table class="data-table">
+                  <thead><tr><th>UTC 时间</th><th>请求</th><th>成功</th><th>Tokens</th><th>金额</th></tr></thead>
+                  <tbody>
+                    <tr><td>2026-08-22T00:20:00Z</td><td>92</td><td>91</td><td>278440</td><td>20.71</td></tr>
+                    <tr><td>2026-08-22T00:25:00Z</td><td>108</td><td>106</td><td>314082</td><td>23.55</td></tr>
+                    <tr><td>2026-08-22T00:30:00Z</td><td>114</td><td>113</td><td>349710</td><td>26.12</td></tr>
+                    <tr><td>2026-08-22T00:35:00Z</td><td>101</td><td>99</td><td>296331</td><td>21.84</td></tr>
+                    <tr><td>2026-08-22T00:40:00Z</td><td>121</td><td>120</td><td>372814</td><td>27.90</td></tr>
+                    <tr><td>2026-08-22T00:45:00Z</td><td>117</td><td>116</td><td>351002</td><td>26.20</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <h2>请求</h2>
+            <div class="table-container" id="requestTableContainer">
+              <table class="data-table" aria-label="监控请求列表">
+                <thead><tr><th>时间</th><th>Request ID</th><th>协议 / 模型</th><th>执行路径</th><th>状态</th><th>总耗时 / TTFT</th><th>Tokens</th><th>金额</th></tr></thead>
+                <tbody id="requestRows">
+                  <tr class="prototype-table-row" tabindex="0" data-id="019c7324-3a60-72fd-b96e-f9be978e4210" data-status="succeeded" data-route="provider_account"><td>2026-08-22T01:18:31.412Z</td><td class="mono">019c7324</td><td>openai / gpt-5.2</td><td>provider_account</td><td><span class="badge badge-success">succeeded</span></td><td>1.2s / 418ms</td><td>4382</td><td>0.3287</td></tr>
+                  <tr class="prototype-table-row" tabindex="0" data-id="019c7323-c87d-7f76-8e4a-f2fecc4f81a9" data-status="succeeded" data-route="node"><td>2026-08-22T01:18:02.904Z</td><td class="mono">019c7323</td><td>openai / deepseek-v3</td><td>node</td><td><span class="badge badge-success">succeeded</span></td><td>2.4s</td><td>7210</td><td>0.1124</td></tr>
+                  <tr class="prototype-table-row" tabindex="0" data-id="019c7322-a225-7d8c-a03c-c25edcc50a64" data-status="failed" data-route="provider_account"><td>2026-08-22T01:17:18.627Z</td><td class="mono">019c7322</td><td>anthropic / claude-sonnet-4-5</td><td>provider_account</td><td><span class="badge badge-error">failed</span><span class="text-secondary"> · 信息不完整</span></td><td>804ms / —</td><td>未采集</td><td>未采集</td></tr>
+                  <tr class="prototype-table-row" tabindex="0" data-id="019c7321-8539-7e55-bb22-08aa3f96d260" data-status="running" data-route="provider_account"><td>2026-08-22T01:16:31.113Z</td><td class="mono">019c7321</td><td>openai / gpt-5-mini</td><td>provider_account</td><td><span class="badge badge-warning">running</span></td><td>— / 376ms</td><td>未采集</td><td>未采集</td></tr>
+                  <tr class="prototype-table-row" tabindex="0" data-id="019c7320-26ed-7f51-8ddf-f97bb7d6c57a" data-status="queued" data-route="node"><td>2026-08-22T01:15:02.868Z</td><td class="mono">019c7320</td><td>openai / qwen3-235b</td><td>node</td><td><span class="badge badge-warning">queued</span></td><td>—</td><td>未采集</td><td>未采集</td></tr>
+                  <tr class="prototype-table-row" tabindex="0" data-id="019c731f-9e0d-704c-8465-ae7d5a793e32" data-status="timed_out" data-route="provider_account"><td>2026-08-22T01:14:28.061Z</td><td class="mono">019c731f</td><td>anthropic / claude-opus-4-1</td><td>provider_account</td><td><span class="badge badge-error">timed_out</span></td><td>30.0s / 1065ms</td><td>1831</td><td>0.4416</td></tr>
+                  <tr class="prototype-table-row" tabindex="0" data-id="019c731e-8acd-7d42-b4c4-3e0768ccfb7e" data-status="succeeded" data-route="provider_account"><td>2026-08-22T01:13:17.005Z</td><td class="mono">019c731e</td><td>openai / gemini-2.5-pro</td><td>provider_account</td><td><span class="badge badge-success">succeeded</span><span class="text-secondary"> · 历史推断</span></td><td>1.8s / 521ms</td><td>5692</td><td>0.2761</td></tr>
+                  <tr class="prototype-table-row" tabindex="0" data-id="019c731d-42e5-7f59-a2a2-f1923698ec63" data-status="succeeded" data-route="node"><td>2026-08-22T01:11:52.741Z</td><td class="mono">019c731d</td><td>anthropic / llama-4-maverick</td><td>node</td><td><span class="badge badge-success">succeeded</span></td><td>3.1s</td><td>8814</td><td>0.0948</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="empty-state" id="requestEmpty" hidden>筛选条件无匹配结果</div>
+            <button class="btn btn-secondary" id="nextPageButton" style="align-self:flex-start">下一页</button>
+
+            <div class="monitoring-health-grid">
+              <section>
+                <h2>Provider Account 健康</h2>
+                <a href="#">账号管理 / 单账号探测</a>
+                <div class="monitoring-node-row"><strong>OpenAI · Production</strong><span> 已启用</span><span> · 真实成功率 99.4% · 延迟 821 ms</span><span> · 探测：succeeded（2026-08-22T01:17:05Z，312 ms，错误 无）· 可归责失败 2</span></div>
+                <div class="monitoring-node-row"><strong>Anthropic · Main</strong><span> 已启用</span><span> · 真实成功率 97.8% · 延迟 1184 ms</span><span> · 探测：succeeded（2026-08-22T01:16:58Z，438 ms，错误 无）· 可归责失败 6</span></div>
+                <div class="monitoring-node-row"><strong>OpenRouter · Backup</strong><span> 已启用</span><span> · 真实成功率 94.2% · 延迟 1638 ms</span><span> · 探测：failed（2026-08-22T01:16:43Z，3001 ms，错误 upstream_timeout）· 可归责失败 14</span></div>
+              </section>
+              <section>
+                <h2>Node 健康</h2>
+                <a href="#">打开 Node Gateway 管理</a>
+                <div class="monitoring-node-row"><strong>shanghai-gpu-01</strong><span> online</span><span> · queued 1 / running 3 / succeeded 248 / failed 2 / expired 0</span><span> · 心跳 2026-08-22T01:18:40Z · 会话到期 2026-08-22T01:23:40Z · 模型 ["deepseek-v3","qwen3-235b"]</span></div>
+                <div class="monitoring-node-row"><strong>beijing-gpu-02</strong><span> online</span><span> · queued 1 / running 2 / succeeded 187 / failed 1 / expired 0</span><span> · 心跳 2026-08-22T01:18:38Z · 会话到期 2026-08-22T01:23:38Z · 模型 ["llama-4-maverick"]</span></div>
+                <div class="monitoring-node-row"><strong>singapore-edge-01</strong><span> degraded</span><span> · queued 0 / running 1 / succeeded 96 / failed 4 / expired 1</span><span> · 心跳 2026-08-22T01:18:12Z · 会话到期 2026-08-22T01:22:51Z · 模型 ["deepseek-v3"]</span></div>
+              </section>
+            </div>
+
+            <div class="monitoring-detail card" id="requestDetail" hidden>
+              <h2>请求详情</h2>
+              <p class="mono" id="detailRequestId">019c7324-3a60-72fd-b96e-f9be978e4210</p>
+              <p>租户：4aa8e42c-2a20-45fd-9af4-9efc8b95bd18 · 用户：99b22061-bd6f-4484-b079-35ea2a376fab · Key：c4b875c7-035d-495c-a14a-1a823a90244f</p>
+              <p>状态：<span id="detailStatus">succeeded</span> · 计费：succeeded · 数据质量：实际采集</p>
+              <p>客户端首内容：2026-08-22T01:18:31.830Z</p>
+              <h3>Attempts</h3>
+              <div class="monitoring-stage">
+                <strong>#1 primary · failed</strong>
+                <p>目标：OpenRouter · Backup</p>
+                <p>开始：2026-08-22T01:18:31.421Z · 结束：2026-08-22T01:18:31.706Z · 流结束：upstream_error</p>
+                <p>HTTP：503 · Upstream Request ID：req_or_7f6a40aabdc8</p>
+                <p>响应头：2026-08-22T01:18:31.691Z · 首有效内容：未采集 · TTFT：未采集</p>
+                <p class="text-secondary">错误：provider_temporarily_unavailable</p>
+              </div>
+              <div class="monitoring-stage">
+                <strong>#2 fallback · succeeded</strong>
+                <p>目标：OpenAI · Production</p>
+                <p>开始：2026-08-22T01:18:31.708Z · 结束：2026-08-22T01:18:32.615Z · 流结束：completed</p>
+                <p>HTTP：200 · Upstream Request ID：chatcmpl-C67e9f1aef93</p>
+                <p>响应头：2026-08-22T01:18:31.804Z · 首有效内容：2026-08-22T01:18:31.830Z · TTFT：122 ms</p>
+              </div>
+              <h3>计费摘要</h3>
+              <pre>{
+  "request_id": "019c7324-3a60-72fd-b96e-f9be978e4210",
+  "model": "gpt-5.2",
+  "prompt_tokens": 3188,
+  "completion_tokens": 1194,
+  "total_tokens": 4382,
+  "amount": "0.3287",
+  "currency": "CNY",
+  "billing_status": "succeeded"
+}</pre>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <footer class="footer">
+        <span class="footer-text">© 2026 <a class="footer-link" href="https://github.com/aiqubits/keycompute" target="_blank" rel="noopener noreferrer">KeyCompute</a>. All Rights Reserved.</span>
+      </footer>
+    </div>
+  </div>
+
+  <script>
+    const html = document.documentElement;
+    const sidebar = document.getElementById('sidebar');
+    const sidebarOverlay = document.getElementById('sidebarOverlay');
+    const sidebarNav = document.getElementById('sidebarNav');
+    const mainArea = document.getElementById('mainArea');
+    const mobileMenuButton = document.getElementById('mobileMenuButton');
+    const mobileSidebarClose = document.getElementById('mobileSidebarClose');
+    const mobileViewport = window.matchMedia('(max-width: 639px)');
+    const collapseButton = document.getElementById('collapseButton');
+    const collapseIcon = document.getElementById('collapseIcon');
+    const collapseLabel = document.getElementById('collapseLabel');
+    const themeButton = document.getElementById('themeButton');
+    const themeIcon = document.getElementById('themeIcon');
+    const rangeFilter = document.getElementById('rangeFilter');
+    const customRange = document.getElementById('customRange');
+    const pauseButton = document.getElementById('pauseButton');
+    const refreshButton = document.getElementById('refreshButton');
+    const probeButton = document.getElementById('probeButton');
+    const probeMessage = document.getElementById('probeMessage');
+    const statusFilter = document.getElementById('statusFilter');
+    const routeFilter = document.getElementById('routeFilter');
+    const requestTableContainer = document.getElementById('requestTableContainer');
+    const requestEmpty = document.getElementById('requestEmpty');
+    const requestDetail = document.getElementById('requestDetail');
+    const rows = [...document.querySelectorAll('.prototype-table-row')];
+    let paused = false;
+
+    function setMobileNavigation(open, restoreFocus = false) {
+      const shouldOpen = open && mobileViewport.matches;
+      sidebar.classList.toggle('mobile-open', shouldOpen);
+      sidebarOverlay.classList.toggle('visible', shouldOpen);
+      document.body.classList.toggle('prototype-nav-open', shouldOpen);
+      mobileMenuButton.setAttribute('aria-expanded', String(shouldOpen));
+      mobileMenuButton.title = shouldOpen ? '关闭主导航' : '打开主导航';
+      mobileMenuButton.setAttribute('aria-label', mobileMenuButton.title);
+
+      if (shouldOpen) {
+        requestAnimationFrame(() => mobileSidebarClose.focus());
+      } else if (restoreFocus && mobileViewport.matches) {
+        mobileMenuButton.focus();
+      }
+    }
+
+    mobileMenuButton.addEventListener('click', () => {
+      setMobileNavigation(!sidebar.classList.contains('mobile-open'));
+    });
+    mobileSidebarClose.addEventListener('click', () => setMobileNavigation(false, true));
+    sidebarOverlay.addEventListener('click', () => setMobileNavigation(false, true));
+    sidebarNav.addEventListener('click', event => {
+      if (event.target.closest('.sidebar-item')) setMobileNavigation(false);
+    });
+    mobileViewport.addEventListener('change', () => setMobileNavigation(false));
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && sidebar.classList.contains('mobile-open')) {
+        setMobileNavigation(false, true);
+      }
+    });
+
+    collapseButton.addEventListener('click', () => {
+      const collapsed = sidebar.classList.toggle('collapsed');
+      mainArea.classList.toggle('sidebar-collapsed', collapsed);
+      collapseLabel.textContent = collapsed ? '展开' : '折叠';
+      collapseButton.title = collapsed ? '展开侧边栏' : '折叠侧边栏';
+      collapseIcon.innerHTML = collapsed ? '<path d="m9 18 6-6-6-6"/>' : '<path d="m15 18-6-6 6-6"/>';
+    });
+
+    themeButton.addEventListener('click', () => {
+      const dark = html.dataset.theme === 'dark';
+      html.dataset.theme = dark ? 'light' : 'dark';
+      themeButton.title = dark ? '切换到暗色主题' : '切换到亮色主题';
+      themeIcon.innerHTML = dark
+        ? '<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>'
+        : '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+    });
+
+    document.getElementById('userMenuButton').addEventListener('click', () => {
+      document.getElementById('userMenu').toggleAttribute('hidden');
+    });
+
+    rangeFilter.addEventListener('change', () => {
+      customRange.hidden = rangeFilter.value !== 'custom';
+      updateTimestamp();
+    });
+
+    pauseButton.addEventListener('click', () => {
+      paused = !paused;
+      pauseButton.textContent = paused ? '继续自动刷新' : '暂停自动刷新';
+    });
+
+    function updateTimestamp() {
+      document.getElementById('updatedAt').textContent = new Date().toISOString();
+    }
+
+    refreshButton.addEventListener('click', () => {
+      refreshButton.textContent = '刷新中…';
+      refreshButton.disabled = true;
+      setTimeout(() => {
+        updateTimestamp();
+        refreshButton.textContent = '立即刷新';
+        refreshButton.disabled = false;
+      }, 520);
+    });
+
+    probeButton.addEventListener('click', () => {
+      probeMessage.textContent = '探测中…';
+      probeButton.disabled = true;
+      setTimeout(() => {
+        probeMessage.textContent = '探测完成';
+        probeButton.disabled = false;
+        updateTimestamp();
+      }, 900);
+    });
+
+    function applyFilters() {
+      const status = statusFilter.value;
+      const route = routeFilter.value;
+      let visible = 0;
+      rows.forEach(row => {
+        const matchesStatus = !status || row.dataset.status === status;
+        const matchesRoute = !route || row.dataset.route === route;
+        row.hidden = !(matchesStatus && matchesRoute);
+        if (!row.hidden) visible += 1;
+      });
+      requestTableContainer.hidden = visible === 0;
+      requestEmpty.hidden = visible !== 0;
+      updateTimestamp();
+    }
+
+    statusFilter.addEventListener('change', applyFilters);
+    routeFilter.addEventListener('change', applyFilters);
+
+    function selectRow(row) {
+      rows.forEach(item => item.classList.remove('is-selected'));
+      row.classList.add('is-selected');
+      document.getElementById('detailRequestId').textContent = row.dataset.id;
+      document.getElementById('detailStatus').textContent = row.dataset.status;
+      requestDetail.hidden = false;
+    }
+
+    rows.forEach(row => {
+      row.addEventListener('click', () => selectRow(row));
+      row.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          selectRow(row);
+        }
+      });
+    });
+
+    document.getElementById('nextPageButton').addEventListener('click', event => {
+      event.currentTarget.textContent = '已加载下一页';
+      event.currentTarget.disabled = true;
+      updateTimestamp();
+    });
+
+    if (!paused) {
+      setInterval(() => {
+        if (!paused) updateTimestamp();
+      }, 15000);
+    }
+
+    requestAnimationFrame(() => {
+      const active = document.querySelector('.sidebar-item.active');
+      if (active) active.scrollIntoView({block: 'center'});
+    });
+  </script>
+</body>
+</html>

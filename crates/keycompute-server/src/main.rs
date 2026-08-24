@@ -8,17 +8,21 @@
 //! 5. 初始化默认系统管理员（如果配置）
 //! 6. 启动 HTTP 服务器
 
+use futures::{StreamExt, stream};
 use keycompute_auth::PasswordHasher;
-use keycompute_config::AppConfig;
+use keycompute_config::{AppConfig, DEFAULT_ADMIN_EMAIL, DEFAULT_ADMIN_PASSWORD};
 use keycompute_db::{
     CreateDistributionRuleRequest, CreateTenantRequest, CreateUserCredentialRequest,
-    CreateUserRequest, Database, DatabaseConfig as DbConfig, SystemSetting, Tenant,
-    TenantDistributionRule, User, models::system_setting::setting_keys,
+    CreateUserRequest, Database, DatabaseConfig as DbConfig, DbRouter, SystemSetting, Tenant,
+    TenantDistributionRule, User,
 };
 use keycompute_observability::{init_dev_observability, init_observability};
 use keycompute_server::{AppState, AppStateConfig, init_global_crypto, run};
 use keycompute_types::UserRole;
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
+use sea_orm::{
+    ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait,
+    sqlx::{Connection as SqlxConnection, PgConnection},
+};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -38,15 +42,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let env = std::env::var("KC__ENV").unwrap_or_else(|_| "production".to_string());
+    let is_production = env != "development" && env != "dev";
+
     // 验证配置
-    if let Err(e) = config.validate() {
+    let config_validation = if is_production {
+        config.validate_for_production()
+    } else {
+        config.validate()
+    };
+    if let Err(e) = config_validation {
         eprintln!("配置验证失败: {}", e);
         std::process::exit(1);
     }
-
     // ==================== 阶段 2: 初始化可观测性 ====================
     // 根据环境选择日志格式
-    let env = std::env::var("KC__ENV").unwrap_or_else(|_| "production".to_string());
     if env == "development" || env == "dev" {
         init_dev_observability();
         info!("开发环境可观测性已初始化");
@@ -56,7 +66,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ==================== 阶段 3: 初始化全局加密 ====================
-    let is_production = env != "development" && env != "dev";
     if let Err(e) = init_global_crypto(&config, is_production) {
         error!("全局加密初始化失败: {}", e);
         std::process::exit(1);
@@ -121,10 +130,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ==================== 阶段 5: 初始化默认系统管理员 ====================
-    let _system_tenant = match initialize_default_admin(pool.as_ref()).await {
+    let _system_tenant = match initialize_default_admin(pool.as_ref(), is_production).await {
         Ok(tenant) => {
             info!(tenant_id = %tenant.id, "系统租户初始化成功");
             Some(tenant)
+        }
+        Err(e)
+            if e.downcast_ref::<InvalidDefaultAdminBootstrapPassword>()
+                .is_some() =>
+        {
+            error!("默认管理员初始化失败: {}", e);
+            std::process::exit(1);
         }
         Err(e) => {
             warn!("默认管理员初始化失败: {}", e);
@@ -146,10 +162,6 @@ async fn main() -> anyhow::Result<()> {
     {
         Ok(_) => info!("系统默认定价初始化完成"),
         Err(e) => warn!("系统默认定价初始化失败（非致命错误）: {}", e),
-    }
-
-    if let Err(e) = validate_distribution_public_base_url(pool.as_ref(), &config).await {
-        warn!("运行时配置校验警告: {}", e);
     }
 
     // ==================== 阶段 6: 初始化应用状态 ====================
@@ -176,6 +188,27 @@ async fn main() -> anyhow::Result<()> {
     // 不绑定支付是否启用：即使后续禁用支付，历史安全事件也应按期清理。
     if let Some(pool) = app_state.pool.clone() {
         spawn_payment_security_event_retention(pool);
+    }
+    if let Some(pool) = app_state.pool.clone() {
+        spawn_stale_trace_reconciler(pool, config.gateway.timeout_secs as i64);
+    }
+    if let Some(node_gateway) = app_state.node_gateway.as_ref() {
+        spawn_node_gateway_sweeper(
+            node_gateway.sweeper(),
+            node_gateway.config.sweeper_repush_interval_secs,
+        );
+    }
+    if config.gateway.account_probe_interval_secs > 0 {
+        spawn_account_probe_alerts(
+            app_state.clone(),
+            config.database.url.clone(),
+            config.gateway.account_probe_interval_secs,
+            config.gateway.account_probe_concurrency,
+        );
+    } else {
+        info!(
+            "Provider Account 自动真实推理探测已禁用；可在监控页手动探测或配置 gateway.account_probe_interval_secs 启用"
+        );
     }
 
     // ==================== 阶段 7: 启动服务器 ====================
@@ -237,6 +270,146 @@ fn spawn_payment_security_event_retention(pool: std::sync::Arc<keycompute_db::Db
     });
 }
 
+const STALE_TRACE_FINALIZATION_GRACE_SECS: i64 = 60;
+
+fn stale_trace_threshold_secs(gateway_timeout_secs: i64) -> i64 {
+    // Gateway success finalization deliberately runs outside the execution
+    // timeout. Leave one full reconciliation interval of grace so that a
+    // request finishing at the timeout boundary cannot be overwritten as
+    // stale while its terminal trace write is acquiring the row lock.
+    gateway_timeout_secs
+        .max(60)
+        .saturating_add(STALE_TRACE_FINALIZATION_GRACE_SECS)
+}
+
+fn spawn_stale_trace_reconciler(
+    pool: std::sync::Arc<keycompute_db::DbRouter>,
+    gateway_timeout_secs: i64,
+) {
+    let stale_after_secs = stale_trace_threshold_secs(gateway_timeout_secs);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match keycompute_db::reconcile_stale_requests(pool.as_ref(), stale_after_secs, 200)
+                .await
+            {
+                Ok(count) if count > 0 => {
+                    keycompute_observability::metrics::STALE_REQUEST_RECONCILED_TOTAL.inc_by(count);
+                    info!(count, "已修复 stale request traces")
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error,"stale request trace 修复失败，将在下一周期重试"),
+            }
+        }
+    });
+}
+
+fn spawn_node_gateway_sweeper(sweeper: node_gateway::NodeGatewaySweeper, interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(error) = sweeper.run_once().await {
+                warn!(%error, "Node Gateway sweeper 执行失败，将在下一周期重试");
+            }
+        }
+    });
+}
+
+// Stable, application-owned PostgreSQL advisory lock key for the automatic
+// Provider Account probe. Keep it distinct from every other background job.
+const ACCOUNT_PROBE_ADVISORY_LOCK_ID: i64 = 4_708_607_967_117_743_156;
+
+async fn try_acquire_background_job_lock(
+    database_url: &str,
+    lock_id: i64,
+) -> anyhow::Result<Option<PgConnection>> {
+    // Use a dedicated session instead of borrowing a pooled business
+    // connection or keeping a transaction open across external HTTP calls.
+    // PostgreSQL releases the session advisory lock automatically on drop.
+    let mut connection = PgConnection::connect(database_url).await?;
+    let acquired = sea_orm::sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+        .bind(lock_id)
+        .fetch_one(&mut connection)
+        .await?;
+    if acquired {
+        Ok(Some(connection))
+    } else {
+        Ok(None)
+    }
+}
+
+fn spawn_account_probe_alerts(
+    state: AppState,
+    database_url: String,
+    interval_secs: u64,
+    concurrency: usize,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            let Some(pool) = state.pool.as_deref() else {
+                return;
+            };
+            let leader_connection = match try_acquire_background_job_lock(
+                &database_url,
+                ACCOUNT_PROBE_ADVISORY_LOCK_ID,
+            )
+            .await
+            {
+                Ok(Some(connection)) => connection,
+                Ok(None) => {
+                    tracing::debug!("跳过非 leader 副本的 Provider Account 自动探测");
+                    continue;
+                }
+                Err(error) => {
+                    warn!(%error, "Provider Account 自动探测无法获取 leader 锁");
+                    continue;
+                }
+            };
+            let accounts = match keycompute_db::Account::find_enabled_all(pool.write_conn()).await {
+                Ok(accounts) => accounts,
+                Err(error) => {
+                    warn!(%error,"定时账号探测无法读取账号");
+                    drop(leader_connection);
+                    continue;
+                }
+            };
+            stream::iter(accounts.into_iter().map(|account| {
+                let state = state.clone();
+                async move {
+                    let id = account.id;
+                    let outcome =
+                        keycompute_server::handlers::probe_enabled_account_for_monitoring(
+                            &state, id,
+                        )
+                        .await;
+                    (id, outcome)
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .for_each(|(account_id, outcome)| async move {
+                match outcome {
+                    Ok(Some(value))
+                        if value.get("success").and_then(|value| value.as_bool()) == Some(true) => {
+                    }
+                    Ok(Some(_)) => warn!(%account_id,"Provider Account 定时探测失败"),
+                    Ok(None) => {
+                        tracing::debug!(%account_id,"跳过已禁用或已删除的 Provider Account");
+                    }
+                    Err(error) => warn!(%account_id,%error,"Provider Account 定时探测异常"),
+                }
+            })
+            .await;
+            // Dropping the dedicated connection releases the session lock.
+            drop(leader_connection);
+        }
+    });
+}
+
 /// 设置优雅关闭信号处理器
 ///
 /// 监听 SIGINT (Ctrl+C) 和 SIGTERM 信号
@@ -280,50 +453,58 @@ fn env_var_or_default(key: &str, default: &str) -> String {
     non_empty_or_default(std::env::var(key).ok(), default)
 }
 
-/// 内置的弱默认管理员密码，仅允许在开发环境使用。
-const WEAK_DEFAULT_ADMIN_PASSWORD: &str = "12345";
-
-/// 当前是否为非开发（生产）环境。
-fn is_production_env() -> bool {
-    !matches!(
-        std::env::var("KC__ENV").unwrap_or_default().as_str(),
-        "development" | "dev"
-    )
-}
-
 /// 解析用于创建默认管理员的密码。
 ///
-/// 生产环境必须显式配置 `KC__DEFAULT_ADMIN_PASSWORD` 且不能等于内置弱默认值；
-/// 开发环境允许回退到弱默认值以方便本地调试。
-fn resolve_default_admin_password(configured: Option<String>) -> anyhow::Result<String> {
-    resolve_default_admin_password_for_env(configured, is_production_env())
+/// 未配置时使用公开示例值以便开箱运行；生产环境强烈建议显式覆盖。
+fn resolve_default_admin_password(configured: Option<String>) -> String {
+    non_empty_or_default(configured, DEFAULT_ADMIN_PASSWORD)
 }
 
-fn resolve_default_admin_password_for_env(
+#[derive(Debug)]
+struct InvalidDefaultAdminBootstrapPassword;
+
+impl std::fmt::Display for InvalidDefaultAdminBootstrapPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "KC__DEFAULT_ADMIN_PASSWORD must be a non-default password of at least 12 characters",
+        )
+    }
+}
+
+impl std::error::Error for InvalidDefaultAdminBootstrapPassword {}
+
+fn validate_default_admin_password_for_production(
     configured: Option<String>,
-    is_production: bool,
-) -> anyhow::Result<String> {
-    if !is_production {
-        return Ok(configured.unwrap_or_else(|| WEAK_DEFAULT_ADMIN_PASSWORD.to_string()));
+) -> anyhow::Result<()> {
+    let password = resolve_default_admin_password(configured);
+    if password == DEFAULT_ADMIN_PASSWORD || password.len() < 12 {
+        return Err(InvalidDefaultAdminBootstrapPassword.into());
     }
-
-    match configured {
-        Some(password) if password != WEAK_DEFAULT_ADMIN_PASSWORD => Ok(password),
-        Some(_) => anyhow::bail!(
-            "refusing to create the default admin with the weak built-in password in production; \
-             set KC__DEFAULT_ADMIN_PASSWORD to a strong, unique value"
-        ),
-        None => anyhow::bail!(
-            "KC__DEFAULT_ADMIN_PASSWORD must be set to create the default admin in production"
-        ),
-    }
+    Ok(())
 }
 
-async fn initialize_default_admin(
-    pool: &(impl ConnectionTrait + TransactionTrait),
-) -> anyhow::Result<Tenant> {
+fn validate_default_admin_bootstrap_password(
+    system_admin_exists: bool,
+    is_production: bool,
+    configured: Option<String>,
+) -> anyhow::Result<()> {
+    if is_production && !system_admin_exists {
+        validate_default_admin_password_for_production(configured)?;
+    }
+    Ok(())
+}
+
+fn default_admin_bootstrap_connection(pool: &DbRouter) -> &sea_orm::DatabaseConnection {
+    // Bootstrap is a read-modify-write sequence. Every decision must observe
+    // the writer or replica lag can make an initialized production deployment
+    // look empty and incorrectly require the one-time bootstrap password.
+    pool.write_conn()
+}
+
+async fn initialize_default_admin(pool: &DbRouter, is_production: bool) -> anyhow::Result<Tenant> {
+    let pool = default_admin_bootstrap_connection(pool);
     // 从环境变量读取配置
-    let admin_email = env_var_or_default("KC__DEFAULT_ADMIN_EMAIL", "admin@keycompute.local");
+    let admin_email = env_var_or_default("KC__DEFAULT_ADMIN_EMAIL", DEFAULT_ADMIN_EMAIL);
     // 显式提供的密码（区分“未配置”与“配置为空”）
     let configured_password = std::env::var("KC__DEFAULT_ADMIN_PASSWORD")
         .ok()
@@ -338,6 +519,15 @@ async fn initialize_default_admin(
         [],
     );
     let existing_system_user = User::find_by_statement(stmt).one(pool).await?;
+
+    // The bootstrap password is needed only when this startup will actually
+    // create the first system administrator. Initialized deployments should be
+    // able to remove this one-time secret and continue restarting safely.
+    validate_default_admin_bootstrap_password(
+        existing_system_user.is_some(),
+        is_production,
+        configured_password.clone(),
+    )?;
 
     if let Some(user) = existing_system_user {
         if user.email == admin_email {
@@ -369,9 +559,10 @@ async fn initialize_default_admin(
 
     info!(email = %admin_email, "创建默认系统管理员");
 
-    // 安全守卫：生产环境禁止使用缺省/弱默认管理员密码创建新管理员。
-    // 仅在“确实需要创建新管理员”时校验，避免影响已初始化的部署。
-    let admin_password = resolve_default_admin_password(configured_password)?;
+    let admin_password = resolve_default_admin_password(configured_password);
+    if !is_production && (admin_password == DEFAULT_ADMIN_PASSWORD || admin_password.len() < 12) {
+        warn!("默认管理员正在使用示例或较弱密码");
+    }
 
     // 复用或创建默认 system 租户
     let tenant = if let Some(existing_tenant) = Tenant::find_by_slug(pool, "system").await? {
@@ -449,22 +640,6 @@ async fn initialize_default_admin(
     );
 
     Ok(tenant)
-}
-
-async fn validate_distribution_public_base_url(
-    pool: &impl ConnectionTrait,
-    config: &AppConfig,
-) -> anyhow::Result<()> {
-    let distribution_enabled = SystemSetting::find_by_key(pool, setting_keys::DISTRIBUTION_ENABLED)
-        .await?
-        .map(|setting| setting.parse_bool())
-        .unwrap_or(true);
-
-    if distribution_enabled && config.app_base_url.is_none() {
-        anyhow::bail!("APP_BASE_URL must be configured when distribution is enabled");
-    }
-
-    Ok(())
 }
 
 /// 初始化默认分销规则
@@ -593,7 +768,14 @@ async fn initialize_admin_balance(
 
 #[cfg(test)]
 mod tests {
-    use super::{non_empty_or_default, resolve_default_admin_password_for_env};
+    use super::{
+        default_admin_bootstrap_connection, non_empty_or_default, resolve_default_admin_password,
+        stale_trace_threshold_secs, validate_default_admin_bootstrap_password,
+        validate_default_admin_password_for_production,
+    };
+    use keycompute_config::DEFAULT_ADMIN_PASSWORD;
+    use keycompute_db::DbRouter;
+    use sea_orm::DatabaseConnection;
 
     #[test]
     fn test_non_empty_or_default_uses_non_empty_value() {
@@ -620,43 +802,59 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_admin_password_dev_allows_weak_default() {
-        // 开发环境未配置时回退到弱默认值
-        let resolved = resolve_default_admin_password_for_env(None, false).unwrap();
-        assert_eq!(resolved, "12345");
+    fn test_resolve_admin_password_uses_shared_default() {
+        let resolved = resolve_default_admin_password(None);
+        assert_eq!(resolved, DEFAULT_ADMIN_PASSWORD);
     }
 
     #[test]
-    fn test_resolve_admin_password_dev_uses_configured() {
-        let resolved =
-            resolve_default_admin_password_for_env(Some("custom-dev-pass".to_string()), false)
-                .unwrap();
+    fn test_resolve_admin_password_uses_configured_value() {
+        let resolved = resolve_default_admin_password(Some("custom-dev-pass".to_string()));
         assert_eq!(resolved, "custom-dev-pass");
     }
 
     #[test]
-    fn test_resolve_admin_password_production_requires_configured() {
-        // 生产环境未配置密码——必须拒绝
-        let err = resolve_default_admin_password_for_env(None, true).unwrap_err();
+    fn test_resolve_admin_password_preserves_explicit_value_for_development() {
+        let resolved = resolve_default_admin_password(Some("12345".to_string()));
+        assert_eq!(resolved, "12345");
+    }
+
+    #[test]
+    fn production_rejects_default_and_weak_admin_passwords() {
+        let error = validate_default_admin_password_for_production(None).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("KC__DEFAULT_ADMIN_PASSWORD must be set")
+            error
+                .downcast_ref::<super::InvalidDefaultAdminBootstrapPassword>()
+                .is_some()
+        );
+        assert!(validate_default_admin_password_for_production(Some("12345".to_string())).is_err());
+        assert!(
+            validate_default_admin_password_for_production(Some(
+                "independent-admin-password".to_string()
+            ))
+            .is_ok()
         );
     }
 
     #[test]
-    fn test_resolve_admin_password_production_rejects_weak_default() {
-        // 生产环境显式使用弱默认值——必须拒绝
-        let err =
-            resolve_default_admin_password_for_env(Some("12345".to_string()), true).unwrap_err();
-        assert!(err.to_string().contains("weak built-in password"));
+    fn initialized_production_does_not_require_the_bootstrap_password() {
+        assert!(validate_default_admin_bootstrap_password(true, true, None).is_ok());
+        assert!(validate_default_admin_bootstrap_password(false, true, None).is_err());
+        assert!(validate_default_admin_bootstrap_password(false, false, None).is_ok());
     }
 
     #[test]
-    fn test_resolve_admin_password_production_accepts_strong() {
-        let resolved =
-            resolve_default_admin_password_for_env(Some("S7r0ng-Pass!word".to_string()), true)
-                .unwrap();
-        assert_eq!(resolved, "S7r0ng-Pass!word");
+    fn default_admin_bootstrap_uses_a_writer_connection() {
+        let router = DbRouter::single(DatabaseConnection::Disconnected);
+        assert!(matches!(
+            default_admin_bootstrap_connection(router.as_ref()),
+            DatabaseConnection::Disconnected
+        ));
+    }
+
+    #[test]
+    fn stale_trace_reconciliation_waits_past_gateway_timeout() {
+        assert_eq!(stale_trace_threshold_secs(120), 180);
+        assert_eq!(stale_trace_threshold_secs(0), 120);
     }
 }

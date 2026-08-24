@@ -9,6 +9,7 @@
 //! - 并发安全和幂等性
 //! - 失败恢复和节点排除
 
+use deadpool_redis::redis::AsyncCommands;
 use integration_tests::common::VerificationChain;
 use keycompute_db::DbRouter;
 use keycompute_db::models::{
@@ -25,12 +26,19 @@ use keycompute_types::node::{
     NodeModelCapability, NodeRegisterRequest, NodeTaskCompleteAction, NodeTaskPayload,
     NodeTaskResult,
 };
+use keycompute_types::{
+    AttemptStatus, AttemptTraceFinish, BillingStatus, ErrorOrigin, RequestLifecycleRecorder,
+    RequestStatus, RequestTraceFinish, StreamEndReason, TestRequestLifecycleRecorder,
+    TraceErrorCategory, TraceErrorInfo,
+};
+use node_gateway::NodeGatewaySweeper;
 use node_gateway::config::NodeGatewayAppConfig;
 use node_gateway::redis::NodeGatewayRedis;
 use node_gateway::service::NodeGatewayService;
 use node_gateway::store::NodeGatewayStore;
 use sea_orm::{
     ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement,
+    TransactionTrait,
 };
 use serial_test::serial;
 use std::sync::Arc;
@@ -40,6 +48,7 @@ use uuid::Uuid;
 #[allow(dead_code)]
 struct NodeTestEnv {
     pool: DatabaseConnection,
+    redis_store: Arc<keycompute_runtime::redis_store::RedisRuntimeStore>,
     redis: NodeGatewayRedis,
     service: NodeGatewayService,
     config: NodeGatewayAppConfig,
@@ -192,14 +201,17 @@ impl NodeTestEnv {
 
         let redis_url = std::env::var("REDIS_URL")
             .unwrap_or_else(|_| "redis://:change-me-redis-password@127.0.0.1:6379".to_string());
-        let redis_store = keycompute_runtime::redis_store::RedisRuntimeStore::new(&redis_url)
-            .map_err(|e| anyhow::anyhow!("Redis connection failed: {}", e))?;
-        let redis = NodeGatewayRedis::new(Arc::new(redis_store));
+        let redis_store = Arc::new(
+            keycompute_runtime::redis_store::RedisRuntimeStore::new(&redis_url)
+                .map_err(|e| anyhow::anyhow!("Redis connection failed: {}", e))?,
+        );
+        let redis = NodeGatewayRedis::new(Arc::clone(&redis_store));
 
         let service = NodeGatewayService::new(store, redis.clone(), config.clone());
 
         Ok(Self {
             pool,
+            redis_store,
             redis,
             service,
             config,
@@ -226,6 +238,343 @@ impl NodeTestEnv {
             },
         }
     }
+}
+
+/// Sweeper 必须复用持有 advisory lock 的事务；合法的单连接写池不能因
+/// 再次申请 writer connection 而超时。
+#[tokio::test]
+#[serial(node_gateway)]
+async fn test_sweeper_runs_with_single_db_connection() -> anyhow::Result<()> {
+    let env = NodeTestEnv::new().await?;
+    let test_user_id = create_test_user(&env.pool, "sweeper-single-conn").await;
+    let token = create_test_hmac_token(
+        &env.pool,
+        test_user_id,
+        &env.config.registration_token_secret,
+    )
+    .await;
+    let registered = env
+        .service
+        .register_node(&env.create_register_request("sweeper-single-conn", &token))
+        .await?;
+    env.pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE nodes SET status = 'online', last_heartbeat_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            [registered.node_id.into()],
+        ))
+        .await?;
+
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://keycompute:change-me-strong-password@localhost:5432/keycompute".to_string()
+    });
+    let mut options = sea_orm::ConnectOptions::new(database_url);
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(500));
+    let single_connection = Database::connect(options).await?;
+    let sweeper = NodeGatewaySweeper::new(
+        DbRouter::single(single_connection),
+        env.redis.clone(),
+        env.config.clone(),
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), sweeper.run_once())
+        .await
+        .expect("single-connection sweeper must not wait for a second writer")?;
+
+    let node = Node::find_by_id(&env.pool, registered.node_id)
+        .await?
+        .expect("registered node should still exist");
+    assert_eq!(node.status, NODE_STATUS_OFFLINE);
+    Ok(())
+}
+
+/// Repeated recovery cycles must converge each queued task to one Redis List
+/// entry, while expiration removes all historical duplicates and bounds the
+/// wake-up notification lifetime.
+#[tokio::test]
+#[serial(node_gateway)]
+async fn test_sweeper_converges_redis_queue_entries() -> anyhow::Result<()> {
+    let env = NodeTestEnv::new().await?;
+    let model = format!("sweeper-convergence-{}", Uuid::new_v4());
+    let queue_key = format!("queue:node:model:{model}");
+
+    let queued_task = NodeTask::create(
+        &env.pool,
+        &CreateNodeTaskRequest {
+            request_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            model: model.clone(),
+            payload_json: serde_json::json!({}),
+            deadline_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            complete_grace_until: chrono::Utc::now() + chrono::Duration::minutes(6),
+        },
+    )
+    .await?;
+    env.pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE node_tasks SET queued_at=NOW()-INTERVAL '1 minute' WHERE id=$1",
+            [queued_task.id.into()],
+        ))
+        .await?;
+
+    // Seed the duplicate state produced by the previous unconditional LPUSH
+    // implementation, then prove that multiple sweeps remain convergent.
+    let mut redis = env.redis_store.pool().get().await?;
+    let queued_id = queued_task.id.to_string();
+    let _: () = redis
+        .lpush(
+            &queue_key,
+            &[queued_id.clone(), queued_id.clone(), queued_id.clone()],
+        )
+        .await?;
+    drop(redis);
+
+    let sweeper = NodeGatewaySweeper::new(
+        DbRouter::single(env.pool.clone()),
+        env.redis.clone(),
+        env.config.clone(),
+    );
+    sweeper.run_once().await?;
+    sweeper.run_once().await?;
+
+    let mut redis = env.redis_store.pool().get().await?;
+    let queued_entries: Vec<String> = redis.lrange(&queue_key, 0, -1).await?;
+    assert_eq!(queued_entries, [queued_id]);
+    drop(redis);
+
+    let expired_task = NodeTask::create(
+        &env.pool,
+        &CreateNodeTaskRequest {
+            request_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            model: model.clone(),
+            payload_json: serde_json::json!({}),
+            deadline_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            complete_grace_until: chrono::Utc::now() + chrono::Duration::minutes(1),
+        },
+    )
+    .await?;
+    let expired_id = expired_task.id.to_string();
+    let mut redis = env.redis_store.pool().get().await?;
+    let _: () = redis
+        .lpush(&queue_key, &[expired_id.clone(), expired_id.clone()])
+        .await?;
+    drop(redis);
+
+    sweeper.run_once().await?;
+
+    let reloaded = NodeTask::find_by_id(&env.pool, expired_task.id)
+        .await?
+        .expect("expired task should remain available for audit");
+    assert_eq!(reloaded.status, TASK_STATUS_EXPIRED);
+
+    let mut redis = env.redis_store.pool().get().await?;
+    let queue_entries: Vec<String> = redis.lrange(&queue_key, 0, -1).await?;
+    assert_eq!(queue_entries, [queued_task.id.to_string()]);
+    let result_key = format!("task:result:{}", expired_task.id);
+    let notification_ttl: i64 = redis.ttl(&result_key).await?;
+    assert!(
+        notification_ttl > 0,
+        "orphan result notifications must have a bounded lifetime"
+    );
+
+    let _: usize = redis.del(&queue_key).await?;
+    let _: usize = redis.del(&result_key).await?;
+    drop(redis);
+    for task_id in [queued_task.id, expired_task.id] {
+        env.pool
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "DELETE FROM node_tasks WHERE id=$1",
+                [task_id.into()],
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Request-side waiting may close an expired attempt before the task sweeper
+/// observes the same deadline. Replaying that terminal state must remain
+/// idempotent and must not downgrade a complete trace.
+#[tokio::test]
+#[serial(node_gateway)]
+async fn test_sweeper_preserves_trace_quality_after_wait_timeout() -> anyhow::Result<()> {
+    let env = NodeTestEnv::new().await?;
+    let user_id = create_test_user(&env.pool, "wait-timeout-trace").await;
+    let token =
+        create_test_hmac_token(&env.pool, user_id, &env.config.registration_token_secret).await;
+    let registered = env
+        .service
+        .register_node(&env.create_register_request("wait-timeout-trace", &token))
+        .await?;
+
+    let request_id = Uuid::new_v4();
+    let attempt_id = Uuid::new_v4();
+    let lease_id = Uuid::new_v4();
+    let received_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let claimed_at = chrono::Utc::now() - chrono::Duration::seconds(20);
+    let payload = NodeTaskPayload {
+        request_id,
+        chat: None,
+        image_generation: Some(ImageGenerationRequest {
+            prompt: "wait timeout trace".to_string(),
+            n: Some(1),
+            size: None,
+        }),
+        image_edit: None,
+    };
+    let task = NodeTask::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"INSERT INTO node_tasks (
+                request_id,user_id,model,payload_json,status,assigned_node_id,
+                assigned_session_id,lease_id,claimed_at,deadline_at,
+                complete_grace_until,failure_threshold
+            ) VALUES ($1,$2,'stable-diffusion',$3,'leased',$4,$5,$6,$7,
+                      NOW()-INTERVAL '10 seconds',NOW()+INTERVAL '120 seconds',3)
+            RETURNING *"#,
+        [
+            request_id.into(),
+            user_id.into(),
+            serde_json::to_value(&payload)?.into(),
+            registered.node_id.into(),
+            registered.session_id.into(),
+            lease_id.into(),
+            claimed_at.into(),
+        ],
+    ))
+    .one(&env.pool)
+    .await?
+    .expect("leased timeout task should be inserted");
+
+    env.pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"INSERT INTO gateway_requests (
+                    request_id,tenant_id,user_id,produce_ai_key_id,protocol,request_path,
+                    requested_model,is_stream,route_type,status,received_at,billing_status,trace_quality
+                ) VALUES ($1,$2,$3,$4,'openai','/v1/chat/completions','stable-diffusion',FALSE,
+                          'node','running',$5,'pending','actual')"#,
+            [
+                request_id.into(),
+                Uuid::new_v4().into(),
+                user_id.into(),
+                Uuid::new_v4().into(),
+                received_at.into(),
+            ],
+        ))
+        .await?;
+    env.pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"INSERT INTO gateway_request_attempts (
+                    id,request_id,attempt_no,attempt_kind,route_type,model,status,is_final,
+                    node_task_id,node_id,session_id,lease_id,started_at
+                ) VALUES ($1,$2,1,'primary','node','stable-diffusion','running',FALSE,
+                          $3,$4,$5,$6,$7)"#,
+            [
+                attempt_id.into(),
+                request_id.into(),
+                task.id.into(),
+                registered.node_id.into(),
+                registered.session_id.into(),
+                lease_id.into(),
+                claimed_at.into(),
+            ],
+        ))
+        .await?;
+
+    let lifecycle =
+        keycompute_db::PostgresRequestLifecycleRecorder::new(DbRouter::single(env.pool.clone()));
+    lifecycle
+        .finish_attempt_and_request(AttemptTraceFinish {
+            attempt_id,
+            request_id,
+            attempt_status: AttemptStatus::Expired,
+            request_status: RequestStatus::Running,
+            is_final: true,
+            stream_end_reason: Some(StreamEndReason::Timeout),
+            stream_error_count: Some(1),
+            error: Some(TraceErrorInfo {
+                origin: ErrorOrigin::Node,
+                category: TraceErrorCategory::NodeExpired,
+                code: "node_wait_timeout".to_string(),
+                summary: None,
+                retryable: Some(false),
+            }),
+            billing_status: BillingStatus::Pending,
+            finished_at: chrono::Utc::now(),
+        })
+        .await?;
+    lifecycle
+        .finish_request_without_attempt(RequestTraceFinish {
+            request_id,
+            status: RequestStatus::TimedOut,
+            error: Some(TraceErrorInfo {
+                origin: ErrorOrigin::Node,
+                category: TraceErrorCategory::NodeExpired,
+                code: "node_wait_timeout".to_string(),
+                summary: None,
+                retryable: Some(false),
+            }),
+            billing_status: BillingStatus::NotApplicable,
+            finished_at: chrono::Utc::now(),
+        })
+        .await?;
+
+    env.service.sweeper().run_once().await?;
+
+    let request = env
+        .pool
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT status,trace_quality FROM gateway_requests WHERE request_id=$1",
+            [request_id.into()],
+        ))
+        .await?
+        .expect("request trace should remain available");
+    assert_eq!(request.try_get::<String>("", "status")?, "timed_out");
+    assert_eq!(request.try_get::<String>("", "trace_quality")?, "actual");
+
+    let attempt = env
+        .pool
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT status,is_final,error_code FROM gateway_request_attempts WHERE id=$1",
+            [attempt_id.into()],
+        ))
+        .await?
+        .expect("terminal node attempt should remain available");
+    assert_eq!(attempt.try_get::<String>("", "status")?, "expired");
+    assert!(attempt.try_get::<bool>("", "is_final")?);
+    assert_eq!(
+        attempt.try_get::<String>("", "error_code")?,
+        "node_wait_timeout"
+    );
+
+    let task = NodeTask::find_by_id(&env.pool, task.id)
+        .await?
+        .expect("expired task should remain available");
+    assert_eq!(task.status, TASK_STATUS_EXPIRED);
+
+    env.pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "DELETE FROM gateway_requests WHERE request_id=$1",
+            [request_id.into()],
+        ))
+        .await?;
+    env.pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "DELETE FROM node_tasks WHERE id=$1",
+            [task.id.into()],
+        ))
+        .await?;
+    Ok(())
 }
 
 /// 测试 1: 节点注册流程（使用 HMAC 签名 token）
@@ -277,6 +626,59 @@ async fn test_node_registration() -> anyhow::Result<()> {
 
     chain.print_report();
     assert!(chain.all_passed());
+    Ok(())
+}
+
+/// 会话 TTL 是认证边界：过期 token 既不能通过内部认证，也不能靠心跳续期。
+#[tokio::test]
+#[serial(node_gateway)]
+async fn test_expired_session_cannot_authenticate_or_renew() -> anyhow::Result<()> {
+    let env = NodeTestEnv::new().await?;
+    let user_id = create_test_user(&env.pool, "expired-session").await;
+    let registration_token =
+        create_test_hmac_token(&env.pool, user_id, &env.config.registration_token_secret).await;
+    let registration = env
+        .service
+        .register_node(
+            &env.create_register_request("test-client-expired-session", &registration_token),
+        )
+        .await?;
+
+    env.pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE node_sessions SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+            [registration.session_id.into()],
+        ))
+        .await?;
+
+    assert!(
+        env.service
+            .store
+            .authenticate_session(&registration.session_token)
+            .await
+            .is_err(),
+        "expired session token must not authenticate"
+    );
+    assert!(
+        env.service
+            .heartbeat(
+                registration.node_id,
+                registration.session_id,
+                vec!["deepseek-chat".to_string()],
+            )
+            .await
+            .is_err(),
+        "expired session must not be renewed by heartbeat"
+    );
+
+    let session = NodeSession::find_by_id(&env.pool, registration.session_id)
+        .await?
+        .expect("expired session should remain stored for audit");
+    assert!(
+        session.is_expired(),
+        "failed heartbeat must not extend expiry"
+    );
     Ok(())
 }
 
@@ -524,6 +926,114 @@ async fn test_task_creation_and_enqueue() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[serial(node_gateway)]
+async fn completion_committed_after_client_deadline_returns_timeout_for_handler()
+-> anyhow::Result<()> {
+    let env = NodeTestEnv::new().await?;
+    let user_id = create_test_user(&env.pool, "deadline-race").await;
+    let request_id = Uuid::new_v4();
+    let mut config = env.config.clone();
+    config.task_deadline_secs = 1;
+    let recorder = Arc::new(TestRequestLifecycleRecorder::default());
+    let service = NodeGatewayService::new(
+        NodeGatewayStore::new(DbRouter::single(env.pool.clone()), config.clone()),
+        env.redis.clone(),
+        config,
+    )
+    .with_lifecycle(Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>);
+    let payload = NodeTaskPayload {
+        request_id,
+        chat: Some(keycompute_types::ChatCompletionRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![keycompute_types::Message {
+                role: keycompute_types::MessageRole::User,
+                content: "deadline race".into(),
+            }],
+            stream: Some(false),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stop: None,
+        }),
+        image_generation: None,
+        image_edit: None,
+    };
+
+    let waiting = tokio::spawn(async move {
+        service
+            .enqueue_and_wait(user_id, "deepseek-chat".to_string(), payload)
+            .await
+    });
+    let task = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(task) = NodeTask::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT * FROM node_tasks WHERE request_id=$1",
+                [request_id.into()],
+            ))
+            .one(&env.pool)
+            .await?
+            {
+                break Ok::<_, sea_orm::DbErr>(task);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("enqueued node task should become visible")?;
+
+    // Simulate a completion transaction that made its success decision before
+    // the deadline but was delayed while committing until the local wait timed
+    // out. The timeout finalizer must preserve the successful Node attempt but
+    // keep the client-visible request outcome as timed out.
+    let completion_tx = env.pool.begin().await?;
+    completion_tx
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM node_tasks WHERE id=$1 FOR UPDATE",
+            [task.id.into()],
+        ))
+        .await?
+        .expect("node task should lock for completion");
+    completion_tx
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE node_tasks SET status='succeeded',result_json=$1,finished_at=NOW(),updated_at=NOW() WHERE id=$2",
+            [serde_json::json!({}).into(), task.id.into()],
+        ))
+        .await?;
+    let release_at = task.deadline_at + chrono::Duration::milliseconds(300);
+    if let Ok(delay) = (release_at - chrono::Utc::now()).to_std() {
+        tokio::time::sleep(delay).await;
+    }
+    completion_tx.commit().await?;
+
+    let error = waiting
+        .await
+        .expect("wait task should join")
+        .expect_err("the client wait has already expired at this boundary");
+    assert_eq!(error.request_failure().status, RequestStatus::TimedOut);
+    assert_eq!(
+        error.client_response_outcome(),
+        keycompute_types::ClientResponseOutcome::TimedOut
+    );
+    assert!(
+        recorder.request_finishes().is_empty(),
+        "the HTTP handler, not NodeGatewayService, owns request terminalization"
+    );
+
+    env.pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "DELETE FROM node_tasks WHERE id=$1",
+            [task.id.into()],
+        ))
+        .await?;
+    Ok(())
+}
+
 /// 测试 7: Complete 幂等性 — 相同 task 重复 complete 应返回相同结果且只写一条 submission
 #[tokio::test]
 #[serial(node_gateway)]
@@ -549,8 +1059,8 @@ async fn test_complete_idempotency() -> anyhow::Result<()> {
         Statement::from_sql_and_values(
             DbBackend::Postgres,
             r#"
-            INSERT INTO node_tasks (request_id, user_id, model, payload_json, status, assigned_node_id, assigned_session_id, lease_id, deadline_at, complete_grace_until, failure_threshold)
-            VALUES ($1, $2, $3, $4, 'leased', $5, $6, $7, NOW() + INTERVAL '60 seconds', NOW() + INTERVAL '120 seconds', 3)
+            INSERT INTO node_tasks (request_id, user_id, model, payload_json, status, assigned_node_id, assigned_session_id, lease_id, claimed_at, deadline_at, complete_grace_until, failure_threshold)
+            VALUES ($1, $2, $3, $4, 'leased', $5, $6, $7, NOW(), NOW() + INTERVAL '60 seconds', NOW() + INTERVAL '120 seconds', 3)
             RETURNING *
             "#,
             [
@@ -567,6 +1077,13 @@ async fn test_complete_idempotency() -> anyhow::Result<()> {
     .one(&env.pool)
     .await?
     .unwrap();
+
+    let node_success_metric = keycompute_observability::metrics::MONITORING_NODE_TASK_TOTAL
+        .with_label_values(&["succeeded"]);
+    let attempt_success_metric = keycompute_observability::metrics::MONITORING_ATTEMPT_TOTAL
+        .with_label_values(&["node", "succeeded", "none", "none"]);
+    let node_success_before = node_success_metric.get();
+    let attempt_success_before = attempt_success_metric.get();
 
     // 3. 第一次 complete
     let result1 = env
@@ -599,6 +1116,8 @@ async fn test_complete_idempotency() -> anyhow::Result<()> {
         format!("First complete: {:?}", result1.action),
         result1.action == NodeTaskCompleteAction::Succeeded,
     );
+    let node_success_after_first = node_success_metric.get();
+    let attempt_success_after_first = attempt_success_metric.get();
 
     // 4. 第二次 complete (相同 request, 应该幂等返回)
     let result2 = env
@@ -630,6 +1149,15 @@ async fn test_complete_idempotency() -> anyhow::Result<()> {
         "idempotent::second_complete",
         format!("Second complete (idempotent): {:?}", result2.action),
         result2.action == NodeTaskCompleteAction::Succeeded,
+    );
+    chain.add_step(
+        "node-gateway",
+        "idempotent::metrics_once",
+        "First submission increments terminal metrics; replay does not".to_string(),
+        node_success_after_first == node_success_before + 1.0
+            && node_success_metric.get() == node_success_after_first
+            && attempt_success_after_first == attempt_success_before + 1.0
+            && attempt_success_metric.get() == attempt_success_after_first,
     );
 
     // 5. 验证只有一个 submission
@@ -1639,8 +2167,8 @@ async fn test_node_task_timeout() -> anyhow::Result<()> {
         Statement::from_sql_and_values(
             DbBackend::Postgres,
             r#"
-            INSERT INTO node_tasks (request_id, user_id, model, payload_json, status, assigned_node_id, assigned_session_id, lease_id, deadline_at, complete_grace_until, failure_threshold)
-            VALUES ($1, $2, $3, $4, 'leased', $5, $6, $7, NOW() - INTERVAL '10 seconds', NOW() + INTERVAL '120 seconds', 3)
+            INSERT INTO node_tasks (request_id, user_id, model, payload_json, status, assigned_node_id, assigned_session_id, lease_id, claimed_at, deadline_at, complete_grace_until, failure_threshold)
+            VALUES ($1, $2, $3, $4, 'leased', $5, $6, $7, NOW() - INTERVAL '20 seconds', NOW() - INTERVAL '10 seconds', NOW() + INTERVAL '120 seconds', 3)
             RETURNING *
             "#,
             [
@@ -1665,7 +2193,26 @@ async fn test_node_task_timeout() -> anyhow::Result<()> {
         true,
     );
 
-    // 4. 节点尝试提交超时任务的结果
+    let node_expired_metric = keycompute_observability::metrics::MONITORING_NODE_TASK_TOTAL
+        .with_label_values(&["expired"]);
+    let attempt_expired_metric = keycompute_observability::metrics::MONITORING_ATTEMPT_TOTAL
+        .with_label_values(&["node", "expired", "node", "node_expired"]);
+    let node_expired_before = node_expired_metric.get();
+    let attempt_expired_before = attempt_expired_metric.get();
+
+    // 4. sweeper 先完成任务过期迁移并发出一次指标
+    env.service.sweeper().run_once().await?;
+    let node_expired_after_sweeper = node_expired_metric.get();
+    let attempt_expired_after_sweeper = attempt_expired_metric.get();
+    chain.add_step(
+        "node-gateway",
+        "timeout::sweeper_metrics_once",
+        "Sweeper records the expired task and attempt once".to_string(),
+        node_expired_after_sweeper == node_expired_before + 1.0
+            && attempt_expired_after_sweeper == attempt_expired_before + 1.0,
+    );
+
+    // 5. 节点在宽限期内补交；返回 expired ACK，但不能重复发出指标
     let image_response = ImageGenerationResponse {
         created: 1717200300,
         data: vec![ImageData {
@@ -1686,19 +2233,70 @@ async fn test_node_task_timeout() -> anyhow::Result<()> {
                 image_response: image_response.clone(),
             },
         )
-        .await;
+        .await?;
 
-    // 超时任务的提交应该被拒绝或标记为 expired
     chain.add_step(
         "node-gateway",
-        "timeout::submission_rejected",
+        "timeout::late_submission_is_expired",
         format!("Timeout submission result: {:?}", complete_result),
-        complete_result.is_ok() // 可能返回 Expired 或成功（取决于实现）
-            || complete_result
-                .as_ref()
-                .map(|r| r.action == NodeTaskCompleteAction::Expired)
-                .unwrap_or(false)
-            || complete_result.is_err(),
+        complete_result.action == NodeTaskCompleteAction::Expired,
+    );
+    chain.add_step(
+        "node-gateway",
+        "timeout::late_submission_does_not_duplicate_metrics",
+        "Late expired ACK leaves terminal metrics unchanged".to_string(),
+        node_expired_metric.get() == node_expired_after_sweeper
+            && attempt_expired_metric.get() == attempt_expired_after_sweeper,
+    );
+
+    // 6. The ACK is idempotent over the actual submitted result, even though
+    // the server stores Expired as the action.
+    let retry_result = env
+        .service
+        .complete_task(
+            task.id,
+            lease_id,
+            register_resp.node_id,
+            register_resp.session_id,
+            NodeTaskResult::ImageSucceeded { image_response },
+        )
+        .await?;
+    let submissions = NodeTaskSubmission::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT * FROM node_task_submissions WHERE task_id = $1",
+        [task.id.into()],
+    ))
+    .all(&env.pool)
+    .await?;
+    chain.add_step(
+        "node-gateway",
+        "timeout::late_submission_is_idempotent",
+        "Exact retry returns the stored Expired ACK without another submission".to_string(),
+        retry_result.action == NodeTaskCompleteAction::Expired && submissions.len() == 1,
+    );
+
+    // 7. Expiry does not let another lease manufacture a submission for this
+    // task during the completion grace period.
+    let mismatched = env
+        .service
+        .complete_task(
+            task.id,
+            Uuid::new_v4(),
+            register_resp.node_id,
+            register_resp.session_id,
+            NodeTaskResult::Failed {
+                code: "late".to_string(),
+                message: "wrong lease".to_string(),
+                is_client_error: false,
+            },
+        )
+        .await
+        .expect_err("a mismatched lease must be rejected after expiry");
+    chain.add_step(
+        "node-gateway",
+        "timeout::late_submission_requires_matching_lease",
+        mismatched.to_string(),
+        mismatched.to_string().contains("lease_mismatch"),
     );
 
     chain.print_report();

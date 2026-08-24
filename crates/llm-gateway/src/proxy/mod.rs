@@ -24,7 +24,7 @@ pub use request::ProxyRequest;
 pub use selector::ProxySelector;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Internal HTTP Proxy
 ///
@@ -39,6 +39,8 @@ pub struct HttpProxy {
     default_client: Arc<HttpClient>,
     /// 代理选择器
     proxy_selector: ProxySelector,
+    /// One connection pool per proxy URL, shared across requests.
+    proxy_clients: Arc<RwLock<HashMap<String, Arc<HttpClient>>>>,
     /// 全局配置
     config: ProxyConfig,
 }
@@ -52,6 +54,7 @@ impl HttpProxy {
         Self {
             default_client,
             proxy_selector,
+            proxy_clients: Arc::new(RwLock::new(HashMap::new())),
             config,
         }
     }
@@ -64,6 +67,7 @@ impl HttpProxy {
         Self {
             default_client,
             proxy_selector,
+            proxy_clients: Arc::new(RwLock::new(HashMap::new())),
             config,
         }
     }
@@ -79,8 +83,7 @@ impl HttpProxy {
     /// 否则返回默认客户端。
     pub fn client_for_provider(&self, provider: &str) -> Arc<HttpClient> {
         if let Some(proxy_url) = self.proxy_selector.select(provider) {
-            // 为每个代理 URL 创建或获取客户端
-            Arc::new(HttpClient::new(&self.config, Some(proxy_url)))
+            self.client_for_proxy_url(proxy_url)
         } else {
             Arc::clone(&self.default_client)
         }
@@ -101,16 +104,52 @@ impl HttpProxy {
         if let Some(id) = account_id
             && let Some(proxy_url) = self.proxy_selector.select_for_account(provider, id)
         {
-            return Arc::new(HttpClient::new(&self.config, Some(proxy_url)));
+            return self.client_for_proxy_url(proxy_url);
         }
 
         // 回退到 Provider 级代理
         self.client_for_provider(provider)
     }
 
+    fn client_for_proxy_url(&self, proxy_url: &str) -> Arc<HttpClient> {
+        if let Some(client) = self
+            .proxy_clients
+            .read()
+            .expect("proxy client cache poisoned")
+            .get(proxy_url)
+        {
+            return Arc::clone(client);
+        }
+        let mut clients = self
+            .proxy_clients
+            .write()
+            .expect("proxy client cache poisoned");
+        Arc::clone(
+            clients
+                .entry(proxy_url.to_string())
+                .or_insert_with(|| Arc::new(HttpClient::new(&self.config, Some(proxy_url)))),
+        )
+    }
+
     /// 添加代理规则
     pub fn add_proxy(&mut self, pattern: String, proxy_url: String) {
         self.proxy_selector.add_proxy(pattern, proxy_url);
+    }
+
+    /// Add a wildcard provider rule such as `openai-*` or `*-cn`.
+    pub fn add_pattern(&mut self, pattern: String, proxy_url: String) {
+        self.proxy_selector.add_pattern(pattern, proxy_url);
+    }
+
+    /// Add the highest-priority proxy rule for one provider account.
+    pub fn add_account_proxy(
+        &mut self,
+        provider: String,
+        account_id: uuid::Uuid,
+        proxy_url: String,
+    ) {
+        self.proxy_selector
+            .add_account_proxy(provider, account_id, proxy_url);
     }
 
     /// 获取配置
@@ -159,5 +198,37 @@ mod tests {
 
         let client = proxy.client_for_provider("deepseek");
         assert!(client.is_shared());
+    }
+
+    #[test]
+    fn provider_pattern_and_account_rules_create_proxied_clients() {
+        let mut proxy = HttpProxy::new(ProxyConfig::default());
+        let account_id = uuid::Uuid::nil();
+        proxy.add_proxy(
+            "openai".to_string(),
+            "http://provider-proxy:8080".to_string(),
+        );
+        proxy.add_pattern(
+            "anthropic-*".to_string(),
+            "http://pattern-proxy:8080".to_string(),
+        );
+        proxy.add_account_proxy(
+            "openai".to_string(),
+            account_id,
+            "http://account-proxy:8080".to_string(),
+        );
+
+        assert!(proxy.client_for_provider("openai").has_proxy());
+        assert!(proxy.client_for_provider("anthropic-cn").has_proxy());
+        assert!(
+            proxy
+                .client_for_provider_and_account("openai", Some(account_id))
+                .has_proxy()
+        );
+        assert!(!proxy.client_for_provider("unknown").has_proxy());
+        assert!(Arc::ptr_eq(
+            &proxy.client_for_provider("openai"),
+            &proxy.client_for_provider("openai")
+        ));
     }
 }

@@ -157,6 +157,7 @@ pub async fn debug_routing(
 
     // 2. 构建模拟的 RequestContext
     let mut ctx = RequestContext::new(
+        Uuid::new_v4(),
         auth.user_id,
         auth.tenant_id,
         auth.produce_ai_key_id,
@@ -434,6 +435,7 @@ mod tests {
     fn apply_debug_entry_protocol_sets_native_request_only_for_anthropic() {
         let make_ctx = || {
             RequestContext::new(
+                Uuid::new_v4(),
                 Uuid::new_v4(),
                 Uuid::new_v4(),
                 Uuid::new_v4(),

@@ -3,6 +3,8 @@
 //! 提供 PostgreSQL 数据库连接池、ORM 模型和新库结构初始化
 
 pub mod db_router;
+pub mod lifecycle;
+pub mod migrations;
 pub mod models;
 pub mod schema;
 
@@ -14,11 +16,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use db_router::DbRouter;
+pub use lifecycle::*;
 pub use models::*;
 pub use schema::*;
 
-/// 当前版本的完整数据库结构；只描述最终状态，不承载升级步骤。
-const DATABASE_SCHEMA: &str = include_str!("schema.sql");
+/// 全新部署使用的统一 V0001 数据库基线。
+#[cfg(test)]
+const DATABASE_SCHEMA: &str = include_str!("../migrations/V0001__baseline.sql");
 
 // ============================================================================
 // 错误类型定义
@@ -215,44 +219,24 @@ pub async fn init_pool(config: &DatabaseConfig) -> Result<DatabaseConnection, Db
     Ok(db)
 }
 
-/// 初始化一个全新的数据库结构。
-///
-/// 本项目不提供增量迁移或旧数据升级能力。部署时必须连接空数据库；结构变化后
-/// 应重建数据库再启动服务。整个 schema 在单个事务内执行，任一语句失败都会回滚，
-/// 防止服务在结构不完整的数据库上继续运行。
-///
-/// 执行完成后会验证哨兵列：由于 schema 全部使用 `IF NOT EXISTS`，误连接到
-/// 旧版结构的存量库时旧表会被静默跳过，哨兵校验把这种部署错误从运行期
-/// 故障提前为启动即失败。
+/// Apply the versioned schema migrations. Kept under the previous public name
+/// so deployments and integration tests do not need a flag-day API change.
 pub async fn initialize_schema(db: &DatabaseConnection) -> Result<(), DbError> {
-    let transaction = db
-        .begin()
-        .await
-        .map_err(|error| DbError::SchemaInitializationError(error.to_string()))?;
-
-    transaction
-        .execute_unprepared(DATABASE_SCHEMA)
-        .await
-        .map_err(|error| DbError::SchemaInitializationError(error.to_string()))?;
-
-    transaction
-        .commit()
-        .await
-        .map_err(|error| DbError::SchemaInitializationError(error.to_string()))?;
-
+    migrations::run_migrations(db).await?;
     verify_schema_sentinels(db).await?;
-
     tracing::info!("Database schema initialized successfully");
     Ok(())
 }
 
-/// 近期结构修订引入的哨兵列。旧版数据库缺少这些列，而 `IF NOT EXISTS`
-/// 不会为已存在的表补列，因此可用于识别“误部署到存量旧库”的场景。
+/// 统一基线中的关键哨兵列，用于验证初始化后的数据库结构完整性。
 const SCHEMA_SENTINEL_COLUMNS: &[(&str, &str)] = &[
     ("payment_orders", "payment_scene"),
     ("payment_orders", "provider_trade_no"),
     ("payment_notifications", "payload_digest"),
     ("payment_provider_states", "circuit_state"),
+    ("accounts", "last_probe_status"),
+    ("gateway_requests", "trace_quality"),
+    ("gateway_request_attempts", "attempt_no"),
 ];
 
 /// 验证当前数据库包含最新 schema 的哨兵列，缺失时拒绝启动。
@@ -285,8 +269,7 @@ pub async fn verify_required_columns(
         Ok(())
     } else {
         Err(DbError::SchemaInitializationError(format!(
-            "database is missing required columns [{}]; this deployment only supports \
-             an empty database; rebuild the database instead of reusing a legacy one",
+            "database is missing required columns [{}]",
             missing.join(", ")
         )))
     }
@@ -378,7 +361,7 @@ impl Database {
         self.router.write_conn().begin().await
     }
 
-    /// 初始化空数据库结构；不负责升级已有数据库
+    /// Apply all pending versioned migrations.
     pub async fn initialize_schema(&self) -> Result<(), DbError> {
         initialize_schema(self.router.write_conn()).await
     }
@@ -446,6 +429,10 @@ mod tests {
         assert!(DATABASE_SCHEMA.contains("token_version INTEGER NOT NULL DEFAULT 0"));
         assert!(DATABASE_SCHEMA.contains("CONSTRAINT uk_distribution_records_unique"));
         assert!(DATABASE_SCHEMA.contains("CONSTRAINT uk_node_tips_usage_log_id UNIQUE"));
+        assert!(DATABASE_SCHEMA.contains("CREATE TABLE IF NOT EXISTS gateway_requests"));
+        assert!(DATABASE_SCHEMA.contains("CREATE TABLE IF NOT EXISTS gateway_request_attempts"));
+        assert!(DATABASE_SCHEMA.contains("last_probe_status VARCHAR(32)"));
+        assert!(DATABASE_SCHEMA.contains("CONSTRAINT ck_accounts_probe_status"));
         assert!(!DATABASE_SCHEMA.contains("ALTER TABLE"));
         assert!(!DATABASE_SCHEMA.contains("\nUPDATE "));
         assert!(!DATABASE_SCHEMA.contains("\nDELETE FROM "));

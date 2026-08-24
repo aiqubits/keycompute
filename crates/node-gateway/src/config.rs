@@ -2,19 +2,8 @@
 //!
 //! 定义节点网关的配置结构，包括会话 TTL、心跳间隔、轮询超时等参数。
 
-use keycompute_config::NodeGatewayConfig;
+use keycompute_config::{DEFAULT_REGISTRATION_TOKEN_SECRET, NodeGatewayConfig};
 use std::time::Duration;
-
-/// Node Gateway 配置加载错误
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    /// 生产环境下 registration_token_secret 为必填项
-    #[error(
-        "生产环境禁止使用默认 registration_token_secret，\
-         请设置 KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET 环境变量"
-    )]
-    RegistrationTokenSecretRequired,
-}
 
 /// Node Gateway 配置
 #[derive(Debug, Clone)]
@@ -44,7 +33,7 @@ pub struct NodeGatewayAppConfig {
 impl Default for NodeGatewayAppConfig {
     fn default() -> Self {
         Self {
-            registration_token_secret: "change-me-node-registration-token-secret".to_string(),
+            registration_token_secret: DEFAULT_REGISTRATION_TOKEN_SECRET.to_string(),
             session_ttl_secs: 300, // 5 分钟
             heartbeat_interval_secs: 30,
             poll_timeout_secs: 30,
@@ -61,28 +50,21 @@ impl Default for NodeGatewayAppConfig {
 impl NodeGatewayAppConfig {
     /// 从配置文件中加载
     ///
-    /// # Errors
-    ///
-    /// 生产环境下 `registration_token_secret` 为必填项，缺失时返回 `ConfigError`。
-    /// Debug 构建允许使用硬编码默认密钥以便本地开发。
-    pub fn from_config(config: &NodeGatewayConfig) -> Result<Self, ConfigError> {
+    /// 缺失、空值或示例密钥不会阻止服务启动；生产环境会记录安全建议。
+    pub fn from_config(config: &NodeGatewayConfig) -> Self {
         let secret = config
             .registration_token_secret
             .clone()
-            .filter(|s| !s.is_empty())
-            .map(Ok)
-            .unwrap_or_else(|| {
-                if cfg!(debug_assertions) {
-                    tracing::warn!(
-                        "Using default registration_token_secret — insecure for production!"
-                    );
-                    Ok("change-me-node-registration-token-secret".to_string())
-                } else {
-                    Err(ConfigError::RegistrationTokenSecretRequired)
-                }
-            })?;
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_REGISTRATION_TOKEN_SECRET.to_string());
 
-        Ok(Self {
+        if secret == DEFAULT_REGISTRATION_TOKEN_SECRET {
+            tracing::warn!(
+                "Node Gateway 正在使用示例 registration_token_secret；生产环境强烈建议设置独立随机密钥"
+            );
+        }
+
+        Self {
             registration_token_secret: secret,
             session_ttl_secs: config.session_ttl_secs.unwrap_or(300),
             heartbeat_interval_secs: config.heartbeat_interval_secs.unwrap_or(30),
@@ -93,7 +75,7 @@ impl NodeGatewayAppConfig {
             task_failure_threshold: config.task_failure_threshold.unwrap_or(3),
             sweeper_heartbeat_ttl_secs: config.sweeper_heartbeat_ttl_secs.unwrap_or(600),
             sweeper_repush_interval_secs: config.sweeper_repush_interval_secs.unwrap_or(10),
-        })
+        }
     }
 
     /// 获取会话 TTL 的 Duration
@@ -119,5 +101,52 @@ impl NodeGatewayAppConfig {
     /// 获取完成宽限期的 Duration
     pub fn complete_grace(&self) -> Duration {
         Duration::from_secs(self.complete_grace_secs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_registration_secret_uses_advisory_default() {
+        let config = NodeGatewayConfig {
+            registration_token_secret: None,
+            ..Default::default()
+        };
+
+        let resolved = NodeGatewayAppConfig::from_config(&config);
+
+        assert_eq!(
+            resolved.registration_token_secret,
+            DEFAULT_REGISTRATION_TOKEN_SECRET
+        );
+    }
+
+    #[test]
+    fn configured_registration_secret_is_preserved() {
+        let config = NodeGatewayConfig {
+            registration_token_secret: Some("independent-random-registration-secret".to_string()),
+            ..Default::default()
+        };
+
+        let resolved = NodeGatewayAppConfig::from_config(&config);
+
+        assert_eq!(
+            resolved.registration_token_secret,
+            "independent-random-registration-secret"
+        );
+    }
+
+    #[test]
+    fn configured_short_registration_secret_is_advisory() {
+        let config = NodeGatewayConfig {
+            registration_token_secret: Some("dev".to_string()),
+            ..Default::default()
+        };
+
+        let resolved = NodeGatewayAppConfig::from_config(&config);
+
+        assert_eq!(resolved.registration_token_secret, "dev");
     }
 }

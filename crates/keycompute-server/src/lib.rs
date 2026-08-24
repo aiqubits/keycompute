@@ -6,6 +6,7 @@
 pub mod error;
 pub mod extractors;
 pub mod handlers;
+mod lifecycle_metrics;
 pub mod middleware;
 pub mod payment_registry;
 pub mod providers;

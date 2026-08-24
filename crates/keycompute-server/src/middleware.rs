@@ -4,14 +4,14 @@
 
 use crate::{
     error::{ApiError, Result},
-    extractors::AuthExtractor,
+    extractors::{AuthExtractor, ClientRequestId, RequestId, RequestReceivedAt},
     state::AppState,
 };
 use axum::{
     body::{Body, to_bytes},
     extract::{Request, State},
     http::{
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
         header::{CONTENT_LENGTH, CONTENT_TYPE, SET_COOKIE},
     },
     middleware::Next,
@@ -155,11 +155,10 @@ pub async fn request_logger(req: Request, next: Next) -> Response {
 
     // 提前克隆 request_id，避免借用冲突
     let request_id = req
-        .headers()
-        .get("X-Request-ID")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+        .extensions()
+        .get::<RequestId>()
+        .map(|id| id.0.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
     info!(
         request_id = %request_id,
@@ -191,41 +190,61 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
+        .expose_headers([
+            HeaderName::from_static("x-request-id"),
+            HeaderName::from_static("x-client-request-id"),
+        ])
 }
 
-/// 追踪 ID 注入中间件
-pub async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
-    // 复用上游传入的请求 ID；缺失时生成一个带服务命名空间前缀的新 ID
-    let request_id = match req
+/// 请求身份与入口时间注入中间件
+pub async fn trace_id_middleware(
+    State(_state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let received_at = chrono::Utc::now();
+    let request_id = Uuid::new_v4();
+    let client_request_id = req
         .headers()
         .get("X-Request-ID")
-        .and_then(|h| h.to_str().ok())
-    {
-        Some(existing) => existing.to_owned(),
-        None => {
-            let id = new_request_id();
-            if let Ok(value) = id.parse() {
-                req.headers_mut().insert("X-Request-ID", value);
-            }
-            id
-        }
-    };
-
+        .and_then(|value| value.to_str().ok())
+        .and_then(validate_client_request_id);
+    if req.headers().contains_key("X-Request-ID") && client_request_id.is_none() {
+        keycompute_observability::metrics::CLIENT_REQUEST_ID_REJECTED_TOTAL.inc();
+        tracing::debug!("Rejected invalid client request ID");
+    }
+    req.extensions_mut().insert(RequestId(request_id));
+    req.extensions_mut().insert(RequestReceivedAt(received_at));
+    req.extensions_mut()
+        .insert(ClientRequestId(client_request_id.clone()));
     let mut response = next.run(req).await;
-    // 回写请求 ID 到响应头，便于客户端与服务端日志对账
-    if let Ok(value) = request_id.parse() {
-        response.headers_mut().insert("X-Request-ID", value);
+    let internal_value =
+        HeaderValue::from_str(&request_id.to_string()).expect("UUID is a valid header");
+    response
+        .headers_mut()
+        .insert("X-Request-ID", internal_value);
+    if let Some(client_request_id) =
+        client_request_id.and_then(|value| HeaderValue::from_str(&value).ok())
+    {
+        response
+            .headers_mut()
+            .insert("X-Client-Request-ID", client_request_id);
     }
     response
 }
 
-/// 生成请求 ID
-///
-/// 以包名前缀作为服务命名空间（如 keycompute-* → keyc），
-/// 便于多服务日志聚合时快速识别来源服务。
-fn new_request_id() -> String {
-    let ns = env!("CARGO_PKG_NAME").get(..4).unwrap_or("app");
-    format!("{ns}-{}", uuid::Uuid::new_v4())
+/// Validate the optional, untrusted client correlation identifier.
+pub fn validate_client_request_id(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 128
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(byte))
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 /// 构造服务不可用响应（503 Service Unavailable）
@@ -954,11 +973,93 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
+    async fn delayed_received_at_echo(RequestReceivedAt(received_at): RequestReceivedAt) -> String {
+        received_at.to_rfc3339()
+    }
+
+    async fn delay_after_ingress(req: axum::extract::Request, next: Next) -> Response {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        next.run(req).await
+    }
+
     #[tokio::test]
     async fn test_cors_layer() {
         let cors = cors_layer();
         // 确保可以创建 CORS 层
         let _ = cors;
+    }
+
+    #[test]
+    fn client_request_id_validation_is_strict_ascii() {
+        assert_eq!(
+            validate_client_request_id("client.abc_123:-"),
+            Some("client.abc_123:-".to_string())
+        );
+        assert_eq!(validate_client_request_id(""), None);
+        assert_eq!(validate_client_request_id("contains space"), None);
+        assert_eq!(validate_client_request_id("请求"), None);
+        assert_eq!(validate_client_request_id(&"x".repeat(129)), None);
+    }
+
+    #[tokio::test]
+    async fn response_returns_canonical_and_client_request_id_headers() {
+        let state = AppState::with_config(AppStateConfig::default());
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::NO_CONTENT }))
+            .layer(from_fn_with_state(state.clone(), trace_id_middleware))
+            .layer(cors_layer())
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("Origin", "https://client.example")
+                    .header("X-Request-ID", "client-id_123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let internal = response.headers()["X-Request-ID"].to_str().unwrap();
+        assert!(Uuid::parse_str(internal).is_ok());
+        assert_eq!(response.headers()["X-Client-Request-ID"], "client-id_123");
+        assert!(response.headers().get("X-KeyCompute-Request-ID").is_none());
+        let exposed = response.headers()["Access-Control-Expose-Headers"]
+            .to_str()
+            .unwrap()
+            .split(',')
+            .map(|header| header.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        assert!(exposed.iter().any(|header| header == "x-request-id"));
+        assert!(exposed.iter().any(|header| header == "x-client-request-id"));
+    }
+
+    #[tokio::test]
+    async fn trace_middleware_captures_received_at_before_downstream_work() {
+        let state = AppState::with_config(AppStateConfig::default());
+        let app = Router::new()
+            .route("/", get(delayed_received_at_echo))
+            .layer(from_fn(delay_after_ingress))
+            .layer(from_fn_with_state(state.clone(), trace_id_middleware))
+            .with_state(state);
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let completed_at = chrono::Utc::now();
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let received_at = chrono::DateTime::parse_from_rfc3339(
+            std::str::from_utf8(&body).expect("timestamp response is UTF-8"),
+        )
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+        assert!(
+            completed_at - received_at >= chrono::Duration::milliseconds(30),
+            "received_at must include time spent in downstream middleware"
+        );
     }
 
     #[tokio::test]

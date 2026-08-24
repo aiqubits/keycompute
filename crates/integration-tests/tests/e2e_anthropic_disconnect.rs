@@ -1,13 +1,13 @@
 //! Anthropic 流式路径客户端断开场景端到端测试。
 //!
-//! 验证：客户端在 message_start 之后、message_stop 之前断开时，primary 失败
-//! 不得再对 fallback 上游发起无意义的调用，且 usage log 仍以实际完成账号
-//! （无账号完成时回退 primary）、status=error 正确落库。
+//! 验证：客户端在 message_start 之后、message_stop 之前断开时，executor 会
+//! 立即取消 primary，不得再对 fallback 上游发起无意义的调用；usage log 仍以
+//! 实际完成账号（无账号完成时回退 primary）、status=error 正确落库。
 //!
 //! 背景：Anthropic 流式 handler 的后台结算任务持有 executor 的 receiver 直到
 //! Done/Error（保证计费完成），因此客户端断开不会触发 `tx.is_closed()`。
 //! handler 在 SSE 发送失败时通过 `ctx.mark_client_disconnected()` 显式传播断开，
-//! executor 据此在 primary 失败后中止 fallback 链。
+//! executor 据此取消活动上游并中止 fallback 链。
 
 use futures::StreamExt;
 use integration_tests::mocks::provider::MockProviderFactory;
@@ -23,17 +23,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 
-/// 发送 message_start（Raw）后等待外部触发才失败的 primary。
-///
-/// 用 Notify 精确控制失败时机：测试在模拟客户端断开（mark 标志）之后再触发
-/// 失败，确保 executor 检查断开标志时它已被置位，避免固定 sleep 的时序脆弱性。
+/// 发送 message_start（Raw）后保持挂起的 primary，用于验证断连会主动取消上游。
 #[derive(Debug)]
-struct MessageStartThenFailProvider {
-    fail: Arc<Notify>,
-}
+struct MessageStartThenPendingProvider;
 
 #[async_trait::async_trait]
-impl ProviderAdapter for MessageStartThenFailProvider {
+impl ProviderAdapter for MessageStartThenPendingProvider {
     fn name(&self) -> &'static str {
         "anthropic-primary"
     }
@@ -47,32 +42,27 @@ impl ProviderAdapter for MessageStartThenFailProvider {
         _transport: &dyn HttpTransport,
         _request: UpstreamRequest,
     ) -> keycompute_types::Result<StreamBox> {
-        let fail = Arc::clone(&self.fail);
         let stream = futures::stream::iter(vec![Ok(StreamEvent::raw(
             r#"{"kind":"anthropic_sse","event":"message_start","data":{"type":"message_start","message":{"id":"msg_test"}}}"#
                 .to_string(),
         ))])
-        .chain(futures::stream::once(async move {
-            fail.notified().await;
-            Err(KeyComputeError::ProviderError(
-                "connection reset before message_stop".into(),
-            ))
-        }));
+        .chain(futures::stream::pending());
         Ok(Box::pin(stream))
     }
 }
 
-/// 只发送 ping（不提交可继续的消息）后等待外部触发才失败的 primary。
+/// 只发送 ping（不提交可继续的消息）后等待外部触发，再由 Provider 明确
+/// 宣告失败的 primary。
 ///
 /// ping 不满足 `raw_event_commits_response`，`sent_content` 保持 false：
 /// 这是客户端断开标志需要独立发挥作用的场景（客户端在线时 fallback 合法）。
 #[derive(Debug)]
-struct PingThenFailProvider {
+struct PingThenDeclaredErrorProvider {
     fail: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
-impl ProviderAdapter for PingThenFailProvider {
+impl ProviderAdapter for PingThenDeclaredErrorProvider {
     fn name(&self) -> &'static str {
         "anthropic-primary"
     }
@@ -92,8 +82,8 @@ impl ProviderAdapter for PingThenFailProvider {
         ))])
         .chain(futures::stream::once(async move {
             fail.notified().await;
-            Err(KeyComputeError::ProviderError(
-                "connection reset after ping".into(),
+            Ok(StreamEvent::error(
+                "provider explicitly rejected the request",
             ))
         }));
         Ok(Box::pin(stream))
@@ -132,13 +122,10 @@ impl ProviderAdapter for CountingFailProvider {
 #[tokio::test]
 async fn anthropic_stream_disconnect_aborts_fallback_and_billing_stays_on_primary() {
     let fallback_calls = Arc::new(AtomicUsize::new(0));
-    let fail = Arc::new(Notify::new());
     let mut providers = std::collections::HashMap::new();
     providers.insert(
         "anthropic".to_string(),
-        Arc::new(MessageStartThenFailProvider {
-            fail: Arc::clone(&fail),
-        }) as Arc<dyn ProviderAdapter>,
+        Arc::new(MessageStartThenPendingProvider) as Arc<dyn ProviderAdapter>,
     );
     providers.insert(
         "fallback".to_string(),
@@ -146,9 +133,16 @@ async fn anthropic_stream_disconnect_aborts_fallback_and_billing_stays_on_primar
             calls: Arc::clone(&fallback_calls),
         }) as Arc<dyn ProviderAdapter>,
     );
-    let executor = GatewayExecutor::new(GatewayConfig::default(), providers);
+    let executor = GatewayExecutor::new(
+        GatewayConfig {
+            max_retries: 0,
+            ..GatewayConfig::default()
+        },
+        providers,
+    );
 
     let ctx = Arc::new(RequestContext::new(
+        uuid::Uuid::new_v4(),
         uuid::Uuid::new_v4(),
         uuid::Uuid::new_v4(),
         uuid::Uuid::new_v4(),
@@ -194,17 +188,15 @@ async fn anthropic_stream_disconnect_aborts_fallback_and_billing_stays_on_primar
     // 2. 客户端断开：handler 检测到 SSE 发送失败后显式标记断开
     ctx.mark_client_disconnected();
 
-    // 3. 触发 primary 失败（message_stop 之前断流）
-    fail.notify_one();
-
-    // 4. executor 必须中止 fallback 链并向 handler 上报 Error，而不是调用 fallback
+    // 3. executor 必须立即取消尚未 message_stop 的 primary，中止 fallback 链，
+    // 并向 handler 上报明确的断连终态。
     let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("executor should terminate the stream")
         .expect("channel should stay open until the terminal error");
     assert!(
-        matches!(second, StreamEvent::Error { message } if message.contains("connection reset")),
-        "handler should observe an error, not a fallback response"
+        matches!(second, StreamEvent::Error { message } if message.contains("client disconnected")),
+        "handler should observe the disconnect error, not a fallback response"
     );
     // 终止事件之后 channel 关闭（后台任务结束）
     assert!(
@@ -255,7 +247,7 @@ async fn anthropic_stream_ping_disconnect_aborts_fallback_via_disconnect_flag() 
     let mut providers = std::collections::HashMap::new();
     providers.insert(
         "anthropic".to_string(),
-        Arc::new(PingThenFailProvider {
+        Arc::new(PingThenDeclaredErrorProvider {
             fail: Arc::clone(&fail),
         }) as Arc<dyn ProviderAdapter>,
     );
@@ -265,9 +257,16 @@ async fn anthropic_stream_ping_disconnect_aborts_fallback_via_disconnect_flag() 
             calls: Arc::clone(&fallback_calls),
         }) as Arc<dyn ProviderAdapter>,
     );
-    let executor = GatewayExecutor::new(GatewayConfig::default(), providers);
+    let executor = GatewayExecutor::new(
+        GatewayConfig {
+            max_retries: 0,
+            ..GatewayConfig::default()
+        },
+        providers,
+    );
 
     let ctx = Arc::new(RequestContext::new(
+        uuid::Uuid::new_v4(),
         uuid::Uuid::new_v4(),
         uuid::Uuid::new_v4(),
         uuid::Uuid::new_v4(),
@@ -299,14 +298,13 @@ async fn anthropic_stream_ping_disconnect_aborts_fallback_via_disconnect_flag() 
         .await
         .expect("execute should return receiver");
 
-    // 客户端已收到 ping（keepalive，不提交消息），随后断开并触发 primary 失败
+    // 客户端已收到 ping（keepalive，不提交消息），随后断开
     let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("ping should arrive")
         .expect("channel open");
     assert!(matches!(first, StreamEvent::Raw { data } if data.contains("ping")));
     ctx.mark_client_disconnected();
-    fail.notify_one();
 
     // 没有断开标志时 fallback 是合法的（sent_content=false）；断开标志必须阻止它
     let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -314,7 +312,7 @@ async fn anthropic_stream_ping_disconnect_aborts_fallback_via_disconnect_flag() 
         .expect("executor should terminate with an error")
         .expect("channel open until the terminal error");
     assert!(
-        matches!(second, StreamEvent::Error { message } if message.contains("connection reset")),
+        matches!(second, StreamEvent::Error { message } if message.contains("client disconnected")),
         "disconnect flag must abort fallback and surface an error"
     );
     assert_eq!(
@@ -333,7 +331,7 @@ async fn anthropic_stream_fallback_still_works_when_client_stays_connected() {
     let mut providers = std::collections::HashMap::new();
     providers.insert(
         "anthropic".to_string(),
-        Arc::new(PingThenFailProvider {
+        Arc::new(PingThenDeclaredErrorProvider {
             fail: Arc::clone(&fail),
         }) as Arc<dyn ProviderAdapter>,
     );
@@ -341,9 +339,16 @@ async fn anthropic_stream_fallback_still_works_when_client_stays_connected() {
         "openai".to_string(),
         Arc::new(MockProviderFactory::create_openai()) as Arc<dyn ProviderAdapter>,
     );
-    let executor = GatewayExecutor::new(GatewayConfig::default(), providers);
+    let executor = GatewayExecutor::new(
+        GatewayConfig {
+            max_retries: 0,
+            ..GatewayConfig::default()
+        },
+        providers,
+    );
 
     let ctx = Arc::new(RequestContext::new(
+        uuid::Uuid::new_v4(),
         uuid::Uuid::new_v4(),
         uuid::Uuid::new_v4(),
         uuid::Uuid::new_v4(),
@@ -376,7 +381,8 @@ async fn anthropic_stream_fallback_still_works_when_client_stays_connected() {
         .await
         .expect("execute should return receiver");
 
-    // ping 之后触发 primary 失败：客户端在线，fallback 合法
+    // ping 之后触发 Provider 明确失败：客户端在线，fallback 合法。连接重置、
+    // malformed SSE 或缺失 message_stop 属于结果不确定，不得作为这个对照组。
     let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("ping should arrive")

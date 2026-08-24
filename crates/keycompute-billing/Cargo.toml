@@ -8,10 +8,11 @@ keycompute-types = { workspace = true }
 keycompute-db = { workspace = true }
 keycompute-distribution = { workspace = true }
 keycompute-config = { workspace = true }
+keycompute-observability = { workspace = true }
 async-trait = "0.1"
 bigdecimal = { version = "0.4", features = ["serde"] }
 sea-orm = { workspace = true }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = "1.35"

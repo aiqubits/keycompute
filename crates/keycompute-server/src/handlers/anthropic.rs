@@ -5,7 +5,7 @@
 
 use crate::{
     error::{ApiError, Result},
-    extractors::{AuthExtractor, RequestId},
+    extractors::{AuthExtractor, ClientRequestId, RequestId, RequestReceivedAt},
     state::AppState,
 };
 use axum::{
@@ -19,7 +19,11 @@ use axum::{
 };
 use futures::{Stream, StreamExt};
 use keycompute_auth::Permission;
-use keycompute_types::{ExecutionTarget, Message, MessageContent, MessageRole, RequestContext};
+use keycompute_types::{
+    ClientResponseOutcome, ErrorOrigin, ExecutionTarget, Message, MessageContent, MessageRole,
+    NoopRequestLifecycleRecorder, RequestContext, RequestLifecycleRecorder, RequestStatus,
+    RequestTraceStart, RouteType, TraceErrorCategory,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{convert::Infallible, sync::Arc, time::Duration};
@@ -128,23 +132,93 @@ impl AnthropicMessagesRequest {
     }
 }
 
+async fn finish_anthropic_unexecuted_trace(
+    guard: &mut super::PreExecutionTraceGuard,
+    origin: ErrorOrigin,
+    category: TraceErrorCategory,
+    code: &str,
+) {
+    guard.finish_failed(origin, category, code).await;
+}
+
 /// POST /v1/messages
 pub async fn messages(
     State(state): State<AppState>,
     auth: AuthExtractor,
     request_id: RequestId,
+    client_request_id: ClientRequestId,
+    received_at: RequestReceivedAt,
     headers: HeaderMap,
     Json(request): Json<AnthropicMessagesRequest>,
 ) -> Result<axum::response::Response> {
-    require_messages_api_permission(&auth)?;
-    request.validate()?;
-    validate_anthropic_headers(&headers)?;
+    let mut lifecycle: Arc<dyn RequestLifecycleRecorder> = Arc::clone(&state.lifecycle);
+    let mut pre_execution_guard =
+        super::PreExecutionTraceGuard::new(Arc::clone(&lifecycle), request_id.0);
+    if let Err(error) = lifecycle
+        .start_request(RequestTraceStart {
+            request_id: request_id.0,
+            client_request_id: client_request_id.0,
+            tenant_id: auth.tenant_id,
+            user_id: auth.user_id,
+            produce_ai_key_id: auth.produce_ai_key_id,
+            protocol: "anthropic".to_string(),
+            request_path: "/v1/messages".to_string(),
+            requested_model: request.model.clone(),
+            is_stream: request.stream,
+            received_at: received_at.0,
+        })
+        .await
+    {
+        tracing::warn!(request_id=%request_id.0, %error, "request tracing disabled for this request");
+        pre_execution_guard.disarm();
+        lifecycle = Arc::new(NoopRequestLifecycleRecorder);
+        pre_execution_guard =
+            super::PreExecutionTraceGuard::new(Arc::clone(&lifecycle), request_id.0);
+    }
+    if let Err(error) = require_messages_api_permission(&auth) {
+        finish_anthropic_unexecuted_trace(
+            &mut pre_execution_guard,
+            ErrorOrigin::Client,
+            TraceErrorCategory::Authorization,
+            "permission_denied",
+        )
+        .await;
+        return Err(error);
+    }
+    if let Err(error) = request.validate() {
+        finish_anthropic_unexecuted_trace(
+            &mut pre_execution_guard,
+            ErrorOrigin::Client,
+            TraceErrorCategory::InvalidRequest,
+            "invalid_request",
+        )
+        .await;
+        return Err(error);
+    }
+    if let Err(error) = validate_anthropic_headers(&headers) {
+        finish_anthropic_unexecuted_trace(
+            &mut pre_execution_guard,
+            ErrorOrigin::Client,
+            TraceErrorCategory::InvalidRequest,
+            "invalid_anthropic_headers",
+        )
+        .await;
+        return Err(error);
+    }
 
-    if let Some(balance_service) = state.billing.balance_service() {
-        balance_service
+    if let Some(balance_service) = state.billing.balance_service()
+        && let Err(error) = balance_service
             .check_balance_for_tenant(auth.user_id, auth.tenant_id)
             .await
-            .map_err(ApiError::from)?;
+    {
+        finish_anthropic_unexecuted_trace(
+            &mut pre_execution_guard,
+            ErrorOrigin::Client,
+            TraceErrorCategory::Balance,
+            "insufficient_balance",
+        )
+        .await;
+        return Err(ApiError::from(error));
     }
 
     // 在将反序列化请求转为原生 JSON 前提取轻量路由字段。若同时保留两种
@@ -157,20 +231,46 @@ pub async fn messages(
     let context_messages = request.context_messages();
 
     let provider = keycompute_pricing::resolve_pricing_provider(&model);
-    let pricing = state
+    let pricing = match state
         .pricing
         .create_snapshot(&model, &auth.tenant_id, Some(provider))
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to create pricing snapshot: {e}")))?;
+    {
+        Ok(pricing) => pricing,
+        Err(error) => {
+            finish_anthropic_unexecuted_trace(
+                &mut pre_execution_guard,
+                ErrorOrigin::Gateway,
+                TraceErrorCategory::Internal,
+                "pricing_failed",
+            )
+            .await;
+            return Err(ApiError::Internal(format!(
+                "Failed to create pricing snapshot: {error}"
+            )));
+        }
+    };
 
-    let native_anthropic_request =
-        Arc::new(serde_json::to_value(request).map_err(|e| {
-            ApiError::Internal(format!("Failed to serialize Messages request: {e}"))
-        })?);
+    let native_anthropic_request = match serde_json::to_value(request) {
+        Ok(request) => Arc::new(request),
+        Err(error) => {
+            finish_anthropic_unexecuted_trace(
+                &mut pre_execution_guard,
+                ErrorOrigin::Gateway,
+                TraceErrorCategory::Internal,
+                "request_serialization_failed",
+            )
+            .await;
+            return Err(ApiError::Internal(format!(
+                "Failed to serialize Messages request: {error}"
+            )));
+        }
+    };
     // 注意内存特征：32 MiB 上限的 body 在反序列化（Json 提取器）与
     // to_value 之间各持有一份 Value，峰值约为 body 的 2~3 倍。上限是有意
     // 设定的（多模态内联块），但不要在下游再复制整个请求体；仅 Arc 共享。
     let mut request_ctx = RequestContext::new(
+        request_id.0,
         auth.user_id,
         auth.tenant_id,
         auth.produce_ai_key_id,
@@ -186,11 +286,19 @@ pub async fn messages(
     request_ctx.native_anthropic_headers = forwarded_anthropic_headers(&headers);
     let mut ctx = Arc::new(request_ctx);
 
-    let mut plan = state
-        .routing
-        .route(&ctx)
-        .await
-        .map_err(|e| crate::error::map_routing_error(e, "anthropic"))?;
+    let mut plan = match state.routing.route(&ctx).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            finish_anthropic_unexecuted_trace(
+                &mut pre_execution_guard,
+                ErrorOrigin::Gateway,
+                TraceErrorCategory::Internal,
+                "routing_failed",
+            )
+            .await;
+            return Err(crate::error::map_routing_error(error, "anthropic"));
+        }
+    };
 
     let (primary_provider, primary_account_id) = match &plan.primary {
         ExecutionTarget::ProviderAccount {
@@ -199,12 +307,26 @@ pub async fn messages(
             ..
         } if provider.eq_ignore_ascii_case("anthropic") => (provider.clone(), *account_id),
         ExecutionTarget::ProviderAccount { .. } => {
+            finish_anthropic_unexecuted_trace(
+                &mut pre_execution_guard,
+                ErrorOrigin::Gateway,
+                TraceErrorCategory::InvalidRequest,
+                "incompatible_provider_route",
+            )
+            .await;
             return Err(ApiError::BadRequest(format!(
                 "Model {} is not available through an Anthropic-compatible provider",
                 model
             )));
         }
         ExecutionTarget::Node { .. } => {
+            finish_anthropic_unexecuted_trace(
+                &mut pre_execution_guard,
+                ErrorOrigin::Gateway,
+                TraceErrorCategory::InvalidRequest,
+                "unsupported_node_route",
+            )
+            .await;
             return Err(ApiError::BadRequest(
                 "Anthropic Messages ingress cannot be routed to a node".to_string(),
             ));
@@ -216,28 +338,51 @@ pub async fn messages(
         target,
         ExecutionTarget::ProviderAccount { provider, .. } if provider.eq_ignore_ascii_case("anthropic")
     ));
+    if let Err(error) = lifecycle
+        .set_route(
+            request_id.0,
+            RouteType::ProviderAccount,
+            RequestStatus::Routing,
+        )
+        .await
+    {
+        tracing::warn!(request_id=%request_id.0, %error, "failed to record request route");
+    }
     state
         .pricing
         .update_context_pricing(Arc::make_mut(&mut ctx), &primary_provider)
         .await;
 
     let timeout_duration = std::time::Duration::from_secs(state.gateway_config.timeout_secs);
+    let mut client_response_guard =
+        super::ClientResponseGuard::new(Arc::clone(&lifecycle), Arc::clone(&ctx));
+    pre_execution_guard.disarm();
     // execute 会立即返回 receiver（后台任务持有上游连接），因此该 timeout 只
     // 防护“建立执行链”阶段的异常阻塞，不覆盖流式消费生命周期；流式超时由
     // executor 内部的 exec_timeout（同源 timeout_secs）负责。
     let rx = match tokio::time::timeout(
         timeout_duration,
-        state.gateway.execute(
+        state.gateway.execute_with_recorder(
             Arc::clone(&ctx),
             plan,
             Arc::clone(&state.account_states),
             Some(Arc::clone(&state.provider_health)),
+            Arc::clone(&lifecycle),
         ),
     )
     .await
     {
-        Ok(result) => result.map_err(crate::error::map_execution_error)?,
+        Ok(Ok(rx)) => rx,
+        Ok(Err(error)) => {
+            client_response_guard
+                .finish_with_outcome(ClientResponseOutcome::ResponseFailed)
+                .await;
+            return Err(crate::error::map_execution_error(error));
+        }
         Err(_) => {
+            client_response_guard
+                .finish_with_outcome(ClientResponseOutcome::TimedOut)
+                .await;
             return Err(ApiError::Internal(format!(
                 "Gateway execute timeout after {}s",
                 state.gateway_config.timeout_secs
@@ -255,18 +400,29 @@ pub async fn messages(
 
     let billing = Arc::clone(&state.billing);
     if stream {
-        Ok(Sse::new(create_anthropic_stream(
+        let stream = create_anthropic_stream_with_lifecycle(
             rx,
             ctx,
             primary_provider,
             primary_account_id,
             billing,
-        ))
-        .into_response())
+            Arc::clone(&lifecycle),
+        );
+        client_response_guard.disarm();
+        Ok(Sse::new(stream).into_response())
     } else {
-        let response =
-            create_anthropic_response(rx, ctx, primary_provider, primary_account_id, billing)
-                .await?;
+        // The nested response helper installs its own guard before its first
+        // await, so ownership transfers without a cancellation gap.
+        client_response_guard.disarm();
+        let response = create_anthropic_response_with_lifecycle(
+            rx,
+            ctx,
+            primary_provider,
+            primary_account_id,
+            billing,
+            Arc::clone(&lifecycle),
+        )
+        .await?;
         Ok(Json(response).into_response())
     }
 }
@@ -284,74 +440,149 @@ fn require_messages_api_permission(auth: &AuthExtractor) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 async fn create_anthropic_response(
-    mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
+    rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
     ctx: Arc<RequestContext>,
     provider_name: String,
     account_id: uuid::Uuid,
     billing: Arc<keycompute_billing::BillingService>,
 ) -> Result<Value> {
-    let mut complete = false;
-    let mut native_response = None;
-    let mut status = "success";
+    create_anthropic_response_with_lifecycle(
+        rx,
+        ctx,
+        provider_name,
+        account_id,
+        billing,
+        Arc::new(keycompute_types::NoopRequestLifecycleRecorder),
+    )
+    .await
+}
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            llm_protocol_provider::StreamEvent::Raw { data } => {
-                if let Some(body) = raw_message_body(&data) {
-                    native_response = Some(body);
+async fn create_anthropic_response_with_lifecycle(
+    mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
+    ctx: Arc<RequestContext>,
+    provider_name: String,
+    account_id: uuid::Uuid,
+    billing: Arc<keycompute_billing::BillingService>,
+    lifecycle: Arc<dyn keycompute_types::RequestLifecycleRecorder>,
+) -> Result<Value> {
+    let mut client_response_guard =
+        super::ClientResponseGuard::new(Arc::clone(&lifecycle), Arc::clone(&ctx));
+    let (mut response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let worker_ctx = Arc::clone(&ctx);
+    tokio::spawn(async move {
+        let mut complete = false;
+        let mut native_response = None;
+        let mut status = "success";
+        let mut handler_connected = true;
+        let mut terminal_error = None;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = response_tx.closed(), if handler_connected => {
+                    handler_connected = false;
+                    worker_ctx.mark_client_disconnected();
+                }
+                event = rx.recv() => {
+                    let Some(event) = event else { break };
+                    match event {
+                        llm_protocol_provider::StreamEvent::Raw { data } => {
+                            if let Some(body) = raw_message_body(&data) {
+                                native_response = Some(body);
+                            }
+                        }
+                        llm_protocol_provider::StreamEvent::Done => {
+                            complete = true;
+                            break;
+                        }
+                        llm_protocol_provider::StreamEvent::Error { message } => {
+                            status = "error";
+                            tracing::warn!(request_id = %worker_ctx.request_id, error = %message, "Anthropic upstream request failed");
+                            terminal_error = Some(ApiError::Provider(
+                                "Upstream request failed".to_string(),
+                            ));
+                            break;
+                        }
+                        // 原生非流式路径由 Raw(anthropic_message) 承载完整响应体，不产生
+                        // Delta；Usage/InputUsage 已由 executor 写入 ctx 用于计费。
+                        llm_protocol_provider::StreamEvent::Delta { .. }
+                        | llm_protocol_provider::StreamEvent::Usage { .. }
+                        | llm_protocol_provider::StreamEvent::InputUsage { .. } => {}
+                    }
                 }
             }
-            llm_protocol_provider::StreamEvent::Done => {
-                complete = true;
-                break;
-            }
-            llm_protocol_provider::StreamEvent::Error { message } => {
-                status = "error";
-                finalize_anthropic_billing_logged(
-                    &billing,
-                    &ctx,
-                    &provider_name,
-                    account_id,
-                    status,
-                )
-                .await;
-                tracing::warn!(request_id = %ctx.request_id, error = %message, "Anthropic upstream request failed");
-                return Err(ApiError::Provider("Upstream request failed".to_string()));
-            }
-            // 原生非流式路径由 Raw(anthropic_message) 承载完整响应体，不产生
-            // Delta；Usage/InputUsage 已由 executor 写入 ctx 用于计费。
-            llm_protocol_provider::StreamEvent::Delta { .. }
-            | llm_protocol_provider::StreamEvent::Usage { .. }
-            | llm_protocol_provider::StreamEvent::InputUsage { .. } => {}
         }
-    }
 
-    if !complete {
-        status = "incomplete";
-        finalize_anthropic_billing_logged(&billing, &ctx, &provider_name, account_id, status).await;
-        return Err(ApiError::Internal(
-            "Stream ended unexpectedly: channel closed without Done event".to_string(),
-        ));
-    }
+        if terminal_error.is_none() && !complete {
+            status = "incomplete";
+            terminal_error = Some(ApiError::Internal(
+                "Stream ended unexpectedly: channel closed without Done event".to_string(),
+            ));
+        }
+        if terminal_error.is_none() && native_response.is_none() {
+            status = "incomplete";
+            tracing::error!(
+                request_id = %worker_ctx.request_id,
+                "Anthropic stream completed without a native message body"
+            );
+            terminal_error = Some(ApiError::Internal(
+                "Anthropic response body missing after stream completion".to_string(),
+            ));
+        }
 
-    // 流已完整结束但原生响应体缺失（Raw 事件未到达，正常路径不会发生）：
-    // 不得向客户端返回空 content 的 200（静默空成功会误导 SDK 与计费），
-    // 以内部错误结束并按 incomplete 落库，避免未交付的响应按成功计费。
-    let Some(native_response) = native_response else {
-        status = "incomplete";
-        finalize_anthropic_billing_logged(&billing, &ctx, &provider_name, account_id, status).await;
-        tracing::error!(
-            request_id = %ctx.request_id,
-            "Anthropic stream completed without a native message body"
-        );
-        return Err(ApiError::Internal(
-            "Anthropic response body missing after stream completion".to_string(),
-        ));
+        finalize_anthropic_billing_logged(
+            &billing,
+            &worker_ctx,
+            &provider_name,
+            account_id,
+            status,
+        )
+        .await;
+        let result = match (terminal_error, native_response) {
+            (Some(error), _) => Err(error),
+            (None, Some(response)) => Ok(response),
+            (None, None) => Err(ApiError::Internal(
+                "Anthropic response validation state was inconsistent".to_string(),
+            )),
+        };
+        if handler_connected && response_tx.send(result).is_err() {
+            worker_ctx.mark_client_disconnected();
+        }
+    });
+
+    let response = match response_rx.await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            super::finish_client_response_trace(
+                &lifecycle,
+                &ctx,
+                ClientResponseOutcome::ResponseFailed,
+            )
+            .await;
+            client_response_guard.disarm();
+            return Err(error);
+        }
+        Err(_) => {
+            super::finish_client_response_trace(
+                &lifecycle,
+                &ctx,
+                ClientResponseOutcome::ResponseFailed,
+            )
+            .await;
+            client_response_guard.disarm();
+            return Err(ApiError::Internal(
+                "Non-streaming Anthropic response worker stopped unexpectedly".to_string(),
+            ));
+        }
     };
-
-    finalize_anthropic_billing_logged(&billing, &ctx, &provider_name, account_id, status).await;
-    Ok(native_response)
+    if let Err(error) = super::record_final_client_first_content(&lifecycle, ctx.request_id).await {
+        tracing::warn!(request_id = %ctx.request_id, %error, "failed to record client first content");
+    }
+    super::finish_client_response_trace(&lifecycle, &ctx, ClientResponseOutcome::Succeeded).await;
+    client_response_guard.disarm();
+    Ok(response)
 }
 
 /// SSE 转发超时：客户端保持连接但停止读取时（TCP backpressure 或代理不消费），
@@ -368,9 +599,9 @@ async fn forward_sse_event(
     ctx: &RequestContext,
     client_connected: &mut bool,
     event: Event,
-) {
+) -> bool {
     if !*client_connected {
-        return;
+        return false;
     }
     let sent = tokio::time::timeout(SSE_SEND_TIMEOUT, sse_tx.send(event))
         .await
@@ -380,6 +611,7 @@ async fn forward_sse_event(
         *client_connected = false;
         ctx.mark_client_disconnected();
     }
+    sent
 }
 
 /// Anthropic Errors schema 的 SSE 错误帧：对客户端只暴露通用文本。
@@ -393,12 +625,31 @@ fn anthropic_error_event(message: &str) -> Event {
     )
 }
 
+#[cfg(test)]
 fn create_anthropic_stream(
+    rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
+    ctx: Arc<RequestContext>,
+    provider_name: String,
+    account_id: uuid::Uuid,
+    billing: Arc<keycompute_billing::BillingService>,
+) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
+    create_anthropic_stream_with_lifecycle(
+        rx,
+        ctx,
+        provider_name,
+        account_id,
+        billing,
+        Arc::new(keycompute_types::NoopRequestLifecycleRecorder),
+    )
+}
+
+fn create_anthropic_stream_with_lifecycle(
     mut rx: tokio::sync::mpsc::Receiver<llm_protocol_provider::StreamEvent>,
     ctx: Arc<RequestContext>,
     provider_name: String,
     account_id: uuid::Uuid,
     billing: Arc<keycompute_billing::BillingService>,
+    lifecycle: Arc<dyn keycompute_types::RequestLifecycleRecorder>,
 ) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
     let (sse_tx, sse_rx) = mpsc::channel(100);
 
@@ -408,6 +659,7 @@ fn create_anthropic_stream(
         let mut completed = false;
         let mut status = "success";
         let mut client_connected = true;
+        let mut client_first_content_recorded = false;
 
         loop {
             // 客户端断开时 SSE 的 receiver 被 drop，sse_tx 的 channel 随即关闭。
@@ -433,13 +685,38 @@ fn create_anthropic_stream(
                                 {
                                     continue;
                                 }
-                                forward_sse_event(
+                                let commits_response =
+                                    raw_sse_event_commits_response(&event_name, &body);
+                                let completes_response =
+                                    raw_sse_event_completes_response(&event_name, &body);
+                                let sent = forward_sse_event(
                                     &sse_tx,
                                     &ctx,
                                     &mut client_connected,
                                     Event::default().event(event_name).data(body.to_string()),
                                 )
                                 .await;
+                                if sent && commits_response && !client_first_content_recorded
+                                {
+                                    if let Err(error) = lifecycle
+                                        .record_client_first_content(ctx.request_id, chrono::Utc::now())
+                                        .await
+                                    {
+                                        tracing::warn!(request_id = %ctx.request_id, %error, "failed to record client first content");
+                                    }
+                                    client_first_content_recorded = true;
+                                }
+                                // `message_stop` is the client-visible terminal
+                                // frame. Some SDKs close the SSE body as soon as
+                                // they consume it, before the executor's
+                                // normalized Done reaches this worker. Record
+                                // success in the shared context now so that an
+                                // expected close is not misclassified as a
+                                // disconnect. The request trace remains open
+                                // until normalized Done completes billing.
+                                if sent && completes_response {
+                                    ctx.mark_client_response_succeeded();
+                                }
                             }
                         }
                         llm_protocol_provider::StreamEvent::Done => {
@@ -450,6 +727,12 @@ fn create_anthropic_stream(
                                 &provider_name,
                                 account_id,
                                 status,
+                            )
+                            .await;
+                            super::finish_client_response_trace(
+                                &lifecycle,
+                                &ctx,
+                                ClientResponseOutcome::Succeeded,
                             )
                             .await;
                             break;
@@ -466,11 +749,17 @@ fn create_anthropic_stream(
                             )
                             .await;
                             tracing::warn!(request_id = %ctx.request_id, error = %message, "Anthropic upstream stream failed");
-                            forward_sse_event(
+                            let _ = forward_sse_event(
                                 &sse_tx,
                                 &ctx,
                                 &mut client_connected,
                                 anthropic_error_event("Upstream request failed"),
+                            )
+                            .await;
+                            super::finish_client_response_trace(
+                                &lifecycle,
+                                &ctx,
+                                ClientResponseOutcome::ResponseFailed,
                             )
                             .await;
                             break;
@@ -489,11 +778,17 @@ fn create_anthropic_stream(
             status = "incomplete";
             finalize_anthropic_billing_logged(&billing, &ctx, &provider_name, account_id, status)
                 .await;
-            forward_sse_event(
+            let _ = forward_sse_event(
                 &sse_tx,
                 &ctx,
                 &mut client_connected,
                 anthropic_error_event("Upstream stream ended before message_stop"),
+            )
+            .await;
+            super::finish_client_response_trace(
+                &lifecycle,
+                &ctx,
+                ClientResponseOutcome::ResponseFailed,
             )
             .await;
         }
@@ -551,6 +846,18 @@ fn raw_sse_event(data: &str) -> Option<(String, Value)> {
         envelope.get("event")?.as_str()?.to_string(),
         envelope.get("data")?.clone(),
     ))
+}
+
+/// Keep client TTFT semantics aligned with the executor: pings and error
+/// envelopes do not begin a response, while all other raw Anthropic events do.
+fn raw_sse_event_commits_response(event_name: &str, body: &Value) -> bool {
+    event_name != "ping"
+        && event_name != "error"
+        && body.get("type").and_then(Value::as_str) != Some("error")
+}
+
+fn raw_sse_event_completes_response(event_name: &str, body: &Value) -> bool {
+    event_name == "message_stop" || body.get("type").and_then(Value::as_str) == Some("message_stop")
 }
 
 fn value_text(value: &Value) -> String {
@@ -639,6 +946,45 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[tokio::test]
+    async fn messages_trace_preserves_ingress_received_at() {
+        let received_at = chrono::DateTime::parse_from_rfc3339("2025-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let mut state = AppState::with_config(crate::state::AppStateConfig::default());
+        state.lifecycle = Arc::clone(&recorder) as Arc<dyn RequestLifecycleRecorder>;
+        let auth = AuthExtractor::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "user",
+        );
+        let request = serde_json::from_value(json!({
+            "model": "claude-test",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let result = messages(
+            State(state),
+            auth,
+            RequestId::new(),
+            ClientRequestId(None),
+            RequestReceivedAt(received_at),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::Forbidden(_))));
+        let starts = recorder.request_starts();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].protocol, "anthropic");
+        assert_eq!(starts[0].received_at, received_at);
+    }
+
     #[test]
     fn preserves_tools_and_cache_control_in_serialized_body() {
         let request: AnthropicMessagesRequest = serde_json::from_value(json!({
@@ -677,6 +1023,30 @@ mod tests {
         })
         .to_string();
         assert_eq!(raw_sse_event(&data).unwrap().0, "message_start");
+    }
+
+    #[test]
+    fn pings_do_not_commit_client_first_content() {
+        assert!(!raw_sse_event_commits_response(
+            "ping",
+            &json!({"type": "ping"})
+        ));
+        assert!(!raw_sse_event_commits_response(
+            "error",
+            &json!({"type": "error"})
+        ));
+        assert!(raw_sse_event_commits_response(
+            "message_start",
+            &json!({"type": "message_start"})
+        ));
+        assert!(raw_sse_event_completes_response(
+            "message_stop",
+            &json!({"type": "message_stop"})
+        ));
+        assert!(!raw_sse_event_completes_response(
+            "message_delta",
+            &json!({"type": "message_delta"})
+        ));
     }
 
     #[test]
@@ -791,6 +1161,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
             "claude-test",
             Vec::new(),
             true,
@@ -846,6 +1217,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
             "claude-test",
             Vec::new(),
             true,
@@ -876,6 +1248,7 @@ mod tests {
         // 账号完成请求，结算必须回退 primary 账号（失败尝试的确定性归属）。
         let (tx, rx) = mpsc::channel(4);
         let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
@@ -944,6 +1317,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_sse_send_does_not_record_client_first_content() {
+        let (tx, rx) = mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "claude-test",
+            Vec::new(),
+            true,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let stream = create_anthropic_stream_with_lifecycle(
+            rx,
+            Arc::clone(&ctx),
+            "anthropic".to_string(),
+            uuid::Uuid::new_v4(),
+            Arc::new(keycompute_billing::BillingService::new()),
+            Arc::clone(&recorder) as Arc<dyn keycompute_types::RequestLifecycleRecorder>,
+        );
+        drop(stream);
+
+        tx.send(llm_protocol_provider::StreamEvent::raw(
+            json!({
+                "kind": "anthropic_sse",
+                "event": "message_start",
+                "data": {"type": "message_start"}
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(llm_protocol_provider::StreamEvent::Done)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), tx.closed())
+            .await
+            .expect("worker should drain and stop after the disconnected send");
+
+        assert!(ctx.is_client_disconnected());
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(keycompute_types::ClientResponseOutcome::ClientDisconnected)
+        );
+        assert_eq!(recorder.request_finishes().len(), 1);
+        assert_eq!(
+            recorder.request_finishes()[0].status,
+            keycompute_types::RequestStatus::Cancelled
+        );
+        assert!(
+            recorder
+                .events()
+                .iter()
+                .all(|event| !event.starts_with("client_first_content:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_after_message_stop_keeps_the_response_successful() {
+        let (tx, rx) = mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "claude-test",
+            Vec::new(),
+            true,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
+        let mut stream = Box::pin(create_anthropic_stream_with_lifecycle(
+            rx,
+            Arc::clone(&ctx),
+            "anthropic".to_string(),
+            uuid::Uuid::new_v4(),
+            Arc::new(keycompute_billing::BillingService::new()),
+            Arc::clone(&recorder) as Arc<dyn keycompute_types::RequestLifecycleRecorder>,
+        ));
+
+        tx.send(llm_protocol_provider::StreamEvent::raw(
+            json!({
+                "kind": "anthropic_sse",
+                "event": "message_stop",
+                "data": {"type": "message_stop"}
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("message_stop should be forwarded")
+            .expect("the SSE stream should contain message_stop")
+            .expect("forwarded SSE events are infallible");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ctx.client_response_outcome()
+                != Some(keycompute_types::ClientResponseOutcome::Succeeded)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("message_stop should commit the client response outcome");
+
+        // A compliant SDK may stop polling immediately after the terminal
+        // protocol event, before the internal normalized Done is consumed.
+        // That expected close must not cancel the upstream consumer: Done is
+        // still required to finish billing and persist the successful trace.
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert!(!ctx.is_client_disconnected());
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(keycompute_types::ClientResponseOutcome::Succeeded),
+            "a close after the terminal frame must not overwrite success"
+        );
+
+        tx.send(llm_protocol_provider::StreamEvent::Done)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), tx.closed())
+            .await
+            .expect("the worker should drain the normalized Done and exit");
+        assert_eq!(recorder.request_finishes().len(), 1);
+        assert_eq!(
+            recorder.request_finishes()[0].status,
+            keycompute_types::RequestStatus::Succeeded
+        );
+    }
+
+    #[tokio::test]
     async fn client_disconnect_during_no_event_window_marks_context() {
         // P2 回归：客户端在后台任务等待上游事件（尚未发送任何 SSE 帧）时断开。
         // 空窗期内没有失败的 send、executor 的 tx 又因本任务持有 receiver 而不会
@@ -952,6 +1458,7 @@ mod tests {
         // 的上游调用并按 success 落库。
         let (tx, rx) = mpsc::channel(4);
         let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
@@ -996,6 +1503,7 @@ mod tests {
         // 必须把停滞客户端视为断开并标记 ctx。
         let (tx, rx) = mpsc::channel(1);
         let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
@@ -1066,6 +1574,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
             "claude-test",
             Vec::new(),
             true,
@@ -1110,6 +1619,7 @@ mod tests {
         // 客户端只能看到标准化的 "Upstream request failed"，不泄露上游 body。
         let (tx, rx) = mpsc::channel(4);
         let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
@@ -1161,12 +1671,12 @@ mod tests {
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
             "claude-test",
             Vec::new(),
             false,
             keycompute_types::PricingSnapshot::default(),
         ));
-
         let error = create_anthropic_response(
             rx,
             ctx,
@@ -1177,6 +1687,47 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.to_string(), "Provider error: Upstream request failed");
+    }
+
+    #[tokio::test]
+    async fn non_stream_worker_survives_handler_cancellation() {
+        let (tx, rx) = mpsc::channel(4);
+        let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "claude-test",
+            Vec::new(),
+            false,
+            keycompute_types::PricingSnapshot::default(),
+        ));
+        let handler = tokio::spawn(create_anthropic_response_with_lifecycle(
+            rx,
+            Arc::clone(&ctx),
+            "anthropic".to_string(),
+            uuid::Uuid::new_v4(),
+            Arc::new(keycompute_billing::BillingService::new()),
+            Arc::new(keycompute_types::NoopRequestLifecycleRecorder),
+        ));
+        tokio::task::yield_now().await;
+        handler.abort();
+        let _ = handler.await;
+
+        tx.send(llm_protocol_provider::StreamEvent::error(
+            "client disconnected",
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), tx.closed())
+            .await
+            .expect("detached worker must consume the terminal event after handler cancellation");
+
+        assert!(ctx.is_client_disconnected());
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(keycompute_types::ClientResponseOutcome::ClientDisconnected)
+        );
     }
 
     #[tokio::test]
@@ -1209,6 +1760,7 @@ mod tests {
         drop(tx);
 
         let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
@@ -1246,24 +1798,31 @@ mod tests {
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
             "claude-test",
             Vec::new(),
             false,
             keycompute_types::PricingSnapshot::default(),
         ));
+        let recorder = Arc::new(keycompute_types::TestRequestLifecycleRecorder::default());
 
-        let error = create_anthropic_response(
+        let error = create_anthropic_response_with_lifecycle(
             rx,
-            ctx,
+            Arc::clone(&ctx),
             "anthropic".to_string(),
             uuid::Uuid::new_v4(),
             Arc::new(keycompute_billing::BillingService::new()),
+            recorder as Arc<dyn keycompute_types::RequestLifecycleRecorder>,
         )
         .await
         .unwrap_err();
         assert!(
             matches!(error, ApiError::Internal(_)),
             "missing native body must surface as an internal error, got {error}"
+        );
+        assert_eq!(
+            ctx.client_response_outcome(),
+            Some(keycompute_types::ClientResponseOutcome::ResponseFailed)
         );
     }
 
@@ -1272,6 +1831,7 @@ mod tests {
         // 非流式路径的结算必须归属到实际完成请求的账号：executor 在 fallback
         // 成功后写入 executed_provider_account，finalize 应使用该账号而非 primary。
         let ctx = Arc::new(RequestContext::new(
+            uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),

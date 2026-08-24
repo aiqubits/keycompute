@@ -136,6 +136,21 @@ html, body {
   transition: opacity var(--transition-slow);
 }
 
+.sidebar-mobile-close {
+  display: none;
+  width: 36px;
+  height: 36px;
+  margin-left: auto;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
 .sidebar.collapsed .sidebar-logo-copy {
   opacity: 0;
   width: 0;

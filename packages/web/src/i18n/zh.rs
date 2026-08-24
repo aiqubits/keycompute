@@ -289,6 +289,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     // ── Layout ──────────────────────────────────
     m.insert("layout.back_to_home", "返回首页");
     m.insert("layout.open_menu", "打开菜单");
+    m.insert("layout.close_menu", "关闭菜单");
     m.insert("layout.switch_to_light", "切换到亮色主题");
     m.insert("layout.switch_to_dark", "切换到暗色主题");
     m.insert("layout.switch_to_zh", "切换到中文");
@@ -1003,7 +1004,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
 
     m.insert(
         "monitoring.subtitle",
-        "追踪 gateway 到 node 的请求生命周期、节点健康和用量落账状态。",
+        "统一追踪 Provider Account 与 Node 请求生命周期、目标健康和计费状态。",
     );
     m.insert("monitoring.control_plane", "执行链路概览");
     m.insert(
@@ -1079,6 +1080,122 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("monitoring.map_gateway_subtitle", "OpenAI API");
     m.insert("monitoring.map_router_subtitle", "节点: 模型");
     m.insert("monitoring.map_node", "节点");
+    m.insert("monitoring.time_range", "时间范围");
+    m.insert("monitoring.range_1h", "最近 1 小时");
+    m.insert("monitoring.range_6h", "最近 6 小时");
+    m.insert("monitoring.range_24h", "最近 24 小时");
+    m.insert("monitoring.range_custom", "自定义 UTC");
+    m.insert("monitoring.utc_from", "UTC 起始时间");
+    m.insert("monitoring.utc_to", "UTC 结束时间");
+    m.insert("monitoring.utc_to_title", "UTC 结束时间（最长 24 小时）");
+    m.insert("monitoring.status_filter", "状态筛选");
+    m.insert("monitoring.all_statuses", "全部状态");
+    m.insert("monitoring.timed_out", "超时");
+    m.insert("monitoring.running", "运行中");
+    m.insert("monitoring.queued", "排队");
+    m.insert("monitoring.routing", "路由中");
+    m.insert("monitoring.cancelled", "已取消");
+    m.insert("monitoring.received", "已接收");
+    m.insert("monitoring.online", "在线");
+    m.insert("monitoring.offline", "离线");
+    m.insert("monitoring.route_filter", "执行路径筛选");
+    m.insert("monitoring.all_routes", "全部路径");
+    m.insert("monitoring.resume_auto_refresh", "继续自动刷新");
+    m.insert("monitoring.pause_auto_refresh", "暂停自动刷新");
+    m.insert("monitoring.refresh_now", "立即刷新");
+    m.insert("monitoring.probe_in_progress", "探测中…");
+    m.insert("monitoring.probe_done", "探测完成");
+    m.insert("monitoring.probe_failed", "探测失败");
+    m.insert("monitoring.probe_all_accounts", "探测全部账号");
+    m.insert("monitoring.last_updated", "最后更新");
+    m.insert("monitoring.empty_range", "当前时间范围无流量");
+    m.insert("monitoring.empty_filtered", "筛选条件无匹配结果");
+    m.insert("monitoring.request_list", "监控请求列表");
+    m.insert("monitoring.time", "时间");
+    m.insert("monitoring.request_id", "Request ID");
+    m.insert("monitoring.protocol_model", "协议 / 模型");
+    m.insert("monitoring.execution_route", "执行路径");
+    m.insert("monitoring.route_provider_account", "Provider 账号");
+    m.insert("monitoring.route_node", "节点");
+    m.insert("monitoring.status", "状态");
+    m.insert("monitoring.duration_ttft", "总耗时 / TTFT");
+    m.insert("monitoring.next_page", "下一页");
+    m.insert("monitoring.request_detail", "请求详情");
+    m.insert("monitoring.tenant", "租户");
+    m.insert("monitoring.user", "用户");
+    m.insert("monitoring.key", "Key");
+    m.insert("monitoring.billing", "计费");
+    m.insert("monitoring.trace_quality", "数据质量");
+    m.insert("monitoring.client_first_content", "客户端首内容");
+    m.insert("monitoring.not_collected", "未采集");
+    m.insert("monitoring.none", "无");
+    m.insert("monitoring.billing_summary", "计费摘要");
+    m.insert("monitoring.detail_load_failed", "详情加载失败");
+    m.insert("monitoring.attempts", "Attempts");
+    m.insert(
+        "monitoring.node_task_submissions",
+        "Node Task / Submissions",
+    );
+    m.insert("monitoring.request_count", "请求量");
+    m.insert("monitoring.active_queued", "活跃 {active} / 排队 {queued}");
+    m.insert("monitoring.success_rate", "成功率");
+    m.insert("monitoring.error_rate_value", "错误率 {rate}");
+    m.insert("monitoring.attempt_success_rate", "Attempt 成功率");
+    m.insert("monitoring.attempt_count", "{count} 次 attempts");
+    m.insert("monitoring.fallback_rate", "Fallback 率");
+    m.insert("monitoring.request_count_meta", "{count} 次请求");
+    m.insert("monitoring.total_duration_percentiles", "总耗时 P50 / P95");
+    m.insert("monitoring.provider_ttft", "Provider 首内容耗时");
+    m.insert("monitoring.p50_p95", "P50 / P95");
+    m.insert("monitoring.node_queue_execution", "Node 排队 / 执行");
+    m.insert("monitoring.node_no_ttft", "P50（Node 不展示 TTFT）");
+    m.insert("monitoring.tokens_amount", "Tokens / 金额");
+    m.insert("monitoring.trends", "趋势");
+    m.insert("monitoring.no_trends", "暂无趋势数据");
+    m.insert("monitoring.utc_time", "UTC 时间");
+    m.insert("monitoring.unrouted", "未路由");
+    m.insert("monitoring.unassigned_queue", "未分配队列");
+    m.insert("monitoring.view_request", "查看请求 {request_id}");
+    m.insert("monitoring.provider_health", "Provider Account 健康");
+    m.insert("monitoring.account_probe_link", "账号管理 / 单账号探测");
+    m.insert("monitoring.no_accounts", "暂无账号");
+    m.insert("monitoring.node_health", "Node 健康");
+    m.insert("monitoring.node_gateway_link", "打开 Node Gateway 管理");
+    m.insert("monitoring.attempt_target", "目标：{target}");
+    m.insert(
+        "monitoring.attempt_timing",
+        "开始：{start} · 结束：{end} · 流结束：{reason}",
+    );
+    m.insert(
+        "monitoring.attempt_http",
+        "HTTP：{http} · Upstream Request ID：{upstream}",
+    );
+    m.insert(
+        "monitoring.attempt_provider_timing",
+        "响应头：{headers} · 首有效内容：{first} · TTFT：{ttft}",
+    );
+    m.insert("monitoring.error", "错误");
+    m.insert("monitoring.enabled", "已启用");
+    m.insert("monitoring.disabled", "已停用");
+    m.insert(
+        "monitoring.provider_health_line",
+        "真实成功率 {success} · 延迟 {latency}",
+    );
+    m.insert(
+        "monitoring.provider_probe_line",
+        "探测：{probe}（{at}，{latency}，错误 {error}）· 可归责失败 {failures}",
+    );
+    m.insert(
+        "monitoring.node_counts",
+        "排队 {queued} / 运行 {running} / 成功 {succeeded} / 失败 {failed} / 过期 {expired}",
+    );
+    m.insert(
+        "monitoring.node_runtime",
+        "心跳 {heartbeat} · 会话到期 {session} · 模型 {models}",
+    );
+    m.insert("monitoring.quality_derived", "历史推断");
+    m.insert("monitoring.quality_partial", "信息不完整");
+    m.insert("monitoring.quality_actual", "实际采集");
     m.insert("users.subtitle", "查看和管理平台所有注册用户");
     m.insert("users.search_placeholder", "搜索邮箱或用户名...");
     m.insert("users.empty", "暂无用户数据");

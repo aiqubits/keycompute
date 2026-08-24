@@ -88,6 +88,9 @@ pub fn Header(
                 button {
                     class: "header-toggle-btn hide-desktop hide-tablet",
                     title: "{open_menu_title}",
+                    aria_label: "{open_menu_title}",
+                    aria_controls: "app-sidebar",
+                    aria_expanded: sidebar_mobile_open(),
                     onclick: move |_| {
                         let cur = sidebar_mobile_open();
                         *sidebar_mobile_open.write() = !cur;
@@ -116,7 +119,7 @@ pub fn Header(
 
                 // GitHub 仓库链接（与首页样式一致，按后台比例缩放）
                 a {
-                    class: "header-github-link",
+                    class: "header-github-link hide-mobile",
                     href: "https://github.com/keycompute",
                     target: "_blank",
                     rel: "noopener noreferrer",

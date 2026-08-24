@@ -1,5 +1,8 @@
 use once_cell::sync::Lazy;
-use prometheus::{Counter, Histogram, IntCounter, IntGauge, Registry, histogram_opts, opts};
+use prometheus::{
+    Counter, CounterVec, Histogram, HistogramVec, IntCounter, IntGauge, IntGaugeVec, Registry,
+    histogram_opts, opts,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -162,7 +165,7 @@ pub static PROVIDER_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
 pub static BILLING_AMOUNT_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     let vec = CounterVec::new(
         opts!("keycompute_billing_amount_total", "Total billing amount"),
-        &["currency", "tenant_id"],
+        &["currency"],
     )
     .expect("failed to create billing_amount_total counter");
     REGISTRY
@@ -184,9 +187,162 @@ pub static FALLBACK_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     counter
 });
 
-// ==================== 自定义指标类型包装 ====================
+// ==================== Gateway lifecycle tracing metrics ====================
 
-use prometheus::{CounterVec, HistogramVec};
+pub static MONITORING_REQUEST_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec(
+        "keycompute_monitoring_request_total",
+        "Terminal gateway requests recorded by lifecycle tracing",
+        &["protocol", "route_type", "status"],
+    )
+});
+
+pub static MONITORING_ACTIVE_REQUESTS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let metric = IntGaugeVec::new(
+        opts!(
+            "keycompute_monitoring_active_requests",
+            "Gateway requests currently active in lifecycle tracing"
+        ),
+        &["protocol", "route_type"],
+    )
+    .expect("failed to create monitoring_active_requests");
+    REGISTRY
+        .register(Box::new(metric.clone()))
+        .expect("failed to register monitoring_active_requests");
+    metric
+});
+
+pub static MONITORING_REQUEST_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec(
+        "keycompute_monitoring_request_latency_seconds",
+        "End-to-end gateway request latency",
+        &["protocol", "route_type", "status"],
+    )
+});
+
+pub static MONITORING_ATTEMPT_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec(
+        "keycompute_monitoring_attempt_total",
+        "Terminal execution attempts recorded by lifecycle tracing",
+        &["route_type", "status", "error_origin", "error_category"],
+    )
+});
+
+pub static MONITORING_ATTEMPT_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec(
+        "keycompute_monitoring_attempt_latency_seconds",
+        "Execution attempt latency",
+        &["route_type", "status"],
+    )
+});
+
+pub static MONITORING_NODE_TASK_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec(
+        "keycompute_monitoring_node_task_total",
+        "Node task lifecycle outcomes",
+        &["status"],
+    )
+});
+
+pub static TRACE_WRITE_FAILURE_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec(
+        "keycompute_trace_write_failure_total",
+        "Lifecycle trace write failures",
+        &["phase"],
+    )
+});
+
+pub static TRACE_INTERMEDIATE_QUEUE_DROPS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let metric = IntCounter::with_opts(opts!(
+        "keycompute_trace_intermediate_queue_drops_total",
+        "Dropped best-effort intermediate lifecycle events"
+    ))
+    .expect("failed to create trace queue drop counter");
+    REGISTRY
+        .register(Box::new(metric.clone()))
+        .expect("failed to register trace queue drop counter");
+    metric
+});
+
+pub static CLIENT_REQUEST_ID_REJECTED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let metric = IntCounter::with_opts(opts!(
+        "keycompute_client_request_id_rejected_total",
+        "Invalid untrusted client request IDs ignored by the gateway"
+    ))
+    .expect("failed to create client request ID rejection counter");
+    REGISTRY
+        .register(Box::new(metric.clone()))
+        .expect("failed to register client request ID rejection counter");
+    metric
+});
+
+pub static STALE_REQUEST_RECONCILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let metric = IntCounter::with_opts(opts!(
+        "keycompute_stale_request_reconciled_total",
+        "Abandoned request traces reconciled"
+    ))
+    .expect("failed to create stale reconciled counter");
+    REGISTRY
+        .register(Box::new(metric.clone()))
+        .expect("failed to register stale reconciled counter");
+    metric
+});
+
+pub static BILLING_WRITE_FAILURE_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let metric = IntCounter::with_opts(opts!(
+        "keycompute_billing_write_failure_total",
+        "Billing finalization write failures"
+    ))
+    .expect("failed to create billing write failure counter");
+    REGISTRY
+        .register(Box::new(metric.clone()))
+        .expect("failed to register billing write failure counter");
+    metric
+});
+
+pub static ACCOUNT_PROBE_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec(
+        "keycompute_account_probe_total",
+        "Provider account probe outcomes",
+        &["status"],
+    )
+});
+
+pub static ACCOUNT_PROBE_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec(
+        "keycompute_account_probe_latency_seconds",
+        "Provider account probe latency",
+        &["status"],
+    )
+});
+
+fn register_counter_vec(name: &str, help: &str, labels: &[&str]) -> CounterVec {
+    let metric = CounterVec::new(opts!(name, help), labels).expect("failed to create counter vec");
+    REGISTRY
+        .register(Box::new(metric.clone()))
+        .expect("failed to register counter vec");
+    metric
+}
+
+fn register_histogram_vec(name: &str, help: &str, labels: &[&str]) -> HistogramVec {
+    let metric = HistogramVec::new(
+        histogram_opts!(
+            name,
+            help,
+            vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 120.0
+            ]
+        ),
+        labels,
+    )
+    .expect("failed to create histogram vec");
+    REGISTRY
+        .register(Box::new(metric.clone()))
+        .expect("failed to register histogram vec");
+    metric
+}
+
+// ==================== 自定义指标类型包装 ====================
 
 /// 指标收集器
 #[derive(Clone)]
@@ -270,4 +426,17 @@ pub fn init_metrics() {
     let _ = &*PROVIDER_ERROR_TOTAL;
     let _ = &*PROVIDER_LATENCY;
     let _ = &*BILLING_AMOUNT_TOTAL;
+    let _ = &*MONITORING_REQUEST_TOTAL;
+    let _ = &*MONITORING_ACTIVE_REQUESTS;
+    let _ = &*MONITORING_REQUEST_LATENCY;
+    let _ = &*MONITORING_ATTEMPT_TOTAL;
+    let _ = &*MONITORING_ATTEMPT_LATENCY;
+    let _ = &*MONITORING_NODE_TASK_TOTAL;
+    let _ = &*TRACE_WRITE_FAILURE_TOTAL;
+    let _ = &*TRACE_INTERMEDIATE_QUEUE_DROPS_TOTAL;
+    let _ = &*CLIENT_REQUEST_ID_REJECTED_TOTAL;
+    let _ = &*STALE_REQUEST_RECONCILED_TOTAL;
+    let _ = &*BILLING_WRITE_FAILURE_TOTAL;
+    let _ = &*ACCOUNT_PROBE_TOTAL;
+    let _ = &*ACCOUNT_PROBE_LATENCY;
 }

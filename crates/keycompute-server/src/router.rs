@@ -60,6 +60,9 @@ use crate::{
         get_execution_stats,
         get_gateway_status,
         get_monitoring_overview,
+        get_monitoring_request,
+        get_monitoring_summary,
+        get_monitoring_target_health,
         get_my_balance,
         get_my_distribution_earnings,
         get_my_node_gateway_token,
@@ -89,6 +92,7 @@ use crate::{
         list_distribution_records,
         list_distribution_rules,
         list_models,
+        list_monitoring_requests,
         list_my_api_keys,
         list_my_node_gateway_tokens,
         list_my_payment_orders,
@@ -104,6 +108,7 @@ use crate::{
         node_heartbeat,
         node_poll,
         node_register,
+        probe_monitoring_targets,
         recover_node,
         refresh_account,
         refresh_token_handler,
@@ -361,10 +366,31 @@ pub fn create_router(state: AppState) -> Router {
         );
 
     // 监控追踪（仅 Admin）
-    let admin_monitoring_routes = Router::new().route(
-        "/api/v1/admin/monitoring/overview",
-        get(get_monitoring_overview),
-    );
+    let admin_monitoring_routes = Router::new()
+        .route(
+            "/api/v1/admin/monitoring/overview",
+            get(get_monitoring_overview),
+        )
+        .route(
+            "/api/v1/admin/monitoring/requests",
+            get(list_monitoring_requests),
+        )
+        .route(
+            "/api/v1/admin/monitoring/requests/{request_id}",
+            get(get_monitoring_request),
+        )
+        .route(
+            "/api/v1/admin/monitoring/summary",
+            get(get_monitoring_summary),
+        )
+        .route(
+            "/api/v1/admin/monitoring/targets/health",
+            get(get_monitoring_target_health),
+        )
+        .route(
+            "/api/v1/admin/monitoring/targets/probe",
+            post(probe_monitoring_targets),
+        );
 
     // 合并管理路由并添加认证和限流中间件
     // 注意：中间件执行顺序是反向的，所以先添加 rate_limit，再添加 admin_auth
@@ -492,7 +518,7 @@ pub fn create_router(state: AppState) -> Router {
             anthropic_error_response_middleware,
         ))
         .layer(axum::middleware::from_fn(request_logger))
-        .layer(axum::middleware::from_fn(trace_id_middleware))
+        .layer(from_fn_with_state(state.clone(), trace_id_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer())
         .with_state(state)

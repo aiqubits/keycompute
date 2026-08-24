@@ -21,6 +21,10 @@ pub struct Account {
     pub models_supported: Vec<String>,
     /// 可见性：'tenant' = 仅本租户可见（默认），'global' = 所有租户可见
     pub visibility: String,
+    pub last_probe_at: Option<DateTime<Utc>>,
+    pub last_probe_latency_ms: Option<i64>,
+    pub last_probe_status: Option<String>,
+    pub last_probe_error_code: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -161,6 +165,42 @@ impl Account {
         let accounts = Account::find_by_statement(stmt).all(db).await?;
 
         Ok(accounts)
+    }
+
+    /// Persist a health probe only if the account configuration has not changed
+    /// since the probe started.
+    ///
+    /// Probe telemetry deliberately does not modify `updated_at`: that column is
+    /// the optimistic version for account configuration, while concurrent probes
+    /// of the same version may safely use completion order for the latest health
+    /// snapshot.
+    pub async fn record_probe_snapshot_if_config_current(
+        db: &impl ConnectionTrait,
+        id: Uuid,
+        expected_updated_at: DateTime<Utc>,
+        probed_at: DateTime<Utc>,
+        latency_ms: i64,
+        status: &str,
+        error_code: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let result = db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"UPDATE accounts
+                   SET last_probe_at=$1,last_probe_latency_ms=$2,
+                       last_probe_status=$3,last_probe_error_code=$4
+                   WHERE id=$5 AND updated_at=$6"#,
+                [
+                    probed_at.into(),
+                    latency_ms.into(),
+                    status.into(),
+                    error_code.into(),
+                    id.into(),
+                    expected_updated_at.into(),
+                ],
+            ))
+            .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// 查找支持指定模型的账号（含本租户 + 全局可见）

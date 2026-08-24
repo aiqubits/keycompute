@@ -43,6 +43,7 @@ pub fn AppShell(
     #[props(default)] current_path: String,
     #[props(default)] home_title: String,
     #[props(default)] open_menu_title: String,
+    #[props(default)] close_menu_title: String,
     #[props(default)] switch_to_light_theme_title: String,
     #[props(default)] switch_to_dark_theme_title: String,
     #[props(default)] switch_to_zh_title: String,
@@ -141,7 +142,13 @@ pub fn AppShell(
         document::Link { rel: "stylesheet", href: DARK_CSS }
         document::Link { rel: "stylesheet", href: RESPONSIVE_CSS }
 
-        div { class: "app-shell",
+        div {
+            class: "app-shell",
+            onkeydown: move |event| {
+                if event.key() == Key::Escape && sidebar_mobile_open() {
+                    sidebar_mobile_open.set(false);
+                }
+            },
             div {
                 class: "{overlay_class}",
                 onclick: move |_| {
@@ -158,6 +165,7 @@ pub fn AppShell(
                 collapse_sidebar_title: collapse_sidebar_title.clone(),
                 expand_label: expand_label.clone(),
                 collapse_label: collapse_label.clone(),
+                close_menu_title: close_menu_title.clone(),
                 site_name: site_name.clone(),
             }
 
@@ -199,4 +207,17 @@ fn read_local_storage(key: &str) -> Option<String> {
         .ok()??
         .get_item(key)
         .ok()?
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mobile_sidebar_overrides_desktop_collapsed_state() {
+        let css = include_str!("../../assets/styling/responsive.css");
+        assert!(css.contains(".sidebar.collapsed {"));
+        assert!(css.contains(".sidebar.collapsed .sidebar-logo-copy"));
+        assert!(css.contains(".sidebar.collapsed .sidebar-section-title"));
+        assert!(css.contains(".sidebar.collapsed .sidebar-item-label"));
+        assert!(css.contains(".sidebar.collapsed .sidebar-item {"));
+    }
 }

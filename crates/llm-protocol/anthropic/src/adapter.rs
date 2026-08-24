@@ -23,7 +23,8 @@
 use async_trait::async_trait;
 use keycompute_types::{ContentPart, KeyComputeError, MessageContent, Result, SensitiveString};
 use llm_protocol_provider::{
-    ByteStream, HttpTransport, ProviderAdapter, StreamBox, StreamEvent, UpstreamRequest,
+    HttpTransport, ProviderAdapter, StreamBox, StreamEvent, UpstreamFailure, UpstreamFailureKind,
+    UpstreamRequest, UpstreamResponse, UpstreamResponseMeta,
 };
 use serde_json;
 
@@ -49,6 +50,31 @@ impl Default for AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    fn protocol_failure(error: impl std::fmt::Display) -> UpstreamFailure {
+        UpstreamFailure {
+            kind: UpstreamFailureKind::Protocol,
+            status: None,
+            headers_received_at: None,
+            upstream_request_id: None,
+            retryable: false,
+            stable_error_code: "upstream_protocol".to_string(),
+            sanitized_summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+        }
+    }
+    fn protocol_failure_with_meta(
+        meta: &UpstreamResponseMeta,
+        error: impl std::fmt::Display,
+    ) -> UpstreamFailure {
+        UpstreamFailure {
+            kind: UpstreamFailureKind::Protocol,
+            status: Some(meta.status),
+            headers_received_at: Some(meta.headers_received_at),
+            upstream_request_id: meta.upstream_request_id.clone(),
+            retryable: false,
+            stable_error_code: "upstream_protocol".to_string(),
+            sanitized_summary: keycompute_types::sanitize_error_summary(&error.to_string()),
+        }
+    }
     /// 创建新的 Anthropic Provider
     pub fn new() -> Self {
         Self
@@ -300,98 +326,121 @@ impl AnthropicProvider {
         transport: &dyn HttpTransport,
         request: UpstreamRequest,
     ) -> Result<(String, Option<(u32, u32)>, Option<String>, Option<String>)> {
-        let native = self.build_native_request_body(&request)?;
+        self.chat_internal_with_meta(transport, request)
+            .await
+            .map(|response| response.body)
+            .map_err(UpstreamFailure::into_keycompute_error)
+    }
+
+    async fn chat_internal_with_meta(
+        &self,
+        transport: &dyn HttpTransport,
+        request: UpstreamRequest,
+    ) -> std::result::Result<
+        UpstreamResponse<(String, Option<(u32, u32)>, Option<String>, Option<String>)>,
+        UpstreamFailure,
+    > {
+        let native = self
+            .build_native_request_body(&request)
+            .map_err(Self::protocol_failure)?;
         let body = match native.as_ref() {
             Some(body) => serde_json::to_string(body),
-            None => serde_json::to_string(&self.build_request_body(&request)?),
+            None => serde_json::to_string(
+                &self
+                    .build_request_body(&request)
+                    .map_err(Self::protocol_failure)?,
+            ),
         }
-        .map_err(|e| {
-            KeyComputeError::ProviderError(format!("Failed to serialize request: {}", e))
-        })?;
+        .map_err(Self::protocol_failure)?;
         let url = Self::messages_url(&request.endpoint);
 
         let headers = self.build_request_headers(&request);
 
-        let response_text = transport.post_json(&url, headers, body).await?;
+        let response = transport.post_json_response(&url, headers, body).await?;
+        let UpstreamResponse {
+            meta,
+            body: response_text,
+        } = response;
 
         if native.is_some() {
-            let response: serde_json::Value =
-                serde_json::from_str(&response_text).map_err(|e| {
-                    KeyComputeError::ProviderError(format!(
-                        "Failed to parse Anthropic response: {}",
-                        e
-                    ))
-                })?;
-            let usage = Self::parse_native_usage(&response)?;
+            let response: serde_json::Value = serde_json::from_str(&response_text)
+                .map_err(|e| Self::protocol_failure_with_meta(&meta, e))?;
+            let usage = Self::parse_native_usage(&response)
+                .map_err(|error| Self::protocol_failure_with_meta(&meta, error))?;
             // `ProviderAdapter::chat` is a text-returning public API. Native
             // ingress normally consumes the raw body through `stream_chat`,
             // but direct callers must still receive the response's text rather
             // than a silent empty string.
-            let content: AnthropicResponse =
-                serde_json::from_value(response.clone()).map_err(|e| {
-                    KeyComputeError::ProviderError(format!(
-                        "Failed to parse Anthropic response: {}",
-                        e
-                    ))
-                })?;
+            let content: AnthropicResponse = serde_json::from_value(response.clone())
+                .map_err(|e| Self::protocol_failure_with_meta(&meta, e))?;
             let stop_reason = response
                 .get("stop_reason")
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string);
-            return Ok((
-                content.extract_text(),
-                usage,
-                stop_reason,
-                Some(response_text),
-            ));
+            return Ok(UpstreamResponse {
+                meta,
+                body: (
+                    content.extract_text(),
+                    usage,
+                    stop_reason,
+                    Some(response_text),
+                ),
+            });
         }
 
-        let anthropic_response: AnthropicResponse =
-            serde_json::from_str(&response_text).map_err(|e| {
-                KeyComputeError::ProviderError(format!("Failed to parse Anthropic response: {}", e))
-            })?;
+        let anthropic_response: AnthropicResponse = serde_json::from_str(&response_text)
+            .map_err(|e| Self::protocol_failure_with_meta(&meta, e))?;
 
         let content = anthropic_response.extract_text();
         let usage = Some((
-            anthropic_response.usage.total_input_tokens()?,
+            anthropic_response
+                .usage
+                .total_input_tokens()
+                .map_err(|error| Self::protocol_failure_with_meta(&meta, error))?,
             anthropic_response.usage.output_tokens,
         ));
 
-        Ok((content, usage, anthropic_response.stop_reason, None))
+        Ok(UpstreamResponse {
+            meta,
+            body: (content, usage, anthropic_response.stop_reason, None),
+        })
     }
 
     /// 执行流式请求
-    async fn stream_chat_internal(
+    async fn stream_chat_internal_with_meta(
         &self,
         transport: &dyn HttpTransport,
         request: UpstreamRequest,
-    ) -> Result<StreamBox> {
-        let native = self.build_native_request_body(&request)?;
+    ) -> std::result::Result<UpstreamResponse<StreamBox>, UpstreamFailure> {
+        let native = self
+            .build_native_request_body(&request)
+            .map_err(Self::protocol_failure)?;
         let url = Self::messages_url(&request.endpoint);
 
         let body_json = match native.as_ref() {
             Some(body) => serde_json::to_string(body),
             None => {
-                let mut body = self.build_request_body(&request)?;
+                let mut body = self
+                    .build_request_body(&request)
+                    .map_err(Self::protocol_failure)?;
                 // 确保启用流式输出
                 body.stream = Some(true);
                 serde_json::to_string(&body)
             }
         }
-        .map_err(|e| {
-            KeyComputeError::ProviderError(format!("Failed to serialize request: {}", e))
-        })?;
+        .map_err(Self::protocol_failure)?;
 
         let mut headers = self.build_request_headers(&request);
         headers.push(("Accept".to_string(), "text/event-stream".to_string()));
 
-        let byte_stream: ByteStream = transport.post_stream(&url, headers, body_json).await?;
+        let response = transport
+            .post_stream_response(&url, headers, body_json)
+            .await?;
 
         // 转换为标准化的 StreamEvent 流
-        Ok(crate::stream::parse_anthropic_stream_with_raw(
-            byte_stream,
-            native.is_some(),
-        ))
+        Ok(response.map_body(|byte_stream| {
+            crate::stream::parse_anthropic_stream_with_raw(byte_stream, native.is_some())
+        }))
     }
 }
 
@@ -417,7 +466,10 @@ impl ProviderAdapter for AnthropicProvider {
         request: UpstreamRequest,
     ) -> Result<StreamBox> {
         if request.stream {
-            self.stream_chat_internal(transport, request).await
+            self.stream_chat_internal_with_meta(transport, request)
+                .await
+                .map(|response| response.body)
+                .map_err(|error| KeyComputeError::ProviderError(error.to_string()))
         } else {
             // 非流式请求，包装为单事件流
             let (content, usage, finish_reason, native_response) =
@@ -460,6 +512,43 @@ impl ProviderAdapter for AnthropicProvider {
         }
     }
 
+    async fn stream_chat_with_meta(
+        &self,
+        transport: &dyn HttpTransport,
+        request: UpstreamRequest,
+    ) -> std::result::Result<UpstreamResponse<StreamBox>, UpstreamFailure> {
+        if request.stream {
+            self.stream_chat_internal_with_meta(transport, request)
+                .await
+        } else {
+            let response = self.chat_internal_with_meta(transport, request).await?;
+            let (content, usage, finish_reason, native_response) = response.body;
+            let mut events: Vec<Result<StreamEvent>> = if let Some(native_response) =
+                native_response
+            {
+                vec![Ok(StreamEvent::raw(
+                    serde_json::json!({"kind": "anthropic_message", "body": serde_json::from_str::<serde_json::Value>(&native_response).unwrap_or(serde_json::Value::Null)}).to_string(),
+                ))]
+            } else {
+                vec![Ok(StreamEvent::Delta {
+                    content,
+                    finish_reason: Some(finish_reason.unwrap_or_else(|| "stop".to_string())),
+                })]
+            };
+            if let Some((input_tokens, output_tokens)) = usage {
+                events.push(Ok(StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                }));
+            }
+            events.push(Ok(StreamEvent::Done));
+            Ok(UpstreamResponse {
+                meta: response.meta,
+                body: Box::pin(futures::stream::iter(events)),
+            })
+        }
+    }
+
     async fn chat(
         &self,
         transport: &dyn HttpTransport,
@@ -487,8 +576,11 @@ impl ProviderAdapter for AnthropicProvider {
                 ANTHROPIC_API_VERSION.to_string(),
             ),
         ];
-        let response = transport.get_binary(&url, headers).await?;
-        llm_protocol_provider::parse_models_response(&response.body)
+        let response = transport
+            .get_binary_response(&url, headers)
+            .await
+            .map_err(UpstreamFailure::into_keycompute_error)?;
+        llm_protocol_provider::parse_models_response(&response.body.body)
     }
 }
 
@@ -496,6 +588,7 @@ impl ProviderAdapter for AnthropicProvider {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use llm_protocol_provider::ByteStream;
     use llm_protocol_provider::{UpstreamMessage, test_support::RecordingGetTransport};
     use std::time::Duration;
 
@@ -795,10 +888,15 @@ mod tests {
         })));
 
         match provider.stream_chat(&transport, request).await {
-            Err(KeyComputeError::ProviderError(message)) => {
-                assert!(message.contains("usage.output_tokens"));
+            Err(KeyComputeError::UpstreamFailure {
+                stable_code,
+                summary,
+                ..
+            }) => {
+                assert_eq!(stable_code, "upstream_protocol");
+                assert!(summary.contains("usage.output_tokens"));
             }
-            Err(error) => panic!("expected a provider error, got {error}"),
+            Err(error) => panic!("expected a structured upstream failure, got {error}"),
             Ok(_) => panic!("malformed native usage must not create a stream"),
         }
     }
@@ -883,6 +981,7 @@ mod tests {
                 },
             ],
             stream: true,
+            include_stream_usage: true,
             max_tokens: Some(1024),
             temperature: None,
             top_p: None,
@@ -951,6 +1050,7 @@ mod tests {
                 content: MessageContent::Parts(parts),
             }],
             stream: false,
+            include_stream_usage: true,
             max_tokens: None,
             temperature: None,
             top_p: None,
