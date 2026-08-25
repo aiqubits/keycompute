@@ -314,8 +314,9 @@ async fn check_distribution_enabled(pool: &impl ConnectionTrait) -> Result<()> {
                 ApiError::Internal(format!("Failed to query distribution setting: {}", e))
             })?
             .map(|setting| setting.parse_bool())
-            // 与默认初始化保持一致：缺失设置时按启用处理，避免升级环境漏种默认值时误判为禁用。
-            .unwrap_or(true);
+            // Missing or invalid configuration must not expose distribution
+            // operations that depend on a configured public application URL.
+            .unwrap_or(false);
 
     if enabled {
         Ok(())

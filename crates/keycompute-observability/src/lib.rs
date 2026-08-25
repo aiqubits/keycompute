@@ -12,7 +12,9 @@ pub mod tracing;
 pub use host_monitor::{
     HealthStatus, HostMetrics, HostMonitor, SystemSnapshot, collect_host_metrics,
 };
-pub use logger::{init_dev_logger, init_logger, is_logger_initialized, try_init_logger};
+pub use logger::{
+    init_dev_logger, init_logger, init_prod_logger, is_logger_initialized, try_init_logger,
+};
 pub use metrics::{MetricsCollector, init_metrics, is_metrics_initialized};
 pub use tracing::{
     create_provider_span, create_request_span, create_stream_span, events, init_distributed_tracing,
@@ -20,7 +22,7 @@ pub use tracing::{
 
 /// 初始化所有可观测性组件
 ///
-/// 在应用启动时调用此函数，初始化日志和指标系统
+/// 在生产应用启动时调用此函数，初始化 JSON 日志和指标系统
 ///
 /// # Examples
 ///
@@ -34,7 +36,7 @@ pub use tracing::{
 /// }
 /// ```
 pub fn init_observability() {
-    init_logger();
+    init_prod_logger();
     init_metrics();
     // 日志系统已初始化，tracing 将通过 subscriber 输出此消息
 }

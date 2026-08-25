@@ -119,7 +119,7 @@ impl AdminSystemSettings {
             maintenance_mode: get_bool(setting_keys::MAINTENANCE_MODE, false),
             maintenance_message: get_value(setting_keys::MAINTENANCE_MESSAGE),
 
-            distribution_enabled: get_bool(setting_keys::DISTRIBUTION_ENABLED, true),
+            distribution_enabled: get_bool(setting_keys::DISTRIBUTION_ENABLED, false),
             distribution_level1_default_ratio: get_decimal(
                 setting_keys::DISTRIBUTION_LEVEL1_DEFAULT_RATIO,
                 0.03,

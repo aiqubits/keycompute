@@ -7,8 +7,13 @@
 #   sudo ./reset_admin_password.sh
 #
 # 前提条件：
-#   - Docker 容器 keycompute-postgres-primary 正在运行
+#   - 通过本项目 Docker Compose 启动的 PostgreSQL 正在运行
 #   - Python3 可用（用于生成 Argon2id 密码哈希）
+#
+# 可选覆盖（自定义 Compose 项目或容器时使用）：
+#   KC_RESET_DB_CONTAINER=<container name or id>
+#   KC_RESET_DB_USER=<postgres user>
+#   KC_RESET_DB_NAME=<database name>
 # =============================================================================
 
 set -euo pipefail
@@ -21,10 +26,11 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # ── 配置 ─────────────────────────────────────────────────────────────────────
-ADMIN_EMAIL="${KC__DEFAULT_ADMIN_EMAIL:-admin@keycompute.local}"
-DB_CONTAINER="keycompute-postgres-primary"
-DB_USER="keycompute"
-DB_NAME="keycompute"
+DB_CONTAINER_OVERRIDE="${KC_RESET_DB_CONTAINER:-}"
+DB_USER_OVERRIDE="${KC_RESET_DB_USER:-}"
+DB_NAME_OVERRIDE="${KC_RESET_DB_NAME:-}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
 
@@ -32,6 +38,118 @@ info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
+
+container_is_running() {
+    [ "$(docker inspect --format '{{.State.Running}}' "$1" 2>/dev/null || true)" = "true" ]
+}
+
+container_display_name() {
+    local name
+    name="$(docker inspect --format '{{.Name}}' "$1" 2>/dev/null || true)"
+    name="${name#/}"
+    printf '%s\n' "${name:-$1}"
+}
+
+container_env_value() {
+    local container="$1"
+    local key="$2"
+
+    docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${container}" 2>/dev/null \
+        | awk -v key="${key}" 'index($0, key "=") == 1 { sub("^[^=]*=", ""); print; exit }'
+}
+
+generate_password_hash() {
+    KC_RESET_PASSWORD_INPUT="$1" python3 <<'PYEOF'
+import os
+import sys
+from argon2 import PasswordHasher, Type
+
+password = os.environ["KC_RESET_PASSWORD_INPUT"]
+ph = PasswordHasher(
+    time_cost=3,
+    memory_cost=65536,
+    parallelism=4,
+    hash_len=32,
+    type=Type.ID,
+)
+
+try:
+    hash_str = ph.hash(password)
+    ph.verify(hash_str, password)
+except Exception as error:
+    print(f"[ERROR] 密码哈希生成或验证失败: {error}", file=sys.stderr)
+    sys.exit(1)
+
+print(hash_str)
+PYEOF
+}
+
+resolve_database_container() {
+    local container_id
+
+    # 显式覆盖始终优先，适用于非 Compose 或自定义容器名部署。
+    if [ -n "${DB_CONTAINER_OVERRIDE}" ]; then
+        if container_is_running "${DB_CONTAINER_OVERRIDE}"; then
+            printf '%s\n' "${DB_CONTAINER_OVERRIDE}"
+            return 0
+        fi
+        error "指定的数据库容器 ${DB_CONTAINER_OVERRIDE} 未运行" >&2
+        return 1
+    fi
+
+    # 优先让 Compose 解析当前项目的实际容器 ID。普通编排的服务名为
+    # postgres，主从编排的写库服务名为 postgres-primary。
+    container_id="$(
+        docker compose --project-directory "${PROJECT_ROOT}" \
+            -f "${PROJECT_ROOT}/docker-compose.yml" \
+            ps --status running -q postgres 2>/dev/null | head -n 1 || true
+    )"
+    if [ -n "${container_id}" ] && container_is_running "${container_id}"; then
+        printf '%s\n' "${container_id}"
+        return 0
+    fi
+
+    container_id="$(
+        docker compose --project-directory "${PROJECT_ROOT}" \
+            -f "${PROJECT_ROOT}/docker-compose.replicas.yml" \
+            ps --status running -q postgres-primary 2>/dev/null | head -n 1 || true
+    )"
+    if [ -n "${container_id}" ] && container_is_running "${container_id}"; then
+        printf '%s\n' "${container_id}"
+        return 0
+    fi
+
+    # 支持 `docker compose -p <custom>`：通过 Compose 工作目录和服务标签限定
+    # 当前项目，避免误选同机其他项目的 PostgreSQL。
+    for service in postgres postgres-primary; do
+        container_id="$(
+            docker ps \
+                --filter "label=com.docker.compose.project.working_dir=${PROJECT_ROOT}" \
+                --filter "label=com.docker.compose.service=${service}" \
+                --format '{{.ID}}' 2>/dev/null | head -n 1 || true
+        )"
+        if [ -n "${container_id}" ] && container_is_running "${container_id}"; then
+            printf '%s\n' "${container_id}"
+            return 0
+        fi
+    done
+
+    # 兼容仓库历史上两个固定容器名。只接受精确名称，不做
+    # `*postgres*` 模糊匹配，避免选中 ains-postgres 等无关数据库。
+    for container_id in keycompute-postgres keycompute-postgres-primary; do
+        if container_is_running "${container_id}"; then
+            printf '%s\n' "${container_id}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# 被 shell 测试 source 时只导出上述辅助函数，不执行交互式重置。
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
 
 # ── 前置检查 ────────────────────────────────────────────────────────────────
 
@@ -44,14 +162,21 @@ if ! command -v docker &>/dev/null; then
     exit 1
 fi
 
-# 检查数据库容器是否运行
-if ! docker ps --format '{{.Names}}' | grep -q "^${DB_CONTAINER}$"; then
-    error "数据库容器 ${DB_CONTAINER} 未运行！"
+# 自动解析当前编排的写库容器
+if ! DB_CONTAINER="$(resolve_database_container)"; then
+    error "未找到当前 KeyCompute 项目正在运行的数据库容器！"
     info "可用的容器："
     docker ps --format '  {{.Names}}  ({{.Status}})'
+    info "如使用自定义容器，可设置 KC_RESET_DB_CONTAINER=<name-or-id>"
     exit 1
 fi
-ok "数据库容器 ${DB_CONTAINER} 运行正常"
+DB_CONTAINER_NAME="$(container_display_name "${DB_CONTAINER}")"
+DB_USER="${DB_USER_OVERRIDE:-$(container_env_value "${DB_CONTAINER}" POSTGRES_USER)}"
+DB_NAME="${DB_NAME_OVERRIDE:-$(container_env_value "${DB_CONTAINER}" POSTGRES_DB)}"
+DB_USER="${DB_USER:-keycompute}"
+DB_NAME="${DB_NAME:-keycompute}"
+ok "数据库容器 ${DB_CONTAINER_NAME} 运行正常"
+info "数据库：${DB_NAME}（用户 ${DB_USER}）"
 
 # 检查 Python3
 if ! command -v python3 &>/dev/null; then
@@ -82,13 +207,16 @@ echo ""
 
 info "正在查询管理员用户..."
 
-ADMIN_INFO=$(docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -tA \
-    -c "SELECT id, email, name FROM users WHERE email = '${ADMIN_EMAIL}';" 2>/dev/null || true)
-
-if [ -z "${ADMIN_INFO}" ]; then
-    # 如果没有找到配置的邮箱，尝试查找 role=system 的用户
-    ADMIN_INFO=$(docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -tA \
-        -c "SELECT id, email, name FROM users WHERE role = 'system' ORDER BY created_at ASC LIMIT 1;" 2>/dev/null || true)
+if ! ADMIN_INFO="$(
+    docker exec -i "${DB_CONTAINER}" psql \
+        -U "${DB_USER}" \
+        -d "${DB_NAME}" \
+        -v ON_ERROR_STOP=1 \
+        -tA \
+        -c "SELECT id, email, name FROM users WHERE role = 'system' ORDER BY created_at ASC LIMIT 1;"
+)"; then
+    error "查询系统管理员失败，请检查数据库连接和表结构！"
+    exit 1
 fi
 
 if [ -z "${ADMIN_INFO}" ]; then
@@ -97,9 +225,9 @@ if [ -z "${ADMIN_INFO}" ]; then
     exit 1
 fi
 
-ADMIN_ID=$(echo "${ADMIN_INFO}" | cut -d'|' -f1 | tr -d ' ')
-ADMIN_EMAIL_FOUND=$(echo "${ADMIN_INFO}" | cut -d'|' -f2 | tr -d ' ')
-ADMIN_NAME=$(echo "${ADMIN_INFO}" | cut -d'|' -f3 | tr -d ' ')
+IFS='|' read -r ADMIN_ID ADMIN_EMAIL_FOUND ADMIN_NAME <<< "${ADMIN_INFO}"
+ADMIN_ID="${ADMIN_ID//[[:space:]]/}"
+ADMIN_EMAIL_FOUND="${ADMIN_EMAIL_FOUND//[[:space:]]/}"
 
 ok "找到管理员：${ADMIN_NAME} <${ADMIN_EMAIL_FOUND}>"
 info "用户 ID：${ADMIN_ID}"
@@ -165,55 +293,67 @@ echo ""
 
 info "正在生成密码哈希（Argon2id）并更新数据库..."
 
-python3 << PYEOF
-import subprocess, sys
-from argon2 import PasswordHasher, Type
+if ! PASSWORD_HASH="$(generate_password_hash "${NEW_PASSWORD}")"; then
+    error "密码哈希生成失败！"
+    exit 1
+fi
 
-password = """${NEW_PASSWORD}"""
-user_id = """${ADMIN_ID}"""
+if ! KC_RESET_PASSWORD_HASH="${PASSWORD_HASH}" \
+    KC_RESET_ADMIN_ID="${ADMIN_ID}" \
+    KC_RESET_DB_CONTAINER_ID="${DB_CONTAINER}" \
+    KC_RESET_DB_USER_RESOLVED="${DB_USER}" \
+    KC_RESET_DB_NAME_RESOLVED="${DB_NAME}" \
+    python3 <<'PYEOF'
+import os
+import subprocess
+import sys
+import uuid
 
-ph = PasswordHasher(
-    time_cost=3,
-    memory_cost=65536,
-    parallelism=4,
-    hash_len=32,
-    type=Type.ID
-)
-
-try:
-    hash_str = ph.hash(password)
-    # 立即验证生成的哈希
-    ph.verify(hash_str, password)
-except Exception as e:
-    print(f"[ERROR] 密码哈希生成或验证失败: {e}")
-    sys.exit(1)
+hash_str = os.environ["KC_RESET_PASSWORD_HASH"]
+user_id = str(uuid.UUID(os.environ["KC_RESET_ADMIN_ID"]))
 
 sql = f"""
-UPDATE user_credentials
-SET password_hash = '{hash_str}',
-    failed_login_attempts = 0,
-    locked_until = NULL,
-    updated_at = NOW()
-WHERE user_id = '{user_id}';
+WITH updated AS (
+    UPDATE user_credentials
+    SET password_hash = '{hash_str}',
+        failed_login_attempts = 0,
+        locked_until = NULL,
+        updated_at = NOW()
+    WHERE user_id = '{user_id}'
+    RETURNING 1
+)
+SELECT COUNT(*) FROM updated;
 """
 
 cmd = [
-    "docker", "exec", "-i",
-    "${DB_CONTAINER}",
-    "psql", "-U", "${DB_USER}", "-d", "${DB_NAME}",
-    "-c", sql
+    "docker",
+    "exec",
+    "-i",
+    os.environ["KC_RESET_DB_CONTAINER_ID"],
+    "psql",
+    "-U",
+    os.environ["KC_RESET_DB_USER_RESOLVED"],
+    "-d",
+    os.environ["KC_RESET_DB_NAME_RESOLVED"],
+    "-v",
+    "ON_ERROR_STOP=1",
+    "-tA",
+    "-c",
+    sql,
 ]
 
 result = subprocess.run(cmd, capture_output=True, text=True)
 if result.returncode != 0:
     print(f"[ERROR] 数据库更新失败: {result.stderr}")
     sys.exit(1)
-else:
-    print(f"[OK] 密码哈希生成成功并已更新到数据库")
-    print(result.stdout, end="")
-PYEOF
 
-if [ $? -ne 0 ]; then
+if result.stdout.strip() != "1":
+    print("[ERROR] 系统管理员缺少唯一登录凭证，未更新任何密码", file=sys.stderr)
+    sys.exit(1)
+
+print("[OK] 密码哈希生成成功并已更新到数据库")
+PYEOF
+then
     error "密码重置失败！"
     exit 1
 fi

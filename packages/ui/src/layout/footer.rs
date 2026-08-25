@@ -1,5 +1,7 @@
 use dioxus::prelude::*;
 
+use super::GITHUB_REPOSITORY_URL;
+
 /// 页脚组件
 #[component]
 pub fn Footer(#[props(default = "KeyCompute".to_string())] site_name: String) -> Element {
@@ -9,7 +11,7 @@ pub fn Footer(#[props(default = "KeyCompute".to_string())] site_name: String) ->
                 "© 2026 "
                 a {
                     class: "footer-link",
-                    href: "https://github.com/aiqubits/keycompute",
+                    href: GITHUB_REPOSITORY_URL,
                     target: "_blank",
                     rel: "noopener noreferrer",
                     "{site_name}"

@@ -68,6 +68,7 @@ pub enum NavIcon {
 /// - `collapsed`：是否折叠状态（Signal）
 /// - `mobile_open`：移动端是否打开（Signal）
 /// - `current_path`：当前活跃路径
+/// - `site_logo_src`：站点 Logo 地址，为空时回退为站点名称首字母
 #[component]
 pub fn Sidebar(
     #[props(default)] sections: Vec<NavSection>,
@@ -80,9 +81,16 @@ pub fn Sidebar(
     #[props(default)] collapse_label: String,
     #[props(default)] close_menu_title: String,
     #[props(default = "KeyCompute".to_string())] site_name: String,
+    #[props(default)] site_logo_src: String,
 ) -> Element {
     let is_collapsed = collapsed();
     let is_mobile_open = mobile_open();
+    let site_initial = site_name
+        .chars()
+        .find(|character| !character.is_whitespace())
+        .unwrap_or('K')
+        .to_uppercase()
+        .collect::<String>();
 
     let sidebar_class = {
         let mut cls = "sidebar".to_string();
@@ -106,7 +114,15 @@ pub fn Sidebar(
         nav { id: "app-sidebar", class: "{sidebar_class}", aria_label: "Main navigation",
             // Logo 区域
             div { class: "sidebar-logo",
-                div { class: "sidebar-logo-icon", "K" }
+                if site_logo_src.trim().is_empty() {
+                    div { class: "sidebar-logo-icon sidebar-logo-fallback", "{site_initial}" }
+                } else {
+                    img {
+                        class: "sidebar-logo-icon",
+                        src: "{site_logo_src}",
+                        alt: "{site_name}",
+                    }
+                }
                 div { class: "sidebar-logo-copy",
                     span { class: "sidebar-logo-text", "{site_name}" }
                     span { class: "sidebar-logo-kicker", "AI token platform" }

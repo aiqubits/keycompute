@@ -1,10 +1,11 @@
 //! KeyCompute 配置管理模块
 //!
-//! 提供统一的配置加载机制：
-//! 1. 环境变量优先（前缀 KC__，双下划线分隔层级）
-//! 2. 配置文件回退（项目根目录 config.toml）
-//! 3. 默认值兜底
-//! 4. 顶层 `APP_BASE_URL` 环境变量可覆盖公开链接基础地址
+//! 运行模式与配置来源由可执行文件的构建方式固定：
+//! 1. debug 构建仅读取项目根目录 `config.toml`
+//! 2. release 构建仅读取 `KC__*` 与顶层 `APP_BASE_URL` 环境变量
+//! 3. 两种来源都使用代码默认值补全未配置项
+//!
+//! 配置中不存在运行模式开关，两种来源也不会相互覆盖。
 
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
@@ -36,11 +37,11 @@ pub use server::ServerConfig;
 
 /// 首次启动时创建的示例管理员邮箱。
 pub const DEFAULT_ADMIN_EMAIL: &str = "admin@keycompute.local";
-/// 首次启动时创建的示例管理员密码；生产环境强烈建议覆盖。
+/// 首次启动时创建的示例管理员密码；生产环境首次创建 system 管理员时会拒绝该值。
 pub const DEFAULT_ADMIN_PASSWORD: &str = "change-me-admin-password";
 
 /// 全局应用配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct AppConfig {
     /// 对外公开的前端应用基础 URL（可选）
     pub app_base_url: Option<String>,
@@ -66,28 +67,10 @@ pub struct AppConfig {
     /// 加密配置（可选）
     pub crypto: Option<CryptoConfig>,
     /// 邮件服务配置
+    #[serde(default)]
     pub email: EmailConfig,
     /// 节点网关配置（可选）
     pub node_gateway: Option<NodeGatewayConfig>,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            app_base_url: Some(Self::default_app_base_url()),
-            server: ServerConfig::default(),
-            database: DatabaseConfig::default(),
-            database_read_urls: Vec::new(),
-            database_routing: DatabaseRoutingConfig::default(),
-            database_read: DatabaseReadConfig::default(),
-            redis: None,
-            auth: AuthConfig::default(),
-            gateway: GatewayConfig::default(),
-            crypto: None,
-            email: EmailConfig::default(),
-            node_gateway: None,
-        }
-    }
 }
 
 /// 配置加载错误
@@ -104,26 +87,20 @@ pub enum ConfigLoadError {
 }
 
 impl AppConfig {
-    fn default_app_base_url() -> String {
-        "https://keycompute.cn".to_string()
-    }
-
-    pub fn resolved_app_base_url(&self) -> String {
+    pub fn resolved_app_base_url(&self) -> Option<String> {
         Self::normalize_app_base_url(self.app_base_url.clone())
-            .unwrap_or_else(Self::default_app_base_url)
     }
 
-    fn apply_global_env_overrides(mut app_config: AppConfig) -> AppConfig {
+    fn apply_production_env_overrides(mut app_config: AppConfig) -> AppConfig {
         if let Ok(url) = std::env::var("APP_BASE_URL") {
-            app_config.app_base_url = Self::normalize_app_base_url(Some(url));
-        } else {
-            app_config.app_base_url = Self::normalize_app_base_url(app_config.app_base_url);
+            app_config.app_base_url = Some(url);
         }
 
-        if app_config.app_base_url.is_none() {
-            app_config.app_base_url = Some(Self::default_app_base_url());
-        }
+        Self::normalize(app_config)
+    }
 
+    fn normalize(mut app_config: AppConfig) -> AppConfig {
+        app_config.app_base_url = Self::normalize_app_base_url(app_config.app_base_url);
         app_config
     }
 
@@ -176,55 +153,24 @@ impl AppConfig {
         }
     }
 
-    /// 加载配置（环境变量优先，配置文件回退）
+    /// 加载 debug 构建的开发配置。
     ///
-    /// 加载顺序：
-    /// 1. 设置默认值
-    /// 2. 从项目根目录 config.toml 加载（如果存在）
-    /// 3. 从环境变量 KC__* 加载（覆盖配置文件）
-    /// 4. 从顶层 APP_BASE_URL 加载公开链接基础地址（覆盖配置文件）
-    ///
-    /// # 环境变量格式
-    /// - 使用 `KC__` 前缀
-    /// - 使用双下划线 `__` 分隔层级
-    /// - 示例：`KC__SERVER__PORT=8080` 对应 `server.port`
-    /// - 顶层 `APP_BASE_URL` 用于公开前端地址
-    pub fn load() -> Result<Self, ConfigLoadError> {
-        // 1. 设置默认值
-        let mut builder = Self::create_default_builder()?;
-
-        // 2. 从配置文件加载（如果存在）
-        let config_paths = ["config.toml"];
-
-        for path in &config_paths {
-            if Path::new(path).exists() {
-                tracing::info!("加载配置文件: {}", path);
-                builder = builder.add_source(File::with_name(path).required(false));
-                break;
-            }
-        }
-
-        // 3. 从环境变量加载（覆盖配置文件）
-        // 支持 KC__SECTION__KEY 格式
-        builder = builder.add_source(
-            Environment::with_prefix("KC")
-                .separator("__")
-                .try_parsing(true)
-                .ignore_empty(true)
-                .list_separator(",")
-                .with_list_parse_key("database_read_urls")
-                .with_list_parse_key("database_routing.read_weights"),
-        );
-
-        let config = builder.build()?;
-        let app_config: AppConfig = Self::apply_global_env_overrides(config.try_deserialize()?);
-
-        tracing::info!("配置加载成功");
-        Ok(app_config)
+    /// 固定读取当前工作目录下的 `config.toml`；文件不存在时
+    /// fail closed，且不读取 `KC__*` 或 `APP_BASE_URL` 环境变量。
+    pub fn load_development() -> Result<Self, ConfigLoadError> {
+        Self::from_file("config.toml")
     }
 
-    /// 仅从环境变量加载配置
-    pub fn from_env() -> Result<Self, ConfigLoadError> {
+    /// 加载 release 构建的生产配置。
+    ///
+    /// 固定读取 `KC__*` 与顶层 `APP_BASE_URL` 环境变量，不探测或
+    /// 读取 `config.toml`。Docker Compose 通过 `.env` 向容器注入这些变量。
+    pub fn load_production() -> Result<Self, ConfigLoadError> {
+        Self::from_env()
+    }
+
+    /// 仅从生产环境变量加载配置。
+    fn from_env() -> Result<Self, ConfigLoadError> {
         // 设置默认值
         let mut builder = Self::create_default_builder()?;
 
@@ -240,12 +186,12 @@ impl AppConfig {
         );
 
         let config = builder.build()?;
-        let app_config: AppConfig = Self::apply_global_env_overrides(config.try_deserialize()?);
+        let app_config: AppConfig = Self::apply_production_env_overrides(config.try_deserialize()?);
 
         Ok(app_config)
     }
 
-    /// 仅从配置文件加载配置
+    /// 仅从开发配置文件加载配置，不接受环境变量覆盖。
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigLoadError> {
         let path = path.as_ref();
 
@@ -262,7 +208,7 @@ impl AppConfig {
         builder = builder.add_source(File::from(path).required(true));
 
         let config = builder.build()?;
-        let app_config: AppConfig = Self::apply_global_env_overrides(config.try_deserialize()?);
+        let app_config: AppConfig = Self::normalize(config.try_deserialize()?);
 
         Ok(app_config)
     }
@@ -421,19 +367,19 @@ impl AppConfig {
             }
         }
 
-        // 项目配置准则：示例凭据必须保持可运行、可覆盖，并在生产环境给出
-        // 强烈告警，但不因保留示例值而阻断启动。该行为由配置契约测试保护；
-        // 除非项目明确变更准则，否则不要将其改为 fail-closed。
+        // 开发环境保留可运行、可覆盖的示例凭据，并在这里给出安全告警。
+        // 生产入口会继续调用 validate_for_production，以 fail-closed 方式拒绝
+        // 公开占位密钥和缺失的 Provider API Key 加密密钥。
         // JWT 密钥安全检查
         if self.auth.jwt_secret == DEFAULT_JWT_SECRET {
             tracing::warn!(
-                "⚠️  安全警告: JWT 密钥使用默认值，生产环境强烈建议设置 KC__AUTH__JWT_SECRET"
+                "⚠️  安全警告: JWT 密钥使用开发示例值；生产启动会拒绝该值，请设置 KC__AUTH__JWT_SECRET"
             );
         }
 
         // JWT 密钥长度检查（排除默认密钥，避免重复警告）
         if self.auth.jwt_secret != DEFAULT_JWT_SECRET && self.auth.jwt_secret.len() < 32 {
-            tracing::warn!("⚠️  安全警告: JWT 密钥长度不足 32 字符，建议使用更长的密钥");
+            tracing::warn!("⚠️  安全警告: JWT 密钥长度不足 32 字节，建议使用更长的密钥");
         }
 
         // JWT 过期时间验证
@@ -488,28 +434,23 @@ impl AppConfig {
         }
 
         let resolved_app_base_url = self.resolved_app_base_url();
-        Self::validate_public_app_base_url(&resolved_app_base_url)
-            .map_err(ConfigLoadError::ValidationError)?;
-
-        if self.app_base_url.is_none() {
-            tracing::info!(
-                "💡 提示: 未显式配置 APP_BASE_URL，已回退为 {}",
-                resolved_app_base_url
-            );
-        }
-
-        if email_is_configured && self.app_base_url.is_none() {
-            tracing::info!(
-                "💡 Email 服务将使用默认公开地址 {} 生成链接",
-                resolved_app_base_url
-            );
+        if let Some(base_url) = resolved_app_base_url.as_deref() {
+            Self::validate_public_app_base_url(base_url)
+                .map_err(ConfigLoadError::ValidationError)?;
+        } else if email_is_configured {
+            return Err(ConfigLoadError::ValidationError(
+                "启用 Email 服务时必须显式配置 APP_BASE_URL；禁止回退到其他部署的公开地址"
+                    .to_string(),
+            ));
+        } else {
+            tracing::info!("💡 提示: 未配置 APP_BASE_URL，密码重置和公开邀请链接功能不可用");
         }
 
         // 加密配置提醒
         let has_crypto_key = self.crypto.as_ref().map(|c| c.has_key()).unwrap_or(false);
         if !has_crypto_key {
             tracing::info!(
-                "💡 提示: 未配置加密密钥，Provider API Key 将明文存储。生产环境强烈建议设置 KC__CRYPTO__SECRET_KEY"
+                "💡 提示: 未配置加密密钥，开发环境会明文存储 Provider API Key；生产启动会拒绝该配置"
             );
         }
 
@@ -651,12 +592,12 @@ impl AppConfig {
                     || secret == "change-me-node-registration-token-secret"
                 {
                     tracing::warn!(
-                        "⚠️  安全警告: Node Gateway registration_token_secret 使用默认占位符，生产环境强烈建议修改"
+                        "⚠️  安全警告: Node Gateway registration_token_secret 使用开发占位符；生产环境配置 Redis 时会拒绝该值"
                     );
                 }
             } else {
                 tracing::warn!(
-                    "⚠️  未设置 Node Gateway registration_token_secret，将使用示例密钥；生产环境强烈建议设置独立随机密钥"
+                    "⚠️  未设置 Node Gateway registration_token_secret，将使用开发示例密钥；生产环境配置 Redis 时会拒绝该配置"
                 );
             }
 
@@ -695,7 +636,7 @@ impl AppConfig {
             tracing::info!("Node Gateway 配置已加载");
         } else {
             tracing::warn!(
-                "未显式配置 Node Gateway，将使用示例密钥和默认参数；生产环境强烈建议设置独立随机密钥"
+                "未显式配置 Node Gateway，将使用开发示例密钥和默认参数；若生产环境配置 Redis，启动检查会要求独立随机密钥"
             );
         }
 
@@ -704,21 +645,33 @@ impl AppConfig {
     }
 
     /// Validate secrets required to run this configuration in production.
-    /// Development keeps the runnable examples, but production must never
-    /// silently accept their publicly known values or plaintext key storage.
+    /// Development keeps the runnable examples, but production always requires
+    /// a non-blank JWT secret of at least 32 bytes and a Provider API-key
+    /// encryption key. A non-default node HMAC secret of at least 16 bytes is
+    /// additionally required when Redis enables Node Gateway. SMTP settings
+    /// must be either complete or entirely disabled.
     pub fn validate_for_production(&self) -> Result<(), ConfigLoadError> {
         self.validate()?;
 
         let mut issues = Vec::new();
-        if self.auth.jwt_secret == DEFAULT_JWT_SECRET || self.auth.jwt_secret.len() < 32 {
+        if self.auth.jwt_secret.trim().is_empty()
+            || self.auth.jwt_secret == DEFAULT_JWT_SECRET
+            || self.auth.jwt_secret.len() < 32
+        {
             issues.push(
-                "KC__AUTH__JWT_SECRET must be a non-default value of at least 32 characters"
-                    .to_string(),
+                "KC__AUTH__JWT_SECRET must be a non-default value of at least 32 bytes".to_string(),
             );
         }
 
         if !self.crypto.as_ref().is_some_and(CryptoConfig::has_key) {
             issues.push("KC__CRYPTO__SECRET_KEY must be configured so Provider API keys are not stored in plaintext".to_string());
+        }
+
+        if self.email.is_partially_configured() {
+            issues.push(
+                "KC__EMAIL__SMTP_HOST, KC__EMAIL__SMTP_USERNAME, KC__EMAIL__SMTP_PASSWORD, and KC__EMAIL__FROM_ADDRESS must either all be configured or all remain blank"
+                    .to_string(),
+            );
         }
 
         // Node Gateway 只有在 Redis 后端存在时才会由 AppState 初始化；纯
@@ -735,7 +688,7 @@ impl AppConfig {
                     || secret == "change-me-in-production"
                     || secret.len() < 16
             }) {
-                issues.push("KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET must be a non-default value of at least 16 characters when Redis enables Node Gateway".to_string());
+                issues.push("KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET must be a non-default value of at least 16 bytes when Redis enables Node Gateway".to_string());
             }
         }
 
@@ -751,6 +704,41 @@ impl AppConfig {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    struct EnvVarGuard {
+        original: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvVarGuard {
+        fn set(values: &[(&'static str, &str)]) -> Self {
+            let original = values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+
+            unsafe {
+                for (key, value) in values {
+                    std::env::set_var(key, value);
+                }
+            }
+
+            Self { original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (key, value) in &self.original {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+    }
 
     fn env_example_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
         let prefix = format!("{key}=");
@@ -781,28 +769,47 @@ mod tests {
             .find_map(|line| line.strip_prefix(&prefix).map(str::trim))
     }
 
+    fn readme_config_row<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
+        let marker = format!("| `{key}` |");
+        contents.lines().find(|line| line.starts_with(&marker))
+    }
+
     #[test]
     fn test_default_config() {
         let config = AppConfig::default();
         assert_eq!(config.server.port, 3000);
         assert_eq!(config.server.bind_addr, "0.0.0.0");
-        assert_eq!(
-            config.app_base_url.as_deref(),
-            Some("https://keycompute.cn")
-        );
+        assert!(config.app_base_url.is_none());
     }
 
     #[test]
     #[serial]
     fn test_config_example_matches_shared_fallbacks() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = root.join("config.example.toml");
         let config = AppConfig::from_file(path).expect("config.example.toml 应与配置结构保持一致");
         let defaults = AppConfig::default();
+        let env_example =
+            std::fs::read_to_string(root.join(".env.example")).expect("应该读取 .env.example");
 
-        assert_eq!(config.app_base_url, defaults.app_base_url);
+        assert_eq!(
+            config.app_base_url.as_deref(),
+            Some("http://localhost:8080")
+        );
         assert_eq!(config.server.bind_addr, defaults.server.bind_addr);
         assert_eq!(config.server.port, defaults.server.port);
-        assert_eq!(config.database.url, defaults.database.url);
+        assert_eq!(
+            config.database.url,
+            "postgres://keycompute:change-me-strong-password@127.0.0.1:5432/keycompute"
+        );
+        let postgres_url = format!(
+            "postgres://{}:{}@127.0.0.1:{}/{}",
+            active_env_example_value(&env_example, "POSTGRES_USER").unwrap(),
+            active_env_example_value(&env_example, "POSTGRES_PASSWORD").unwrap(),
+            active_env_example_value(&env_example, "POSTGRES_PORT").unwrap(),
+            active_env_example_value(&env_example, "POSTGRES_DB").unwrap(),
+        );
+        assert_eq!(config.database.url, postgres_url);
         assert_eq!(
             config.database.max_connections,
             defaults.database.max_connections
@@ -903,6 +910,14 @@ mod tests {
             RedisConfig::default().pool_size
         );
         assert_eq!(
+            config.redis.as_ref().expect("示例包含 Redis").url,
+            format!(
+                "redis://:{}@127.0.0.1:{}",
+                active_env_example_value(&env_example, "REDIS_PASSWORD").unwrap(),
+                active_env_example_value(&env_example, "REDIS_PORT").unwrap(),
+            )
+        );
+        assert_eq!(
             config
                 .redis
                 .as_ref()
@@ -915,6 +930,7 @@ mod tests {
         assert_eq!(config.email.use_tls, defaults.email.use_tls);
         assert_eq!(config.email.timeout_secs, defaults.email.timeout_secs);
         assert_eq!(config.email.requirement_recipient, None);
+        assert_eq!(config.email, defaults.email);
         assert!(config.crypto.is_none());
 
         let node = config.node_gateway.expect("示例包含 Node Gateway");
@@ -956,7 +972,7 @@ mod tests {
             std::fs::read_to_string(root.join(".env.example")).expect("应该读取 .env.example");
 
         let expected = [
-            ("APP_BASE_URL", "https://keycompute.cn"),
+            ("APP_BASE_URL", ""),
             ("KC__SERVER__BIND_ADDR", "0.0.0.0"),
             ("KC__SERVER__PORT", "3000"),
             ("KC__DATABASE__MAX_CONNECTIONS", "10"),
@@ -1021,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_security_examples_are_rejected_in_production() {
+    fn test_compose_security_examples_match_the_production_contract() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for file in ["docker-compose.yml", "docker-compose.replicas.yml"] {
             let contents = std::fs::read_to_string(root.join(file)).expect("应该读取 Compose 文件");
@@ -1035,16 +1051,24 @@ mod tests {
             assert!(contents.contains(&format!(
                 "${{KC__DEFAULT_ADMIN_EMAIL:-{DEFAULT_ADMIN_EMAIL}}}"
             )));
-            assert!(contents.contains(&format!(
-                "${{KC__DEFAULT_ADMIN_PASSWORD:-{DEFAULT_ADMIN_PASSWORD}}}"
-            )));
+            assert!(
+                contents.contains("KC__DEFAULT_ADMIN_PASSWORD: ${KC__DEFAULT_ADMIN_PASSWORD:-}")
+            );
             assert!(contents.contains(&format!(
                 "${{KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET:-{DEFAULT_REGISTRATION_TOKEN_SECRET}}}"
             )));
             assert!(contents.contains("${KC__CRYPTO__SECRET_KEY:-}"));
+            assert!(contents.contains("KC__EMAIL__SMTP_HOST: ${KC__EMAIL__SMTP_HOST:-}"));
+            assert!(contents.contains("APP_BASE_URL: ${APP_BASE_URL:-}"));
             assert!(
-                contents.contains("拒绝"),
-                "{file} 必须明确说明示例安全参数会被生产环境拒绝"
+                contents.contains("本编排启用")
+                    && contents.contains("Redis")
+                    && contents.contains("全新数据库"),
+                "{file} 必须说明节点密钥和管理员引导密码的条件"
+            );
+            assert!(
+                contents.contains("不会被应用统一拦截"),
+                "{file} 不得暗示所有 change-me 凭据都会被应用拒绝"
             );
         }
     }
@@ -1056,36 +1080,117 @@ mod tests {
         let config_example = std::fs::read_to_string(root.join("config.example.toml")).unwrap();
         let contributing = std::fs::read_to_string(root.join("CONTRIBUTING.md")).unwrap();
 
-        assert!(env_example.contains("服务拒绝启动"));
-        assert!(config_example.contains("拒绝启动"));
-        assert!(contributing.contains("fail-closed policy"));
+        for contents in [&env_example, &config_example] {
+            assert!(contents.contains("配置 Redis"));
+            assert!(contents.contains("首次创建 system 管理员"));
+            assert!(contents.contains("不会") && contents.contains("统一拦截"));
+        }
+        assert!(contributing.contains("When Redis enables Node Gateway"));
+        assert!(contributing.contains("Only the first\n  `system` administrator bootstrap"));
+        assert!(contributing.contains("are not covered by\n  the application placeholder checks"));
+        assert!(contributing.contains(
+            "docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.dev.yml"
+        ));
+    }
+
+    #[test]
+    fn documentation_contract_changes_trigger_ci() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workflow =
+            std::fs::read_to_string(root.join(".github/workflows/keycompute.yml")).unwrap();
+
+        assert_eq!(workflow.matches("- \"README*.md\"").count(), 2);
+        assert_eq!(workflow.matches("- \"CONTRIBUTING.md\"").count(), 2);
+    }
+
+    #[test]
+    fn localized_readmes_document_the_production_security_contract() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let obsolete_default_login_guidance = [
+            "Default account: `admin@keycompute.local`, password:",
+            "初始账号：`admin@keycompute.local`，密码：",
+            "預設帳號：`admin@keycompute.local`，密碼：",
+            "Cuenta predeterminada: `admin@keycompute.local`, contraseña:",
+            "الحساب الافتراضي: `admin@keycompute.local`، كلمة المرور:",
+        ];
+
+        for file in [
+            "README.md",
+            "README.zh-CN.md",
+            "README.zh-TW.md",
+            "README.es.md",
+            "README.ar.md",
+        ] {
+            let contents = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(contents.contains("config.example.toml"), "{file}");
+            assert!(contents.contains("docker-compose.dev.yml"), "{file}");
+            assert!(
+                contents.contains(
+                    "docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.dev.yml"
+                ),
+                "{file}: 本地依赖必须显式使用示例环境，不能隐式读取生产 .env"
+            );
+            assert!(!contents.contains("set -a && source .env"), "{file}");
+            assert!(
+                obsolete_default_login_guidance
+                    .iter()
+                    .all(|obsolete| !contents.contains(obsolete)),
+                "{file} 仍在指导生产环境使用默认管理员密码登录"
+            );
+
+            let jwt = readme_config_row(&contents, "KC__AUTH__JWT_SECRET").unwrap();
+            let crypto = readme_config_row(&contents, "KC__CRYPTO__SECRET_KEY").unwrap();
+            let node = readme_config_row(&contents, "KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET")
+                .unwrap();
+            let app_base_url = readme_config_row(&contents, "APP_BASE_URL").unwrap();
+            let admin = readme_config_row(&contents, "KC__DEFAULT_ADMIN_PASSWORD").unwrap();
+            assert!(
+                contents.contains("cargo run -p keycompute-server --release"),
+                "{file} 未说明 release 生产启动方式"
+            );
+            assert!(jwt.contains("32"), "{file}: JWT 门槛未记录");
+            assert!(crypto.contains("Base64") && crypto.contains("32"), "{file}");
+            assert!(node.contains("Redis") && node.contains("16"), "{file}");
+            assert!(admin.contains("system") && admin.contains("12"), "{file}");
+            assert!(
+                !node.ends_with("✅ |"),
+                "{file}: 节点密钥不应标成无条件必填"
+            );
+            assert!(
+                !admin.ends_with("⚪ |"),
+                "{file}: 管理员首启密码不应标成无条件可选"
+            );
+            assert!(
+                !app_base_url.ends_with("⚪ |"),
+                "{file}: 启用邮件或公开邀请时 APP_BASE_URL 是条件必填"
+            );
+        }
     }
 
     #[test]
     fn development_validation_keeps_examples_runnable() {
-        assert!(AppConfig::default().validate().is_ok());
+        let config = AppConfig::default();
+        assert!(config.validate().is_ok());
     }
 
     #[test]
     #[serial]
     fn test_config_from_env() {
-        // 注意：这个测试会读取实际的环境变量
-        // 使用 unsafe 因为 set_var/remove_var 在 Rust 2024 中是 unsafe
-        unsafe {
-            std::env::set_var("KC__SERVER__PORT", "8080");
-            std::env::set_var("APP_BASE_URL", "http://localhost");
-            std::env::set_var("KC__EMAIL__SMTP_HOST", "localhost");
-            std::env::set_var("KC__EMAIL__SMTP_USERNAME", "test");
-            std::env::set_var("KC__EMAIL__SMTP_PASSWORD", "test");
-            std::env::set_var("KC__EMAIL__FROM_ADDRESS", "test@localhost");
-            std::env::set_var(
+        let _env = EnvVarGuard::set(&[
+            ("KC__SERVER__PORT", "8080"),
+            ("APP_BASE_URL", "http://localhost"),
+            ("KC__EMAIL__SMTP_HOST", "localhost"),
+            ("KC__EMAIL__SMTP_USERNAME", "test"),
+            ("KC__EMAIL__SMTP_PASSWORD", "test"),
+            ("KC__EMAIL__FROM_ADDRESS", "test@localhost"),
+            (
                 "KC__DATABASE_READ_URLS",
                 "postgres://reader-1/db,postgres://reader-2/db",
-            );
-            std::env::set_var("KC__DATABASE_ROUTING__READ_WEIGHTS", "1,2");
-            std::env::set_var("KC__REDIS__URL", "redis://redis.internal:6379");
-            std::env::set_var("KC__CRYPTO__SECRET_KEY", "");
-        }
+            ),
+            ("KC__DATABASE_ROUTING__READ_WEIGHTS", "1,2"),
+            ("KC__REDIS__URL", "redis://redis.internal:6379"),
+            ("KC__CRYPTO__SECRET_KEY", ""),
+        ]);
 
         let config = AppConfig::from_env().expect("应该从环境变量加载配置");
         assert_eq!(config.server.port, 8080);
@@ -1104,34 +1209,145 @@ mod tests {
         }
         let config = AppConfig::from_env().expect("空列表环境变量应按未设置处理");
         assert!(config.database_routing.read_weights.is_empty());
+    }
 
-        // 清理
-        unsafe {
-            std::env::remove_var("KC__SERVER__PORT");
-            std::env::remove_var("APP_BASE_URL");
-            std::env::remove_var("KC__EMAIL__SMTP_HOST");
-            std::env::remove_var("KC__EMAIL__SMTP_USERNAME");
-            std::env::remove_var("KC__EMAIL__SMTP_PASSWORD");
-            std::env::remove_var("KC__EMAIL__FROM_ADDRESS");
-            std::env::remove_var("KC__DATABASE_READ_URLS");
-            std::env::remove_var("KC__DATABASE_ROUTING__READ_WEIGHTS");
-            std::env::remove_var("KC__REDIS__URL");
-            std::env::remove_var("KC__CRYPTO__SECRET_KEY");
+    #[test]
+    #[serial]
+    fn development_file_loader_ignores_production_environment() {
+        let _env = EnvVarGuard::set(&[
+            ("KC__SERVER__PORT", "8080"),
+            ("APP_BASE_URL", "https://env.example.com"),
+        ]);
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml");
+        let config = AppConfig::from_file(path).expect("开发配置文件应可加载");
+        assert_eq!(config.server.port, 3000);
+        assert_eq!(
+            config.app_base_url.as_deref(),
+            Some("http://localhost:8080")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn production_loader_treats_blank_compose_email_values_as_disabled() {
+        let compose_email_env = [
+            (
+                "KC__AUTH__JWT_SECRET",
+                "compose-production-jwt-secret-at-least-32-bytes",
+            ),
+            (
+                "KC__CRYPTO__SECRET_KEY",
+                "dGVzdC1rZXktZm9yLXByb2R1Y3Rpb24tMzItYnl0ZXM=",
+            ),
+            ("KC__REDIS__URL", "redis://:secret@redis:6379"),
+            (
+                "KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET",
+                "compose-production-node-secret",
+            ),
+            ("KC__EMAIL__SMTP_HOST", ""),
+            ("KC__EMAIL__SMTP_PORT", "465"),
+            ("KC__EMAIL__SMTP_USERNAME", ""),
+            ("KC__EMAIL__SMTP_PASSWORD", ""),
+            ("KC__EMAIL__FROM_ADDRESS", ""),
+            ("KC__EMAIL__FROM_NAME", "KeyCompute"),
+            ("KC__EMAIL__TIMEOUT_SECS", "30"),
+            ("KC__EMAIL__USE_TLS", "true"),
+            ("KC__EMAIL__REQUIREMENT_RECIPIENT", ""),
+            ("APP_BASE_URL", ""),
+        ];
+
+        let _env = EnvVarGuard::set(&compose_email_env);
+
+        let config =
+            AppConfig::load_production().expect("Compose 空 SMTP 变量应加载为禁用邮件的生产配置");
+        assert_eq!(config.email, EmailConfig::default());
+        assert!(!config.email.is_configured());
+        assert!(config.app_base_url.is_none());
+        config
+            .validate_for_production()
+            .expect("其他生产密钥有效时，空 SMTP 和空 APP_BASE_URL 不应阻止生产启动");
+    }
+
+    #[test]
+    #[serial]
+    fn production_loader_keeps_email_disabled_when_any_required_value_is_blank() {
+        const SMTP_HOST: &str = "KC__EMAIL__SMTP_HOST";
+        const SMTP_USERNAME: &str = "KC__EMAIL__SMTP_USERNAME";
+        const SMTP_PASSWORD: &str = "KC__EMAIL__SMTP_PASSWORD";
+        const FROM_ADDRESS: &str = "KC__EMAIL__FROM_ADDRESS";
+
+        for blank_key in [SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, FROM_ADDRESS] {
+            let values = [
+                (
+                    "KC__AUTH__JWT_SECRET",
+                    "email-test-jwt-secret-at-least-32-bytes",
+                ),
+                (
+                    "KC__CRYPTO__SECRET_KEY",
+                    "dGVzdC1rZXktZm9yLXByb2R1Y3Rpb24tMzItYnl0ZXM=",
+                ),
+                (
+                    SMTP_HOST,
+                    if blank_key == SMTP_HOST {
+                        ""
+                    } else {
+                        "smtp.example.com"
+                    },
+                ),
+                (
+                    SMTP_USERNAME,
+                    if blank_key == SMTP_USERNAME {
+                        ""
+                    } else {
+                        "mailer"
+                    },
+                ),
+                (
+                    SMTP_PASSWORD,
+                    if blank_key == SMTP_PASSWORD {
+                        ""
+                    } else {
+                        "secret"
+                    },
+                ),
+                (
+                    FROM_ADDRESS,
+                    if blank_key == FROM_ADDRESS {
+                        ""
+                    } else {
+                        "noreply@example.com"
+                    },
+                ),
+                ("APP_BASE_URL", ""),
+            ];
+            let _env = EnvVarGuard::set(&values);
+
+            let config = AppConfig::load_production()
+                .expect("留空任一 SMTP 必填变量都应得到可加载的禁用配置");
+            assert!(
+                !config.email.is_configured(),
+                "{blank_key} 留空时不应启用邮件"
+            );
+            assert!(matches!(
+                config.validate_for_production(),
+                Err(ConfigLoadError::ValidationError(message))
+                    if message.contains("KC__EMAIL__SMTP_HOST")
+            ));
         }
     }
 
     #[test]
     #[serial]
     fn test_crypto_config_from_env() {
-        // 设置 crypto 和 email 环境变量
-        unsafe {
-            std::env::set_var("KC__CRYPTO__SECRET_KEY", "dGVzdC1rZXktZnJvbS1lbnY=");
-            std::env::set_var("APP_BASE_URL", "http://localhost");
-            std::env::set_var("KC__EMAIL__SMTP_HOST", "localhost");
-            std::env::set_var("KC__EMAIL__SMTP_USERNAME", "test");
-            std::env::set_var("KC__EMAIL__SMTP_PASSWORD", "test");
-            std::env::set_var("KC__EMAIL__FROM_ADDRESS", "test@localhost");
-        }
+        let _env = EnvVarGuard::set(&[
+            ("KC__CRYPTO__SECRET_KEY", "dGVzdC1rZXktZnJvbS1lbnY="),
+            ("APP_BASE_URL", "http://localhost"),
+            ("KC__EMAIL__SMTP_HOST", "localhost"),
+            ("KC__EMAIL__SMTP_USERNAME", "test"),
+            ("KC__EMAIL__SMTP_PASSWORD", "test"),
+            ("KC__EMAIL__FROM_ADDRESS", "test@localhost"),
+        ]);
 
         let config = AppConfig::from_env().expect("应该从环境变量加载配置");
 
@@ -1140,16 +1356,6 @@ mod tests {
         let crypto = config.crypto.unwrap();
         assert!(crypto.has_key(), "crypto 应该有密钥");
         assert_eq!(crypto.secret_key(), Some("dGVzdC1rZXktZnJvbS1lbnY="));
-
-        // 清理
-        unsafe {
-            std::env::remove_var("KC__CRYPTO__SECRET_KEY");
-            std::env::remove_var("APP_BASE_URL");
-            std::env::remove_var("KC__EMAIL__SMTP_HOST");
-            std::env::remove_var("KC__EMAIL__SMTP_USERNAME");
-            std::env::remove_var("KC__EMAIL__SMTP_PASSWORD");
-            std::env::remove_var("KC__EMAIL__FROM_ADDRESS");
-        }
     }
 
     #[test]
@@ -1356,6 +1562,21 @@ mod tests {
     }
 
     #[test]
+    fn production_validation_rejects_blank_jwt_secret() {
+        let mut config = AppConfig::default();
+        config.auth.jwt_secret = "                                ".to_string();
+        config.crypto = Some(CryptoConfig {
+            secret_key: Some("dGVzdC1rZXktZm9yLXByb2R1Y3Rpb24tMzItYnl0ZXM=".to_string()),
+        });
+
+        assert!(matches!(
+            config.validate_for_production(),
+            Err(ConfigLoadError::ValidationError(message))
+                if message.contains("JWT_SECRET") && message.contains("32 bytes")
+        ));
+    }
+
+    #[test]
     fn production_validation_accepts_explicit_secrets() {
         let mut config = AppConfig::default();
         config.auth.jwt_secret = "a-very-secure-jwt-secret-key-for-production".to_string();
@@ -1401,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_app_base_url_falls_back_when_email_enabled() {
+    fn test_validate_app_base_url_is_required_when_email_enabled() {
         let mut config = AppConfig::default();
         config.auth.jwt_secret = "a-very-secure-jwt-secret-key-for-testing".to_string();
         config.app_base_url = None;
@@ -1411,12 +1632,15 @@ mod tests {
         config.email.from_address = "noreply@example.com".to_string();
 
         let result = config.validate();
-        assert!(result.is_ok());
-        assert_eq!(config.resolved_app_base_url(), "https://keycompute.cn");
+        assert!(matches!(
+            result,
+            Err(ConfigLoadError::ValidationError(message)) if message.contains("APP_BASE_URL")
+        ));
+        assert_eq!(config.resolved_app_base_url(), None);
     }
 
     #[test]
-    fn test_resolved_app_base_url_falls_back_to_official_site() {
+    fn test_resolved_app_base_url_remains_unconfigured_when_missing() {
         let config = AppConfig {
             app_base_url: None,
             server: ServerConfig {
@@ -1426,7 +1650,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(config.resolved_app_base_url(), "https://keycompute.cn");
+        assert_eq!(config.resolved_app_base_url(), None);
     }
 
     #[test]

@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="https://github.com/keycompute/keycompute/stargazers"><img src="https://img.shields.io/github/stars/keycompute/keycompute?style=social" alt="GitHub Stars" /></a>
-  <a href="https://github.com/keycompute/keycompute/issues"><img src="https://img.shields.io/github/issues/aiqubits/keycompute" alt="GitHub Issues" /></a>
+  <a href="https://github.com/keycompute/keycompute/issues"><img src="https://img.shields.io/github/issues/keycompute/keycompute" alt="GitHub Issues" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License" /></a>
   <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs Welcome" /></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.92%2B-orange?logo=rust" alt="Rust Version" /></a>
@@ -115,7 +115,7 @@ KeyCompute هي منصة خدمات حوسبة رموز ذكاء اصطناعي 
 
 ### واجهة أمامية متعددة المنصات
 
-- **لوحة إدارة ويب**: Dioxus WASM SPA، 9 وحدات إدارة
+- **لوحة إدارة ويب**: Dioxus WASM SPA
 - **سطح المكتب**: تطبيق أصلي Dioxus Desktop
 - **الهاتف المحمول**: دعم متعدد المنصات Dioxus Mobile
 - **التحكم في الصلاحيات على مستوى المسار**: التحقق من دور Admin، آمن وقابل للإدارة
@@ -162,12 +162,19 @@ KeyCompute هي منصة خدمات حوسبة رموز ذكاء اصطناعي 
 
 ```bash
 # استنساخ المشروع
-git clone https://github.com/your-org/keycompute.git
+git clone https://github.com/keycompute/keycompute.git
 cd keycompute
 
 # نسخ متغيرات البيئة وتعديلها
 cp .env.example .env
-# عدل ملف .env وأدخل القيم الفعلية
+# قبل أول تشغيل في الإنتاج، استبدل جميع بيانات الاعتماد التشغيلية.
+# يرفض التطبيق التشغيل ما لم تتحقق الشروط التالية على الأقل:
+# - KC__AUTH__JWT_SECRET: قيمة غير افتراضية وغير فارغة، بطول 32 بايت على الأقل
+# - KC__CRYPTO__SECRET_KEY: ترميز Base64 لـ 32 بايت بالضبط
+# - KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET: غير افتراضي، 16 بايت على الأقل
+#   (مطلوب هنا لأن Compose يفعّل Redis/Node Gateway)
+# - KC__DEFAULT_ADMIN_PASSWORD: غير افتراضية وغير فارغة، 12 محرفًا على الأقل
+#   (مطلوبة فقط عند إنشاء أول مدير system)
 
 # تشغيل جميع الخدمات
 docker compose up -d
@@ -176,11 +183,12 @@ docker compose up -d
 docker compose ps
 ```
 
-بعد النشر، افتح `http://localhost:8080` للبدء.
+بعد النشر، افتح `http://localhost` (أو المنفذ المحدد في `WEB_PORT`).
 
-الحساب الافتراضي: `admin@keycompute.local`، كلمة المرور: `change-me-admin-password`
-
-> غيّر كلمة مرور المدير الافتراضية فورًا في بيئة الإنتاج.
+ما لم يتم تجاوزها، يكون بريد مدير التهيئة `admin@keycompute.local`. كلمة المرور
+هي القيمة المضبوطة في `KC__DEFAULT_ADMIN_PASSWORD`؛ قاعدة بيانات إنتاج جديدة لا
+تقبل `change-me-admin-password`. بعد إنشاء أول مدير `system`، احذف كلمة مرور
+التهيئة ذات الاستخدام الواحد من البيئة؛ عمليات إعادة التشغيل اللاحقة لا تحتاجها.
 
 ### الخيار 2: التطوير المحلي
 
@@ -189,43 +197,19 @@ docker compose ps
 > ```bash
 > openssl rand -base64 32
 > ```
+> يبني `cargo run` العادي ملف debug التنفيذي، لذا تحدد طريقة البدء نمط
+> التطوير. يقرأ `config.toml` فقط، ويسمح ببيانات اعتماد محلية عامة والاستماع
+> على `0.0.0.0`. لا تتجاوز `.env.example` أو `KC__*` أو `APP_BASE_URL` هذا الملف؛ لا تستخدمه في الإنتاج.
 
 ```bash
-# إنشاء الشبكة
-docker network create keycompute-internal
+# إنشاء إعداد cargo run
+cp config.example.toml config.toml
 
-# PostgreSQL (باستخدام كلمة المرور من .env)
-docker run -d \
-  --name keycompute-postgres \
-  --network keycompute-internal \
-  -e POSTGRES_DB=keycompute \
-  -e POSTGRES_USER=keycompute \
-  -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-change-me-strong-password}" \
-  -p 5432:5432 \
-  -v keycompute_postgres_data:/var/lib/postgresql/data \
-  --restart unless-stopped \
-  postgres:16-alpine
-
-# Redis (باستخدام كلمة المرور من .env)
-docker run -d \
-  --name keycompute-redis \
-  --network keycompute-internal \
-  -p 6379:6379 \
-  -v keycompute_redis_data:/data \
-  --restart unless-stopped \
-  redis:7-alpine \
-  redis-server \
-  --requirepass "${REDIS_PASSWORD:-change-me-redis-password}" \
-  --maxmemory 256mb \
-  --maxmemory-policy allkeys-lru
+# تشغيل PostgreSQL وRedis بمنافذ محلية تطابق config.toml
+docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis
 
 # تثبيت dioxus-cli
 curl -sSL http://dioxus.dev/install.sh | sh
-
-# تحميل متغيرات البيئة (يوصى باستخدام ملف .env)
-cp .env.example .env
-# عدّل .env بقيم التكوين الفعلية
-set -a && source .env && set +a
 
 # تشغيل الخلفية
 cargo run -p keycompute-server
@@ -233,6 +217,10 @@ cargo run -p keycompute-server
 # تشغيل خادم تطوير الواجهة الأمامية (في طرفية أخرى)
 dx serve --package web --platform web --hot-reload true --addr 0.0.0.0
 ```
+
+يحدد `cargo run -p keycompute-server --release` وصورة Docker نمط الإنتاج.
+يقرأ ملف release التنفيذي متغيرات البيئة فقط ويتجاهل `config.toml`؛ لا يمكن لمعلم
+إعداد أو متغير بيئة تغيير نمط التشغيل.
 
 ---
 
@@ -243,8 +231,9 @@ keycompute/
 ├── crates/                          # الوحدات الأساسية للخلفية (Rust)
 │   ├── keycompute-server/            # خدمة HTTP Axum (تدمج جميع الوحدات)
 │   ├── keycompute-types/             # أنواع وماكروات مشتركة
-│   ├── keycompute-db/                # ORM قاعدة البيانات (23 جدولًا)
+│   ├── keycompute-db/                # ORM قاعدة البيانات وترحيلاتها
 │   ├── keycompute-auth/              # المصادقة والتفويض (JWT + API Key + كلمة المرور)
+│   ├── keycompute-cache/             # تجريد التخزين المؤقت ودعم Redis
 │   ├── keycompute-ratelimit/         # محرك تحديد المعدل (خلفية مزدوجة ذاكرة/Redis)
 │   ├── keycompute-pricing/           # محرك التسعير (ثلاثة مستويات + ذاكرة تخزين مؤقت LRU)
 │   ├── keycompute-routing/           # محرك التوجيه الذكي ثنائي الطبقات
@@ -252,31 +241,30 @@ keycompute/
 │   ├── keycompute-billing/           # الفوترة والتسوية (تسوية دقيقة بعد نهاية التدفق)
 │   ├── keycompute-distribution/      # نظام الإحالة والتوزيع
 │   ├── keycompute-observability/     # ركائز قابلية المراقبة الثلاث
-│   ├── keycompute-config/            # إدارة الإعدادات (متغيرات البيئة + TOML)
+│   ├── keycompute-config/            # محملات منفصلة: TOML لـ debug / البيئة لـ release
 │   ├── keycompute-emailserver/       # خدمة البريد الإلكتروني SMTP
 │   ├── keycompute-payment/           # تكامل الدفع
 │   │   ├── keycompute-alipay/        # دفع Alipay
 │   │   └── keycompute-wechatpay/     # دفع WeChat
 │   ├── llm-gateway/                  # بوابة تنفيذ LLM (طبقة علوية وحيدة)
-│   ├── llm-provider/                 # محولات مقدمي الخدمة
-│   │   ├── keycompute-openai/        # OpenAI
-│   │   ├── keycompute-claude/        # Anthropic Claude
-│   │   ├── keycompute-gemini/        # Google Gemini
-│   │   ├── keycompute-deepseek/      # DeepSeek
-│   │   ├── keycompute-ollama/        # نماذج Ollama المحلية
-│   │   └── keycompute-vllm/          # vLLM مستضافة ذاتيًا
+│   ├── llm-protocol/                 # ترجمة البروتوكولات وتعريفات مقدمي الخدمة
+│   │   ├── openai/                   # بروتوكول متوافق مع OpenAI
+│   │   ├── anthropic/                # بروتوكول متوافق مع Anthropic
+│   │   └── provider/                 # أنواع بروتوكول مقدمي الخدمة المشتركة
 │   ├── node-gateway/                 # بوابة العقد (التسجيل/نبضات القلب/إدارة المهام)
-│   └── integration-tests/           # اختبارات تكامل شاملة (30+ سيناريو)
+│   └── integration-tests/           # اختبارات تكامل شاملة
 ├── packages/                         # الواجهة الأمامية (Dioxus 0.7)
-│   ├── web/                          # لوحة إدارة ويب (9 وحدات إدارة)
+│   ├── web/                          # لوحة إدارة ويب
 │   ├── ui/                           # مكتبة مكونات UI مشتركة
 │   ├── desktop/                      # تطبيق أصلي لسطح المكتب
 │   ├── mobile/                       # تطبيق متعدد المنصات للهاتف المحمول
-│   └── client-api/                   # تغليف عميل API (17 وحدة)
+│   └── client-api/                   # تغليف عميل API
 ├── nginx/                            # إعدادات Nginx كوكيل عكسي
 ├── Dockerfile.server                 # صورة الخلفية
 ├── Dockerfile.web                    # صورة الواجهة الأمامية
-└── docker-compose.yml                # تنسيق الحاويات
+├── docker-compose.yml                # تنسيق حاويات الإنتاج
+├── docker-compose.dev.yml            # منافذ الاعتماديات المحلية
+└── docker-compose.replicas.yml       # تنسيق الإنتاج مع نسخ القراءة
 ```
 
 ---
@@ -285,12 +273,14 @@ keycompute/
 
 ### متغيرات البيئة
 
+ينطبق هذا الجدول على بدء الإنتاج release/Docker؛ يستخدم `cargo run` بوضع debug ملف `config.toml`.
+
 | المتغير | الوصف | مطلوب |
 |:---|:---|:---:|
 | `KC__DATABASE__URL` | سلسلة اتصال PostgreSQL | ✅ |
-| `KC__AUTH__JWT_SECRET` | سر توقيع JWT | ✅ |
-| `KC__CRYPTO__SECRET_KEY` | مفتاح تشفير AES-256-GCM لمفاتيح API (لا يمكن تغييره بعد الكتابة) | ✅ |
-| `KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET` | سر توقيع HMAC؛ لإصدار رموز تسجيل العقدة لمرة واحدة | ✅ |
+| `KC__AUTH__JWT_SECRET` | الإنتاج: سر JWT غير افتراضي وغير فارغ بطول 32 بايت على الأقل | ✅ |
+| `KC__CRYPTO__SECRET_KEY` | الإنتاج: ترميز Base64 لـ 32 بايت بالضبط؛ لا يمكن تغييره بعد حفظ مفاتيح Provider API | ✅ |
+| `KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET` | الإنتاج مع Redis: سر HMAC غير افتراضي بطول 16 بايت على الأقل؛ يصدر رموز تسجيل للاستخدام مرة واحدة | مشروط |
 | `KC__REDIS__URL` | سلسلة اتصال Redis (اختياري؛ بدونه: يتحول محدد المعدل إلى الذاكرة، التخزين المؤقت يصبح no-op، بوابة العقدة غير متوفرة) | ⚪ |
 | `KC__EMAIL__SMTP_HOST` | مضيف SMTP (اختياري) | ⚪ |
 | `KC__EMAIL__SMTP_PORT` | منفذ SMTP (اختياري) | ⚪ |
@@ -299,9 +289,9 @@ keycompute/
 | `KC__EMAIL__FROM_ADDRESS` | عنوان بريد المرسل (اختياري) | ⚪ |
 | `KC__EMAIL__FROM_NAME` | الاسم الظاهر للمرسل (اختياري) | ⚪ |
 | `KC__EMAIL__REQUIREMENT_RECIPIENT` | بريد استلام طلبات المتطلبات (اختياري؛ مطلوب لاستلام طلبات الصفحة الرئيسية) | ⚪ |
-| `APP_BASE_URL` | العنوان العام للواجهة الأمامية (ضروري لإعادة التعيين/الدعوات) | ⚪ |
+| `APP_BASE_URL` | عنوان الواجهة العام لهذا النشر؛ مطلوب عند تفعيل SMTP وقبل تفعيل روابط الدعوة العامة | مشروط |
 | `KC__DEFAULT_ADMIN_EMAIL` | بريد المدير الافتراضي | ⚪ |
-| `KC__DEFAULT_ADMIN_PASSWORD` | كلمة مرور المدير الافتراضية | ⚪ |
+| `KC__DEFAULT_ADMIN_PASSWORD` | كلمة مرور تهيئة لمرة واحدة: مطلوبة فقط عند إنشاء أول مدير `system` في الإنتاج؛ غير افتراضية وغير فارغة وبطول 12 محرفًا على الأقل | مشروط |
 
 ---
 
@@ -381,8 +371,8 @@ cargo build -p keycompute-server --release
 
 نرحب بجميع أنواع المساهمات. يرجى مراجعة [CONTRIBUTING.md](CONTRIBUTING.md) لمعرفة كيفية المشاركة.
 
-- 🐛 [الإبلاغ عن الأخطاء](https://github.com/aiqubits/keycompute/issues/new?template=bug_report.yml)
-- 💡 [طلب ميزات جديدة](https://github.com/aiqubits/keycompute/issues/new?template=feature_request.yml)
+- 🐛 [الإبلاغ عن الأخطاء](https://github.com/keycompute/keycompute/issues/new?template=bug_report.yml)
+- 💡 [طلب ميزات جديدة](https://github.com/keycompute/keycompute/issues/new?template=feature_request.yml)
 - 🔧 [إرسال الكود](CONTRIBUTING.md)
 
 ---
@@ -399,6 +389,6 @@ cargo build -p keycompute-server --release
 
 إذا كان هذا المشروع مفيدًا لك، فسنكون ممتنين لمنحه ⭐️.
 
-**[البدء السريع](#البدء-السريع)** • **[الإبلاغ عن المشكلات](https://github.com/aiqubits/keycompute/issues)** • **[أحدث الإصدارات](https://github.com/aiqubits/keycompute/releases)**
+**[البدء السريع](#البدء-السريع)** • **[الإبلاغ عن المشكلات](https://github.com/keycompute/keycompute/issues)** • **[أحدث الإصدارات](https://github.com/keycompute/keycompute/releases)**
 
 </div>

@@ -30,9 +30,9 @@ pub fn Dashboard() -> Element {
     let user_info = user_store.info.read().clone();
     let is_admin = user_info.as_ref().map(|u| u.is_admin()).unwrap_or(false);
     let distribution_settings_loaded = public_settings_store.loaded();
-    let distribution_enabled = public_settings_store.distribution_enabled();
-    let show_distribution_metrics =
-        !is_admin && distribution_settings_loaded && !matches!(distribution_enabled, Some(false));
+    let show_distribution_metrics = !is_admin
+        && distribution_settings_loaded
+        && public_settings_store.distribution_is_enabled();
 
     let usage_stats = use_resource(move || {
         let auth = auth_store.clone();
@@ -93,7 +93,7 @@ pub fn Dashboard() -> Element {
             if !public_settings_store.loaded() {
                 return None;
             }
-            if matches!(public_settings_store.distribution_enabled(), Some(false)) {
+            if !public_settings_store.distribution_is_enabled() {
                 return Some(Ok(None));
             }
 

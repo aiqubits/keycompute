@@ -1,6 +1,8 @@
 # =============================================================================
-# 安全参数准则：本文件中的 change-me/空值均为可覆盖的运行示例。应用只会
-# 生产模式会拒绝默认 JWT、管理员密码、节点 HMAC 密钥或缺失的 Provider API Key 加密密钥。
+# 安全参数准则：本文件中的 change-me/空值均为可覆盖的开发示例。本编排启用
+# Redis，因此生产启动会拒绝默认 JWT、默认节点 HMAC、缺失或无效的 Provider
+# API Key 加密密钥；全新数据库还会拒绝默认管理员引导密码。数据库、Redis、
+# 复制角色、SMTP 和支付示例凭据不会被应用统一拦截，生产部署仍须全部替换。
 # docker-compose.replicas.yml — KeyCompute 一主多从读写分离部署编排
 #
 # 纯 docker-compose.yml 实现，零外部依赖（无需 Patroni / repmgr / pgpool-II）。
@@ -31,8 +33,10 @@
 #   REDIS_PASSWORD                — Redis 密码
 #   KC__AUTH__JWT_SECRET          — JWT 密钥
 #   POSTGRES_REPLICA_PASSWORD     — 复制角色密码（可选，默认同 POSTGRES_PASSWORD）
-#   KC__DEFAULT_ADMIN_EMAIL       — 系统管理员邮箱（可选，默认 admin@keycompute.local）
-#   KC__DEFAULT_ADMIN_PASSWORD    — 系统管理员密码（可选，默认 change-me-admin-password）
+#   KC__CRYPTO__SECRET_KEY        — Provider API Key 加密密钥（Base64 编码的 32 字节）
+#   KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET — 节点 HMAC 密钥（至少 16 字节）
+#   KC__DEFAULT_ADMIN_EMAIL       — 首次创建 system 管理员的邮箱（可选）
+#   KC__DEFAULT_ADMIN_PASSWORD    — 首次创建 system 管理员的密码（首次必填，至少 12 字符）
 # =============================================================================
 
 name: keycompute-replicas
@@ -320,8 +324,7 @@ services:
       ollama-model-init:
         condition: service_completed_successfully
     environment:
-      # 运行环境
-      KC__ENV: production
+      # release 镜像固定为生产模式，不使用运行模式变量
       # 日志格式（Docker 容器日志由采集系统收集，使用 JSON 格式）
       KC__LOG_FORMAT: json
 
@@ -365,17 +368,17 @@ services:
       # 加密配置（生产环境必须配置；未配置时服务拒绝启动）
       KC__CRYPTO__SECRET_KEY: ${KC__CRYPTO__SECRET_KEY:-}
 
-      # 邮件服务配置
-      KC__EMAIL__SMTP_HOST: ${KC__EMAIL__SMTP_HOST:-smtp.example.com}
+      # 邮件服务配置（SMTP_HOST/USERNAME/PASSWORD/FROM_ADDRESS 留空时禁用）
+      KC__EMAIL__SMTP_HOST: ${KC__EMAIL__SMTP_HOST:-}
       KC__EMAIL__SMTP_PORT: ${KC__EMAIL__SMTP_PORT:-465}
-      KC__EMAIL__SMTP_USERNAME: ${KC__EMAIL__SMTP_USERNAME:-noreply@example.com}
-      KC__EMAIL__SMTP_PASSWORD: ${KC__EMAIL__SMTP_PASSWORD:-change-me-smtp-password}
-      KC__EMAIL__FROM_ADDRESS: ${KC__EMAIL__FROM_ADDRESS:-noreply@example.com}
+      KC__EMAIL__SMTP_USERNAME: ${KC__EMAIL__SMTP_USERNAME:-}
+      KC__EMAIL__SMTP_PASSWORD: ${KC__EMAIL__SMTP_PASSWORD:-}
+      KC__EMAIL__FROM_ADDRESS: ${KC__EMAIL__FROM_ADDRESS:-}
       KC__EMAIL__FROM_NAME: ${KC__EMAIL__FROM_NAME:-KeyCompute}
       KC__EMAIL__TIMEOUT_SECS: ${KC__EMAIL__TIMEOUT_SECS:-30}
       KC__EMAIL__USE_TLS: ${KC__EMAIL__USE_TLS:-true}
       KC__EMAIL__REQUIREMENT_RECIPIENT: ${KC__EMAIL__REQUIREMENT_RECIPIENT:-}
-      APP_BASE_URL: ${APP_BASE_URL:-https://keycompute.cn}
+      APP_BASE_URL: ${APP_BASE_URL:-}
 
       # Gateway 配置
       KC__GATEWAY__TIMEOUT_SECS: ${KC__GATEWAY__TIMEOUT_SECS:-120}
@@ -412,9 +415,9 @@ services:
       KC__SERVER__BIND_ADDR: "0.0.0.0"
       KC__SERVER__PORT: "3000"
 
-      # 默认系统管理员配置（首次启动时自动创建）
+      # 默认系统管理员配置（仅首次创建 system 管理员时使用；创建后可删除密码变量）
       KC__DEFAULT_ADMIN_EMAIL: ${KC__DEFAULT_ADMIN_EMAIL:-admin@keycompute.local}
-      KC__DEFAULT_ADMIN_PASSWORD: ${KC__DEFAULT_ADMIN_PASSWORD:-change-me-admin-password}
+      KC__DEFAULT_ADMIN_PASSWORD: ${KC__DEFAULT_ADMIN_PASSWORD:-}
 
       # 节点网关配置（Node Gateway）
       KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET: ${KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET:-change-me-node-registration-token-secret}

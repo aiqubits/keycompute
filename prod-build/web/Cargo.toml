@@ -1,0 +1,23 @@
+# Dockerfile.web copies this manifest and its sibling Cargo.lock to /app before
+# Cargo runs; member paths are intentionally relative to that staged root.
+[workspace]
+resolver = "2"
+members = [
+    "packages/web",
+    "packages/ui",
+    "packages/client-api",
+    "crates/keycompute-types",
+]
+
+[workspace.dependencies]
+dioxus = { version = "0.7.9" }
+keycompute-types = { path = "crates/keycompute-types" }
+ui = { path = "packages/ui" }
+client-api = { path = "packages/client-api" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

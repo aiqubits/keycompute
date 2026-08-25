@@ -1,8 +1,16 @@
-# 支付模块与支付中心优化方案
+# 支付模块与支付中心优化方案（设计记录）
 
 > 适用范围：KeyCompute Web、Server、Client API、数据库与支付 provider crate  
 > 目标版本：Dioxus 0.7.x  
 > 方案结论：保留支付宝，完整接入微信支付 API v3；支付方式由服务端按真实运行状态判定，前端只展示当前可用渠道。
+>
+> 文档状态：这是改造方案与设计记录；第 2 节记录的是改造前基线，并非当前缺陷清单。
+> 部署时以根目录 README、`.env.example` 与 `config.example.toml` 为准。支付渠道是
+> 可选能力：渠道变量缺失或无效时，该 provider 会被标记为未配置/不可用并从用户侧
+> 隐藏，但不会阻止 KeyCompute 主服务启动。本文所称“启动检查”仅指单个支付 provider
+> 在 `PaymentRegistry` 构造时的本地初始化检查，不属于 JWT、存储加密密钥、节点 HMAC
+> 密钥（仅配置 Redis 时）和首次管理员密码（仅尚无 `system` 用户时）这四类系统强制
+> 启动检查。
 
 ## 1. 目标与边界
 
@@ -14,18 +22,18 @@
 
 本期不包含退款、分账、代金券、JSAPI/小程序支付。接口设计为后续扩展保留能力，但首期微信只开放 Native 支付；支付宝继续支持 Page/WAP/QR。
 
-## 2. 现状审计
+## 2. 改造前现状审计
 
-### 2.1 已有基础
+### 2.1 改造前已有基础
 
 - 已有 `payment_orders`、`user_balances` 与余额流水，可复用现有“订单更新 + 余额充值”的事务逻辑。
 - 支付宝实现已覆盖 Page、WAP、QR、异步通知和主动查单。
 - 系统设置已有 `alipay_enabled`、`wechatpay_enabled` 开关，公开设置也会返回这两个字段。
 - 用户端已有余额、充值记录、用量明细和充值交互；管理员已有支付订单列表。
 
-### 2.2 必须修复的问题
+### 2.2 改造前必须修复的问题（当前实现已完成）
 
-| 位置 | 当前问题 | 影响 |
+| 位置 | 改造前问题 | 影响 |
 | --- | --- | --- |
 | `keycompute-wechatpay` | 仍是 `add(2, 2)` 模板 | 微信支付完全未实现 |
 | `AppState.payment` | 类型固定为支付宝 `PaymentService` | 服务端无法同时装载两个渠道 |
@@ -124,7 +132,7 @@ accepts_new_orders = 管理员启用
 
 其中：
 
-- `misconfigured`：必填项缺失、URL 不合法、密钥或证书无法解析、商户私钥自签自验失败。
+- `misconfigured`：必填项缺失、URL 不合法、密钥或证书无法解析。
 - `configured_unverified`：本地检查通过，但尚未完成真实商户身份、App ID 绑定和产品权限验证。
 - `verified`：当前配置指纹下至少一次受控验证订单或真实下单成功，确认当前商户配置有对应产品权限。
 - `available`：近期没有确定性故障。
@@ -133,19 +141,26 @@ accepts_new_orders = 管理员启用
 
 建议熔断规则：明确的认证/商户权限失败首次发生即进入 `unavailable`；其他确定性业务错误在 5 分钟内连续 3 次后进入 `unavailable`；网络超时只进入 `degraded`，不因一次网络抖动隐藏渠道。60 秒后允许后台任务半开探测，创建或查询订单成功可恢复 `available`，但不得改变运营开关。管理员可手动“重新检测”。
 
-### 4.3 启动检查与运行检查
+### 4.3 渠道初始化检查与运行检查（不阻断主服务启动）
 
-支付宝启动检查：App ID、商户私钥、支付宝公钥、通知 URL 必填；RSA2 密钥可解析；用商户私钥签名并做本地结构校验；通知 URL 必须是生产环境 HTTPS 地址。
+以下检查只决定对应 provider 能否进入 Registry。缺项或校验失败会记录“provider unavailable”
+并关闭该渠道；主服务继续启动。只有已配置渠道才执行后续受控验证和运行状态管理。
 
-微信启动检查：`appid`、`mchid`、商户证书序列号、商户 API 私钥、API v3 密钥、微信支付公钥 ID/公钥、通知 URL 必填；API v3 密钥必须为 32 字节；RSA 私钥与微信支付公钥可解析；生产通知 URL 必须是 HTTPS。启动检查通过只进入 `configured_unverified`，不能直接宣称渠道真实可用。
+支付宝渠道初始化检查：App ID、商户私钥、支付宝公钥、通知 URL 必填；RSA2 私钥与公钥可解析；通知 URL 在非本地环境必须是 HTTPS 地址。
 
-微信 `appid` 与 `mchid` 的真实绑定和 Native 产品权限无法仅靠本地密码学检查证明。生产开放前必须由管理员执行一次受控验证订单：成功取得 `code_url` 后立即关单，或由专用白名单验证流程真实下单成功，把状态提升为 `verified`；该流程不通过普通用户方法列表进入，普通用户不得承担首单探测。支付宝采用相同的 `configured_unverified → verified` 规则；迁移时只有使用当前配置成功查询历史订单，才能把支付宝标记为 `verified`。
+微信渠道初始化检查：`appid`、`mchid`、商户证书序列号、商户 API 私钥、API v3 密钥、微信支付公钥 ID/公钥、通知 URL 必填；API v3 密钥必须为 32 字节；RSA 私钥与微信支付公钥可解析；非本地通知 URL 必须是 HTTPS。初始化检查通过只进入 `configured_unverified`，不能直接宣称渠道真实可用。
+
+微信 `appid` 与 `mchid` 的真实绑定和 Native 产品权限无法仅靠本地密码学检查证明。生产开放前必须由管理员执行一次受控验证订单：成功取得 `code_url` 后立即关单，把状态提升为 `verified`；该流程不通过普通用户方法列表进入，普通用户不得承担首单探测。支付宝采用相同的 `configured_unverified → verified` 规则，由管理员创建并关闭真实的 0.01 元验证订单后标记为 `verified`。
 
 验证状态必须绑定 `verified_config_fingerprint`，指纹覆盖 App ID、商户号、证书/公钥 ID、通知 URL 和密钥版本的不可逆摘要。上述任一配置变化都立即清除原验证状态，回到 `configured_unverified`，不得沿用旧凭证的验证结果。
 
-不建议为了展示页面而每次实时调用第三方接口。`GET /payments/methods` 读取健康快照，避免页面加载速度受第三方网络影响。数据库保存单调递增的 `payment_config_version`、配置指纹、验证状态和集群级熔断状态，Redis Pub/Sub 只负责加速失效通知；各实例同时保留不超过 30 秒的数据库版本轮询兜底，Redis 不可用不能产生第二套事实来源。
+不建议为了展示页面而每次实时调用第三方接口。当前
+`GET /api/v1/payments/methods` 从 Registry 和数据库状态计算结果，避免页面加载速度受
+第三方网络影响。
 
-每个实例针对当前配置版本上报短期 readiness 心跳。只有所有仍处于服务发现中的活跃实例都完成当前版本 provider 初始化，集群准入状态才允许对用户返回该渠道；未完成初始化的实例必须从支付 API 流量中摘除或使集群准入关闭。创建订单仍需在本机执行最终准入检查，不能信任页面早先获得的结果。这样避免方法查询命中实例 A、创建请求命中未就绪实例 B 时出现状态分裂。
+多实例配置版本轮询、Redis 失效广播和 provider readiness 心跳仍属于本方案的后续目标，
+不是当前启动契约。当前创建订单仍会在本机执行最终准入检查，不能信任页面早先获得
+的方法快照。
 
 ### 4.4 对外返回
 
@@ -179,15 +194,19 @@ GET /api/v1/payments/methods
 
 ### 5.1 配置与密钥
 
-在 `keycompute-config` 增加支付配置。非敏感项可以写入 TOML；敏感项只允许来自 `KC__` 分层环境变量或密钥管理服务，不写入 `system_settings`，不通过管理 API 回传明文。项目当前配置加载器不支持在 TOML 字符串中展开 `${ENV_NAME}`，因此方案不使用这种占位符：
+当前实现不在 `keycompute-config` 的 TOML 模型中声明支付配置。`PaymentRegistry`
+直接从进程环境构造可选 provider；密钥不写入 `system_settings`，也不通过管理 API
+回传明文。支付宝使用 `ALIPAY_*` 变量：
 
-```toml
-[payment.wechatpay]
-notify_url = "https://example.com/api/v1/payments/notify/wechatpay"
-timeout_minutes = 15
+```text
+ALIPAY_APP_ID=...
+ALIPAY_PRIVATE_KEY=...
+ALIPAY_PUBLIC_KEY=...
+ALIPAY_NOTIFY_URL=https://example.com/api/v1/payments/notify/alipay
 ```
 
-部署环境注入：
+微信优先使用以下 `KC__PAYMENT__WECHATPAY__*` 变量（同时兼容现有
+`WECHATPAY_*` 旧变量作为回退）：
 
 ```text
 KC__PAYMENT__WECHATPAY__APPID=...

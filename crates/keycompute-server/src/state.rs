@@ -75,7 +75,7 @@ impl AppStateConfig {
     /// 从 keycompute_config::AppConfig 创建
     pub fn from_config(config: &keycompute_config::AppConfig) -> Self {
         Self {
-            app_base_url: Some(config.resolved_app_base_url()),
+            app_base_url: config.resolved_app_base_url(),
             rate_limit: if let Some(redis) = &config.redis {
                 RateLimitBackendConfig::Redis {
                     url: redis.url.clone(),
@@ -104,16 +104,16 @@ impl AppStateConfig {
 ///
 /// # 参数
 /// - `config`: 应用配置
-/// - `is_production`: 是否为非开发环境；用于调整缺失密钥时的告警等级
+/// - `is_production`: 是否为非开发环境；生产环境缺失密钥时直接返回错误
 ///
 /// # 返回
-/// - `Ok(())`: 成功初始化，或未配置密钥并回退到明文存储
-/// - `Err(...)`: 已提供密钥但格式错误
+/// - `Ok(())`: 成功初始化，或开发环境未配置密钥并回退到明文存储
+/// - `Err(...)`: 生产环境缺失密钥，或已提供的密钥格式错误
 ///
 /// # 示例
 /// ```rust,ignore
-/// let config = AppConfig::load()?;
-/// init_global_crypto(&config, true)?;
+/// let config = AppConfig::load_development()?;
+/// init_global_crypto(&config, false)?;
 /// let state = AppState::with_config(AppStateConfig::from_config(&config));
 /// ```
 pub fn init_global_crypto(
@@ -802,6 +802,19 @@ mod tests {
     #[test]
     fn production_crypto_initialization_rejects_missing_key() {
         assert!(init_global_crypto(&keycompute_config::AppConfig::default(), true).is_err());
+    }
+
+    #[test]
+    fn crypto_initialization_rejects_invalid_configured_key() {
+        let config = keycompute_config::AppConfig {
+            crypto: Some(keycompute_config::CryptoConfig {
+                secret_key: Some("not-base64-or-32-bytes".to_string()),
+            }),
+            ..keycompute_config::AppConfig::default()
+        };
+
+        assert!(init_global_crypto(&config, true).is_err());
+        assert!(init_global_crypto(&config, false).is_err());
     }
 
     #[test]

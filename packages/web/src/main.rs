@@ -14,6 +14,7 @@ mod views;
 use app::App;
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
+pub(crate) const BRAND_LOGO: Asset = asset!("/assets/logo.jpg");
 const MAIN_CSS: Asset = asset!(
     "/assets/main.css",
     AssetOptions::css().with_static_head(true)

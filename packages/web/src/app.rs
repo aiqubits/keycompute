@@ -232,8 +232,11 @@ pub fn AppLayout() -> Element {
     let site_name = public_settings_store
         .site_name()
         .unwrap_or_else(|| "KeyCompute".to_string());
-    let show_distribution_nav = public_settings_store.loaded()
-        && !matches!(public_settings_store.distribution_enabled(), Some(false));
+    let site_logo_src = public_settings_store
+        .site_logo_url()
+        .unwrap_or_else(|| crate::BRAND_LOGO.to_string());
+    let show_distribution_nav =
+        public_settings_store.loaded() && public_settings_store.distribution_is_enabled();
 
     let mut billing_nav_items = vec![NavItem::new(
         i18n.t("nav.payments"),
@@ -347,6 +350,7 @@ pub fn AppLayout() -> Element {
             user_name,
             current_path,
             site_name,
+            site_logo_src,
             home_title: i18n.t("layout.back_to_home"),
             open_menu_title: i18n.t("layout.open_menu"),
             close_menu_title: i18n.t("layout.close_menu"),

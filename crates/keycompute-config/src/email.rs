@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 /// 邮件服务配置
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(default)]
 pub struct EmailConfig {
     /// SMTP 服务器地址
     pub smtp_host: String,
@@ -49,11 +50,11 @@ fn default_timeout_secs() -> u64 {
 impl Default for EmailConfig {
     fn default() -> Self {
         Self {
-            smtp_host: "localhost".to_string(),
+            smtp_host: String::new(),
             smtp_port: 465,
             smtp_username: String::new(),
             smtp_password: String::new(),
-            from_address: "noreply@localhost".to_string(),
+            from_address: String::new(),
             from_name: Some("KeyCompute".to_string()),
             use_tls: true,
             timeout_secs: 30,
@@ -74,10 +75,24 @@ impl EmailConfig {
 
     /// 检查是否处于“部分配置”状态
     ///
-    /// 默认配置表示未启用邮件能力；只有在偏离默认值但仍缺少必填项时，
-    /// 才视为需要在启动阶段报错的部分配置。
+    /// 只有至少一个 SMTP 必填项（或依赖 SMTP 的需求接收人）已填写、但
+    /// 完整配置仍不成立时，才视为部分配置。仅调整显示名称、TLS 或超时
+    /// 不代表启用邮件能力。
     pub fn is_partially_configured(&self) -> bool {
-        self != &Self::default() && !self.is_configured()
+        let has_email_intent = [
+            self.smtp_host.as_str(),
+            self.smtp_username.as_str(),
+            self.smtp_password.as_str(),
+            self.from_address.as_str(),
+        ]
+        .into_iter()
+        .any(|value| !value.trim().is_empty())
+            || self
+                .requirement_recipient
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+
+        has_email_intent && !self.is_configured()
     }
 
     /// 获取完整的发件人地址（带名称）
@@ -96,6 +111,8 @@ mod tests {
     #[test]
     fn test_default_email_config() {
         let config = EmailConfig::default();
+        assert!(config.smtp_host.is_empty());
+        assert!(config.from_address.is_empty());
         assert_eq!(config.smtp_port, 465);
         assert!(config.use_tls);
         assert_eq!(config.timeout_secs, 30);
@@ -131,6 +148,7 @@ mod tests {
             smtp_host: "smtp.example.com".to_string(),
             smtp_username: "user".to_string(),
             smtp_password: "pass".to_string(),
+            from_address: "noreply@example.com".to_string(),
             ..Default::default()
         };
         assert!(configured.is_configured());
@@ -147,5 +165,19 @@ mod tests {
 
         assert!(!partial.is_configured());
         assert!(partial.is_partially_configured());
+
+        let optional_only = EmailConfig {
+            from_name: Some("Custom Brand".to_string()),
+            use_tls: false,
+            timeout_secs: 5,
+            ..Default::default()
+        };
+        assert!(!optional_only.is_partially_configured());
+
+        let recipient_without_smtp = EmailConfig {
+            requirement_recipient: Some("ops@example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(recipient_without_smtp.is_partially_configured());
     }
 }

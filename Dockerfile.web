@@ -3,10 +3,10 @@
 #
 # 构建阶段：
 #   1. wasm-builder — 安装 dioxus-cli，编译 WASM + 打包静态资产
-#   2. runtime      — Nginx 托管 dist/ 目录，配置 WASM MIME 类型
+#   2. runtime      — Nginx 托管 Dioxus public 产物，配置 WASM MIME 类型
 #
 # Dioxus 编译产物说明：
-#   dx build --release 会在 dist/ 目录生成：
+#   dx build --release 会在 target/dx/web/release/web/public/ 生成：
 #   - index.html
 #   - assets/         （JS、CSS、图片、字体等）
 #   - *.wasm          （WebAssembly 二进制）
@@ -28,16 +28,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 添加 wasm32 编译目标
 RUN rustup target add wasm32-unknown-unknown
 
-# 安装 dioxus-cli（dioxus-cli 在 crates.io 的版本号独立于框架版本，不能指定 --version 0.7.x）
-# --locked 保证 dioxus-cli 自身依赖锁定
+# 使用轻量 sparse 索引；所有 Cargo 步骤共享后续 BuildKit cache mount。
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+ENV CARGO_HTTP_TIMEOUT=600
+ENV CARGO_NET_RETRY=10
+
 # 安装 dioxus-cli（版本必须与项目 dioxus 版本严格匹配）
 # 项目 dioxus 版本为 0.7.9（见 Cargo.toml workspace.dependencies）
-RUN cargo install dioxus-cli@0.7.9 --locked
+# --locked 保证 dioxus-cli 自身依赖锁定
+RUN --mount=type=cache,id=keycompute-web-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=keycompute-web-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    cargo install dioxus-cli@0.7.9 --locked
 
 # 预安装 wasm-bindgen-cli（版本必须与项目 wasm-bindgen 版本严格一致）
 # 项目 wasm-bindgen 版本为 0.2.114（见 Cargo.lock）
 # NO_DOWNLOADS=1 模式下 dx 会对 `wasm-bindgen --version` 做精确版本匹配
-RUN cargo install wasm-bindgen-cli@0.2.114 --locked
+RUN --mount=type=cache,id=keycompute-web-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=keycompute-web-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    cargo install wasm-bindgen-cli@0.2.114 --locked
 
 # 预安装 esbuild（dx web 构建需要；NO_DOWNLOADS=1 禁止 dx 自动下载，必须预置到 PATH）
 # 从 npm registry 下载，便于版本锁定与二进制命名
@@ -53,31 +61,44 @@ RUN ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
 
 WORKDIR /app
 
-# 复制工作区配置与锁文件（优先复制，利用 Docker 层缓存）
-COPY Cargo.toml Cargo.lock ./
+# 使用 Docker 专用 Web-only workspace，避免 dx 的 `cargo metadata` 扫描
+# desktop、mobile、server 和 integration-tests。精简后的 workspace 成员
+# 集合需要自己的锁文件；Cargo 不接受根 workspace 锁文件中多出的成员和依赖。
+COPY prod-build/web/Cargo.toml prod-build/web/Cargo.lock ./
+COPY packages/web packages/web/
+COPY packages/ui packages/ui/
+COPY packages/client-api packages/client-api/
+COPY crates/keycompute-types crates/keycompute-types/
 
-# 复制完整工作区源码
-# 注意：Cargo 解析工作区时要求 workspace.members 中声明的所有成员目录都必须存在
-# 因此需要同时复制 packages/ 和 crates/ 两个顶层目录
-COPY packages/ packages/
-COPY crates/ crates/
+# dx 0.7.9 会先执行未按平台过滤的 cargo metadata。只在这个 Web-only
+# workspace 中预取锁定依赖，确保后续 dx 可完全离线运行。
+RUN --mount=type=cache,id=keycompute-web-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=keycompute-web-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    cargo fetch --locked
 
-# 预先下载依赖，避免 dx build 时 cargo metadata 网络等待问题
-RUN cargo fetch
+# 仅编译 Web/WASM 生产依赖，并为后续 dx build 提前验证 Rust 代码。
+RUN --mount=type=cache,id=keycompute-web-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=keycompute-web-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    cargo check --locked --release \
+    --package web \
+    --target wasm32-unknown-unknown
 
 # 编译前端（生产模式，在工作区根目录执行）
-# dx build 产物输出到工作区根目录的 dist/ 下（即 /app/dist）
+# dx build 产物输出到 /app/target/dx/web/release/web/public。
 # --platform web 显式指定平台，Docker/CI 无图形环境下避免平台推断错误
 # NO_DOWNLOADS=1 是 dioxus-cli 0.7.9 实际生效的开关（见 CliSettings::prefer_no_downloads）：
 # 强制 dx 使用 PATH 中的本地工具链（apt binaryen 的 wasm-opt + 上面预装的 wasm-bindgen-cli/esbuild），
-# 而不是构建时从 GitHub 下载（避免连接超时）。wasm-opt 优化不会被跳过。
+# 而不是构建时从 GitHub 下载（避免连接超时）。
 # 此前的 DX_SKIP_WASM_OPT 会被 dx 静默忽略，仍然触发网络下载。
 # API_BASE_URL 未设置时编译期缺省为空字符串（同源相对路径，经 Nginx 反代访问后端）；
 # 分域部署时由 Compose build args 注入绝对 URL。
 ARG API_BASE_URL=""
 ENV API_BASE_URL=${API_BASE_URL}
 ENV NO_DOWNLOADS=1
-RUN dx build --release --package web --platform web
+ENV CARGO_NET_OFFLINE=true
+RUN --mount=type=cache,id=keycompute-web-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=keycompute-web-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    dx build --release --package web --platform web
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 阶段 2：runtime — Nginx 静态文件托管

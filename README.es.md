@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="https://github.com/keycompute/keycompute/stargazers"><img src="https://img.shields.io/github/stars/keycompute/keycompute?style=social" alt="GitHub Stars" /></a>
-  <a href="https://github.com/keycompute/keycompute/issues"><img src="https://img.shields.io/github/issues/aiqubits/keycompute" alt="GitHub Issues" /></a>
+  <a href="https://github.com/keycompute/keycompute/issues"><img src="https://img.shields.io/github/issues/keycompute/keycompute" alt="GitHub Issues" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License" /></a>
   <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs Welcome" /></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.92%2B-orange?logo=rust" alt="Rust Version" /></a>
@@ -115,7 +115,7 @@ puntuación = 0.30 × Factor de costo + 0.25 × Factor de latencia + 0.25 × Tas
 
 ### Frontend multiplataforma
 
-- **Panel de administración web**: Dioxus WASM SPA, 9 módulos de gestión
+- **Panel de administración web**: Dioxus WASM SPA
 - **Escritorio**: aplicación nativa Dioxus Desktop
 - **Móvil**: soporte multiplataforma Dioxus Mobile
 - **Control de permisos a nivel de ruta**: verificación de rol Admin, seguro y manejable
@@ -162,12 +162,19 @@ puntuación = 0.30 × Factor de costo + 0.25 × Factor de latencia + 0.25 × Tas
 
 ```bash
 # Clonar el proyecto
-git clone https://github.com/your-org/keycompute.git
+git clone https://github.com/keycompute/keycompute.git
 cd keycompute
 
 # Copiar y editar las variables de entorno
 cp .env.example .env
-# Edita .env y completa la configuración real
+# Antes del primer arranque en producción, sustituye todas las credenciales.
+# La aplicación exige como mínimo:
+# - KC__AUTH__JWT_SECRET: no predeterminado, no vacío, al menos 32 bytes
+# - KC__CRYPTO__SECRET_KEY: Base64 de exactamente 32 bytes
+# - KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET: no predeterminado, al menos 16 bytes
+#   (obligatorio aquí porque este Compose habilita Redis/Node Gateway)
+# - KC__DEFAULT_ADMIN_PASSWORD: no predeterminado, no vacío, al menos 12 caracteres
+#   (solo al crear el primer administrador system)
 
 # Iniciar todos los servicios
 docker compose up -d
@@ -176,11 +183,13 @@ docker compose up -d
 docker compose ps
 ```
 
-Después del despliegue, abre `http://localhost:8080` para comenzar.
+Después del despliegue, abre `http://localhost` (o el puerto definido en `WEB_PORT`).
 
-Cuenta predeterminada: `admin@keycompute.local`, contraseña: `change-me-admin-password`
-
-> Cambia inmediatamente la contraseña predeterminada del administrador en producción.
+Si no se cambia, el correo del administrador inicial es `admin@keycompute.local`.
+La contraseña es el valor configurado en `KC__DEFAULT_ADMIN_PASSWORD`; una base
+de datos de producción nueva nunca acepta `change-me-admin-password`. Después de
+crear el primer administrador `system`, elimina esta contraseña de un solo uso
+del entorno; los reinicios posteriores no la necesitan.
 
 ### Opción 2: desarrollo local
 
@@ -189,43 +198,20 @@ Cuenta predeterminada: `admin@keycompute.local`, contraseña: `change-me-admin-p
 > ```bash
 > openssl rand -base64 32
 > ```
+> Un `cargo run` normal compila el ejecutable debug, por lo que el propio método
+> de inicio selecciona el modo de desarrollo. Solo lee `config.toml`, permite
+> credenciales locales públicas y puede escuchar en `0.0.0.0`. `.env.example`,
+> `KC__*` y `APP_BASE_URL` no sobrescriben ese archivo; no lo uses en producción.
 
 ```bash
-# Crear la red
-docker network create keycompute-internal
+# Crear la configuración usada por cargo run
+cp config.example.toml config.toml
 
-# PostgreSQL (usando la contraseña de .env)
-docker run -d \
-  --name keycompute-postgres \
-  --network keycompute-internal \
-  -e POSTGRES_DB=keycompute \
-  -e POSTGRES_USER=keycompute \
-  -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-change-me-strong-password}" \
-  -p 5432:5432 \
-  -v keycompute_postgres_data:/var/lib/postgresql/data \
-  --restart unless-stopped \
-  postgres:16-alpine
-
-# Redis (usando la contraseña de .env)
-docker run -d \
-  --name keycompute-redis \
-  --network keycompute-internal \
-  -p 6379:6379 \
-  -v keycompute_redis_data:/data \
-  --restart unless-stopped \
-  redis:7-alpine \
-  redis-server \
-  --requirepass "${REDIS_PASSWORD:-change-me-redis-password}" \
-  --maxmemory 256mb \
-  --maxmemory-policy allkeys-lru
+# Iniciar PostgreSQL y Redis con puertos locales que coinciden con config.toml
+docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis
 
 # Instalar dioxus-cli
 curl -sSL http://dioxus.dev/install.sh | sh
-
-# Cargar variables de entorno (se recomienda usar el archivo .env)
-cp .env.example .env
-# Edita .env con tus valores de configuración reales
-set -a && source .env && set +a
 
 # Iniciar el backend
 cargo run -p keycompute-server
@@ -233,6 +219,10 @@ cargo run -p keycompute-server
 # Iniciar el servidor de desarrollo frontend (en otra terminal)
 dx serve --package web --platform web --hot-reload true --addr 0.0.0.0
 ```
+
+`cargo run -p keycompute-server --release` y la imagen Docker seleccionan el
+modo de producción. El ejecutable release solo lee variables de entorno e ignora
+`config.toml`; ningún parámetro ni variable de entorno cambia el modo de ejecución.
 
 ---
 
@@ -243,8 +233,9 @@ keycompute/
 ├── crates/                          # Módulos principales del backend (Rust)
 │   ├── keycompute-server/            # Servicio HTTP Axum (integra todos los módulos)
 │   ├── keycompute-types/             # Tipos y macros compartidos
-│   ├── keycompute-db/                # ORM de base de datos (23 tablas)
+│   ├── keycompute-db/                # ORM y migraciones de base de datos
 │   ├── keycompute-auth/              # Autenticación y autorización (JWT + API Key + Contraseña)
+│   ├── keycompute-cache/             # Abstracción de caché y soporte Redis
 │   ├── keycompute-ratelimit/         # Motor de limitación (backend dual memoria/Redis)
 │   ├── keycompute-pricing/           # Motor de precios (tres niveles + caché LRU)
 │   ├── keycompute-routing/           # Motor de enrutamiento inteligente de dos capas
@@ -252,31 +243,30 @@ keycompute/
 │   ├── keycompute-billing/           # Facturación y liquidación (liquidación precisa post-transmisión)
 │   ├── keycompute-distribution/      # Sistema de distribución por referidos
 │   ├── keycompute-observability/     # Tres pilares de observabilidad
-│   ├── keycompute-config/            # Gestión de configuración (variables de entorno + TOML)
+│   ├── keycompute-config/            # Cargadores separados: TOML debug / entorno release
 │   ├── keycompute-emailserver/       # Servicio de correo SMTP
 │   ├── keycompute-payment/           # Integración de pagos
 │   │   ├── keycompute-alipay/        # Pago Alipay
 │   │   └── keycompute-wechatpay/     # Pago WeChat
 │   ├── llm-gateway/                  # Gateway de ejecución LLM (única capa upstream)
-│   ├── llm-provider/                 # Adaptadores de providers
-│   │   ├── keycompute-openai/        # OpenAI
-│   │   ├── keycompute-claude/        # Anthropic Claude
-│   │   ├── keycompute-gemini/        # Google Gemini
-│   │   ├── keycompute-deepseek/      # DeepSeek
-│   │   ├── keycompute-ollama/        # Modelos locales Ollama
-│   │   └── keycompute-vllm/          # vLLM autohospedado
+│   ├── llm-protocol/                 # Traducción de protocolos y definiciones de providers
+│   │   ├── openai/                   # Protocolo compatible con OpenAI
+│   │   ├── anthropic/                # Protocolo compatible con Anthropic
+│   │   └── provider/                 # Tipos de protocolo compartidos
 │   ├── node-gateway/                 # Gateway de nodos (registro/heartbeat/gestión de tareas)
-│   └── integration-tests/           # Pruebas de integración integrales (30+ escenarios)
+│   └── integration-tests/           # Pruebas de integración integrales
 ├── packages/                         # Frontend (Dioxus 0.7)
-│   ├── web/                          # Panel de administración web (9 módulos de gestión)
+│   ├── web/                          # Panel de administración web
 │   ├── ui/                           # Biblioteca de componentes UI compartidos
 │   ├── desktop/                      # Aplicación nativa de escritorio
 │   ├── mobile/                       # Aplicación multiplataforma móvil
-│   └── client-api/                   # Cliente API encapsulado (17 módulos)
+│   └── client-api/                   # Cliente API encapsulado
 ├── nginx/                            # Configuración de proxy inverso Nginx
 ├── Dockerfile.server                 # Imagen del backend
 ├── Dockerfile.web                    # Imagen del frontend
-└── docker-compose.yml                # Orquestación de contenedores
+├── docker-compose.yml                # Orquestación de producción
+├── docker-compose.dev.yml            # Puertos locales para dependencias
+└── docker-compose.replicas.yml       # Orquestación con réplicas de lectura
 ```
 
 ---
@@ -285,12 +275,15 @@ keycompute/
 
 ### Variables de entorno
 
+Esta tabla se aplica al inicio de producción release/Docker. Un `cargo run`
+debug usa `config.toml`.
+
 | Variable | Descripción | Obligatoria |
 |:---|:---|:---:|
 | `KC__DATABASE__URL` | Cadena de conexión de PostgreSQL | ✅ |
-| `KC__AUTH__JWT_SECRET` | Secreto de firma JWT | ✅ |
-| `KC__CRYPTO__SECRET_KEY` | Clave de cifrado AES-256-GCM para API keys (no se puede cambiar después de escribir) | ✅ |
-| `KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET` | Secreto de firma HMAC; utilizado para emitir tokens de registro únicos | ✅ |
+| `KC__AUTH__JWT_SECRET` | Producción: secreto JWT no predeterminado/no vacío de al menos 32 bytes | ✅ |
+| `KC__CRYPTO__SECRET_KEY` | Producción: Base64 de exactamente 32 bytes; no puede cambiarse después de guardar API keys de Provider | ✅ |
+| `KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET` | Producción con Redis: secreto HMAC no predeterminado de al menos 16 bytes; emite tokens de registro de un solo uso | Condicional |
 | `KC__REDIS__URL` | Cadena de conexión de Redis (opcional; sin ella: limitador de tasa cae a memoria, caché pasa a no-op, puerta de enlace de nodos no disponible) | ⚪ |
 | `KC__EMAIL__SMTP_HOST` | Host SMTP (opcional) | ⚪ |
 | `KC__EMAIL__SMTP_PORT` | Puerto SMTP (opcional) | ⚪ |
@@ -299,9 +292,9 @@ keycompute/
 | `KC__EMAIL__FROM_ADDRESS` | Dirección de correo del remitente (opcional) | ⚪ |
 | `KC__EMAIL__FROM_NAME` | Nombre visible del remitente (opcional) | ⚪ |
 | `KC__EMAIL__REQUIREMENT_RECIPIENT` | Correo receptor para solicitudes de requisitos (opcional; necesario para recibir envíos desde la página inicial) | ⚪ |
-| `APP_BASE_URL` | Dirección pública del frontend (necesaria para restablecimiento/invitación) | ⚪ |
+| `APP_BASE_URL` | URL pública del frontend de este despliegue; obligatoria con SMTP y antes de habilitar invitaciones públicas | Condicional |
 | `KC__DEFAULT_ADMIN_EMAIL` | Correo del administrador por defecto | ⚪ |
-| `KC__DEFAULT_ADMIN_PASSWORD` | Contraseña del administrador por defecto | ⚪ |
+| `KC__DEFAULT_ADMIN_PASSWORD` | Contraseña inicial de un solo uso: solo obligatoria al crear el primer administrador `system` en producción; no predeterminada/no vacía y al menos 12 caracteres | Condicional |
 
 ---
 
@@ -381,8 +374,8 @@ cargo build -p keycompute-server --release
 
 Damos la bienvenida a todo tipo de contribuciones. Consulta [CONTRIBUTING.md](CONTRIBUTING.md) para saber cómo participar.
 
-- 🐛 [Reportar bugs](https://github.com/aiqubits/keycompute/issues/new?template=bug_report.yml)
-- 💡 [Solicitar funcionalidades](https://github.com/aiqubits/keycompute/issues/new?template=feature_request.yml)
+- 🐛 [Reportar bugs](https://github.com/keycompute/keycompute/issues/new?template=bug_report.yml)
+- 💡 [Solicitar funcionalidades](https://github.com/keycompute/keycompute/issues/new?template=feature_request.yml)
 - 🔧 [Enviar código](CONTRIBUTING.md)
 
 ---
@@ -399,6 +392,6 @@ Este proyecto se distribuye bajo la licencia [MIT](LICENSE).
 
 Si este proyecto te resulta útil, te agradeceremos una ⭐️.
 
-**[Inicio rápido](#inicio-rápido)** • **[Reportar problemas](https://github.com/aiqubits/keycompute/issues)** • **[Últimas versiones](https://github.com/aiqubits/keycompute/releases)**
+**[Inicio rápido](#inicio-rápido)** • **[Reportar problemas](https://github.com/keycompute/keycompute/issues)** • **[Últimas versiones](https://github.com/keycompute/keycompute/releases)**
 
 </div>

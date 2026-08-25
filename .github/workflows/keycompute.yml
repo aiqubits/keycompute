@@ -18,6 +18,16 @@ on:
       - "**.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - "Dockerfile*"
+      - ".dockerignore"
+      - ".env.example"
+      - "docker-compose*.yml"
+      - "nginx/**"
+      - "packages/**/assets/**"
+      - "prod-build/**"
+      - "scripts/**"
+      - "README*.md"
+      - "CONTRIBUTING.md"
       - ".github/workflows/keycompute.yml"
       - "config.example.toml"
   pull_request:
@@ -26,6 +36,16 @@ on:
       - "**.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - "Dockerfile*"
+      - ".dockerignore"
+      - ".env.example"
+      - "docker-compose*.yml"
+      - "nginx/**"
+      - "packages/**/assets/**"
+      - "prod-build/**"
+      - "scripts/**"
+      - "README*.md"
+      - "CONTRIBUTING.md"
       - ".github/workflows/keycompute.yml"
       - "config.example.toml"
 
@@ -47,7 +67,7 @@ env:
   # ── Crypto ────────────────────────────────────────────────────────────────
   KC__CRYPTO__SECRET_KEY: LXmXUgcaoZePsWayXJN2E5Wa9/zpkl/vOTwnLNy/oLc=
 
-  # ── Email (required by config validation) ─────────────────────────────────
+  # ── Email (configured for email-related integration tests) ────────────────
   KC__EMAIL__SMTP_HOST: localhost
   KC__EMAIL__SMTP_USERNAME: ci@test.local
   KC__EMAIL__SMTP_PASSWORD: ci-test-password
@@ -93,6 +113,31 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate Compose configurations
+        run: |
+          set -euo pipefail
+          bash -n scripts/*.sh scripts/tests/*.sh
+          bash scripts/tests/reset_admin_password_test.sh
+          printf 'POSTGRES_PASSWORD=conflicting-local-password\nREDIS_PASSWORD=conflicting-local-password\n' > .env
+          trap 'rm -f .env' EXIT
+          docker compose --env-file .env.example \
+            -f docker-compose.yml \
+            -f docker-compose.dev.yml \
+            config --quiet
+          docker compose --env-file .env.example \
+            -f docker-compose.yml \
+            -f docker-compose.dev.yml \
+            config --format json \
+            | jq -e '
+                .services.postgres.environment.POSTGRES_PASSWORD == "change-me-strong-password"
+                and ((.services.redis.command | tostring) | contains("change-me-redis-password"))
+                and .services.postgres.ports[0].published == "5432"
+                and .services.redis.ports[0].published == "6379"
+              ' >/dev/null
+          docker compose --env-file .env.example \
+            -f docker-compose.replicas.yml \
+            config --quiet
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -311,6 +356,13 @@ jobs:
       - name: Install dioxus-cli
         run: cargo binstall dioxus-cli --version 0.7.9 -y --force
 
+      - name: Install locked Docker Web tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+          cargo binstall wasm-bindgen-cli --version 0.2.114 -y --force
+          npm install --global esbuild@0.25.0
+
       - name: Verify dx installation
         run: |
           echo "Cargo bin directory: $HOME/.cargo/bin"
@@ -328,6 +380,54 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo build --release -p web --target wasm32-unknown-unknown
+
+      - name: Verify Docker Web workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          web_workspace="$(mktemp -d "${RUNNER_TEMP}/keycompute-web-workspace.XXXXXX")"
+          trap 'rm -rf "${web_workspace}"' EXIT
+
+          cp prod-build/web/Cargo.toml "${web_workspace}/Cargo.toml"
+          cp Cargo.lock "${web_workspace}/Cargo.lock"
+          mkdir -p "${web_workspace}/packages" "${web_workspace}/crates"
+          ln -s "${GITHUB_WORKSPACE}/packages/web" "${web_workspace}/packages/web"
+          ln -s "${GITHUB_WORKSPACE}/packages/ui" "${web_workspace}/packages/ui"
+          ln -s "${GITHUB_WORKSPACE}/packages/client-api" "${web_workspace}/packages/client-api"
+          ln -s "${GITHUB_WORKSPACE}/crates/keycompute-types" \
+            "${web_workspace}/crates/keycompute-types"
+
+          # Normalize the root lockfile for the reduced member set, then prove
+          # the committed Docker lockfile is exactly that projection.
+          cargo metadata \
+            --manifest-path "${web_workspace}/Cargo.toml" \
+            --offline \
+            --format-version 1 >/dev/null
+          cmp "${web_workspace}/Cargo.lock" prod-build/web/Cargo.lock
+
+          # Unlike `cargo metadata --no-deps`, this executes the same locked
+          # dependency resolution and target selection used by Dockerfile.web.
+          CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target" cargo check \
+            --manifest-path "${web_workspace}/Cargo.toml" \
+            --locked \
+            --offline \
+            --release \
+            --package web \
+            --target wasm32-unknown-unknown
+
+          # Exercise the same locked/offline dx path and output layout copied
+          # by Dockerfile.web, including all NO_DOWNLOADS tool requirements.
+          (
+            cd "${web_workspace}"
+            NO_DOWNLOADS=1 \
+              CARGO_NET_OFFLINE=true \
+              CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/docker-web" \
+              dx build --release --package web --platform web
+          )
+          public_dir="${GITHUB_WORKSPACE}/target/docker-web/dx/web/release/web/public"
+          test -f "${public_dir}/index.html"
+          find "${public_dir}" -type f -name '*.wasm' -print -quit | grep -q .
+          find "${public_dir}" -type f -name '*.js' -print -quit | grep -q .
 
       # ── Step: Run Web Unit Tests ────────────────────────────────────────────
       # web 包的单测（i18n key 一致性、示例文本生成、URL 归一化）只能在 native 下运行，

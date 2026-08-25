@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="https://github.com/keycompute/keycompute/stargazers"><img src="https://img.shields.io/github/stars/keycompute/keycompute?style=social" alt="GitHub Stars" /></a>
-  <a href="https://github.com/keycompute/keycompute/issues"><img src="https://img.shields.io/github/issues/aiqubits/keycompute" alt="GitHub Issues" /></a>
+  <a href="https://github.com/keycompute/keycompute/issues"><img src="https://img.shields.io/github/issues/keycompute/keycompute" alt="GitHub Issues" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License" /></a>
   <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs Welcome" /></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.92%2B-orange?logo=rust" alt="Rust Version" /></a>
@@ -115,7 +115,7 @@ score = 0.30 × 成本因子 + 0.25 × 延遲因子 + 0.25 × 成功率 + 0.20 �
 
 ### 跨平台前端
 
-- **Web 管理後台**：Dioxus WASM SPA，9 個管理模組
+- **Web 管理後台**：Dioxus WASM SPA
 - **桌面端**：Dioxus Desktop 原生應用
 - **行動端**：Dioxus Mobile 跨平台支援
 - **路由級權限控制**：Admin 角色驗證，安全可控
@@ -162,12 +162,18 @@ score = 0.30 × 成本因子 + 0.25 × 延遲因子 + 0.25 × 成功率 + 0.20 �
 
 ```bash
 # 複製專案
-git clone https://github.com/your-org/keycompute.git
+git clone https://github.com/keycompute/keycompute.git
 cd keycompute
 
 # 複製並編輯環境變數
 cp .env.example .env
-# 編輯 .env 並填入實際設定
+# 第一次正式環境啟動前替換所有實際憑證；應用程式至少會強制檢查：
+# - KC__AUTH__JWT_SECRET：非預設、非純空白、至少 32 位元組
+# - KC__CRYPTO__SECRET_KEY：恰好 32 位元組的 Base64 編碼
+# - KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET：非預設、至少 16 位元組
+#   （本 Compose 啟用 Redis/Node Gateway，因此必填）
+# - KC__DEFAULT_ADMIN_PASSWORD：非預設、非純空白、至少 12 個字元
+#   （僅第一次建立 system 管理員時必填）
 
 # 啟動所有服務
 docker compose up -d
@@ -176,11 +182,12 @@ docker compose up -d
 docker compose ps
 ```
 
-部署完成後，造訪 `http://localhost:8080` 即可開始使用。
+部署完成後，造訪 `http://localhost` 即可開始使用（或使用 `WEB_PORT` 指定的連接埠）。
 
-預設帳號：`admin@keycompute.local`，密碼：`change-me-admin-password`
-
-> 正式環境請立即修改預設管理員密碼。
+未覆寫時，引導管理員信箱為 `admin@keycompute.local`。密碼是啟動前設定的
+`KC__DEFAULT_ADMIN_PASSWORD`；全新的正式環境資料庫不接受
+`change-me-admin-password`。第一個 `system` 管理員建立完成後，應從環境變數
+移除這個一次性引導密碼，後續重新啟動不再需要它。
 
 ### 方式二：本機開發
 
@@ -189,43 +196,19 @@ docker compose ps
 > ```bash
 > openssl rand -base64 32
 > ```
+> 一般 `cargo run` 建置 debug 可執行檔，啟動方式本身即選定開發模式。
+> 它只讀取 `config.toml`，可使用公開的本機憑據並監聽 `0.0.0.0`。
+> `.env.example`、`KC__*` 與 `APP_BASE_URL` 不會覆寫該檔案；切勿用於正式環境。
 
 ```bash
-# 建立網路
-docker network create keycompute-internal
+# 建立 cargo run 使用的設定
+cp config.example.toml config.toml
 
-# PostgreSQL（使用 .env 中的密碼）
-docker run -d \
-  --name keycompute-postgres \
-  --network keycompute-internal \
-  -e POSTGRES_DB=keycompute \
-  -e POSTGRES_USER=keycompute \
-  -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-change-me-strong-password}" \
-  -p 5432:5432 \
-  -v keycompute_postgres_data:/var/lib/postgresql/data \
-  --restart unless-stopped \
-  postgres:16-alpine
-
-# Redis（選用，用於分散式限流和節點佇列）
-docker run -d \
-  --name keycompute-redis \
-  --network keycompute-internal \
-  -p 6379:6379 \
-  -v keycompute_redis_data:/data \
-  --restart unless-stopped \
-  redis:7-alpine \
-  redis-server \
-  --requirepass "${REDIS_PASSWORD:-change-me-redis-password}" \
-  --maxmemory 256mb \
-  --maxmemory-policy allkeys-lru
+# 啟動 PostgreSQL 與 Redis，並開放與 config.toml 相符的本機連接埠
+docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis
 
 # 安裝 dioxus-cli
 curl -sSL http://dioxus.dev/install.sh | sh
-
-# 載入環境變數（推薦使用 .env 檔案）
-cp .env.example .env
-# 編輯 .env 填入實際設定值
-set -a && source .env && set +a
 
 # 啟動後端
 cargo run -p keycompute-server
@@ -233,6 +216,10 @@ cargo run -p keycompute-server
 # 啟動前端開發伺服器（另一個終端）
 dx serve --package web --platform web --hot-reload true --addr 0.0.0.0
 ```
+
+`cargo run -p keycompute-server --release` 與 Docker 映像選定正式環境模式。
+release 可執行檔只讀取環境變數並忽略 `config.toml`；不存在可改變
+執行模式的設定參數或環境變數。
 
 ---
 
@@ -243,8 +230,9 @@ keycompute/
 ├── crates/                          # 後端核心模組 (Rust)
 │   ├── keycompute-server/            # Axum HTTP 服務（整合所有模組）
 │   ├── keycompute-types/             # 全域共享型別與巨集
-│   ├── keycompute-db/                # 資料庫 ORM（23 張表）
+│   ├── keycompute-db/                # 資料庫 ORM 與遷移
 │   ├── keycompute-auth/              # 認證與鑑權（JWT + API Key + 密碼）
+│   ├── keycompute-cache/             # 快取抽象與 Redis 支援
 │   ├── keycompute-ratelimit/         # 限流引擎（記憶體/Redis 雙後端）
 │   ├── keycompute-pricing/           # 定價引擎（三層兜底 + LRU 快取）
 │   ├── keycompute-routing/           # 雙層智慧路由引擎
@@ -252,31 +240,30 @@ keycompute/
 │   ├── keycompute-billing/           # 計費結算（流結束後精確結算）
 │   ├── keycompute-distribution/      # 二級分銷系統
 │   ├── keycompute-observability/     # 可觀測性三大支柱
-│   ├── keycompute-config/            # 設定管理（環境變數 + TOML）
+│   ├── keycompute-config/            # debug TOML / release 環境變數分離載入
 │   ├── keycompute-emailserver/       # SMTP 郵件服務
 │   ├── keycompute-payment/           # 支付整合
 │   │   ├── keycompute-alipay/        # 支付寶支付
 │   │   └── keycompute-wechatpay/     # 微信支付
 │   ├── llm-gateway/                  # LLM 執行閘道（唯一上游層）
-│   ├── llm-provider/                 # Provider 適配器
-│   │   ├── keycompute-openai/        # OpenAI
-│   │   ├── keycompute-claude/        # Anthropic Claude
-│   │   ├── keycompute-gemini/        # Google Gemini
-│   │   ├── keycompute-deepseek/      # DeepSeek
-│   │   ├── keycompute-ollama/        # Ollama 本地模型
-│   │   └── keycompute-vllm/          # vLLM 自部署
+│   ├── llm-protocol/                 # 協定轉換與 Provider 定義
+│   │   ├── openai/                   # OpenAI 相容協定
+│   │   ├── anthropic/                # Anthropic 相容協定
+│   │   └── provider/                 # 共用 Provider 協定型別
 │   ├── node-gateway/                 # 節點閘道（註冊/心跳/任務管理）
-│   └── integration-tests/           # 端到端整合測試（30+ 場景）
+│   └── integration-tests/           # 端到端整合測試
 ├── packages/                         # 前端 (Dioxus 0.7)
-│   ├── web/                          # Web 管理後台（9 個管理模組）
+│   ├── web/                          # Web 管理後台
 │   ├── ui/                           # 共享 UI 元件庫
 │   ├── desktop/                      # 桌面端原生應用
 │   ├── mobile/                       # 行動端跨平台應用
-│   └── client-api/                   # API 用戶端封裝（17 個模組）
+│   └── client-api/                   # API 用戶端封裝
 ├── nginx/                            # Nginx 反向代理設定
 ├── Dockerfile.server                 # 後端容器映像
 ├── Dockerfile.web                    # 前端容器映像
-└── docker-compose.yml                # 容器編排
+├── docker-compose.yml                # 正式環境容器編排
+├── docker-compose.dev.yml            # 本機依賴連接埠覆寫
+└── docker-compose.replicas.yml       # 正式環境讀取副本編排
 ```
 
 ---
@@ -285,12 +272,14 @@ keycompute/
 
 ### 環境變數
 
+下表僅適用於 release/Docker 正式環境啟動；debug `cargo run` 改為讀取 `config.toml`。
+
 | 變數名 | 說明 | 必填 |
 |:---|:---|:---:|
 | `KC__DATABASE__URL` | PostgreSQL 連線字串 | ✅ |
-| `KC__AUTH__JWT_SECRET` | JWT 簽名金鑰 | ✅ |
-| `KC__CRYPTO__SECRET_KEY` | API Key AES-256-GCM 加密金鑰（寫入後不可更改） | ✅ |
-| `KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET` | HMAC 簽名金鑰；用於簽發一次性節點註冊 token | ✅ |
+| `KC__AUTH__JWT_SECRET` | 正式環境：非預設、非純空白且至少 32 位元組的 JWT 簽名金鑰 | ✅ |
+| `KC__CRYPTO__SECRET_KEY` | 正式環境：恰好 32 位元組的 Base64 編碼；寫入 Provider API Key 後不可更改 | ✅ |
+| `KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET` | 正式環境設定 Redis 時：非預設且至少 16 位元組的 HMAC 金鑰；簽發一次性節點註冊 token | 條件必填 |
 | `KC__REDIS__URL` | Redis 連線字串（選用；不設定時限流降級為記憶體、緩存變為 no-op、節點閘道不可用） | ⚪ |
 | `KC__EMAIL__SMTP_HOST` | SMTP 伺服器位址（選用） | ⚪ |
 | `KC__EMAIL__SMTP_PORT` | SMTP 伺服器連接埠（選用） | ⚪ |
@@ -299,9 +288,9 @@ keycompute/
 | `KC__EMAIL__FROM_ADDRESS` | 寄件者電子郵件地址（選用） | ⚪ |
 | `KC__EMAIL__FROM_NAME` | 寄件者顯示名稱（選用） | ⚪ |
 | `KC__EMAIL__REQUIREMENT_RECIPIENT` | 需求收集表單接收信箱（選用；接收首頁提交需求時需要設定） | ⚪ |
-| `APP_BASE_URL` | 公開前端地址（密碼重設/邀請連結必需） | ⚪ |
+| `APP_BASE_URL` | 目前部署的公開前端地址；啟用 SMTP 時必填，啟用公開邀請連結前也必須設定 | 條件必填 |
 | `KC__DEFAULT_ADMIN_EMAIL` | 預設管理員電子郵件 | ⚪ |
-| `KC__DEFAULT_ADMIN_PASSWORD` | 預設管理員密碼 | ⚪ |
+| `KC__DEFAULT_ADMIN_PASSWORD` | 一次性引導密碼：僅正式環境第一次建立 `system` 管理員時必填；非預設、非純空白且至少 12 個字元 | 條件必填 |
 
 ---
 
@@ -381,8 +370,8 @@ cargo build -p keycompute-server --release
 
 我們歡迎各種形式的貢獻！請閱讀 [CONTRIBUTING.md](CONTRIBUTING.md) 了解如何參與專案開發。
 
-- 🐛 [回報 Bug](https://github.com/aiqubits/keycompute/issues/new?template=bug_report.yml)
-- 💡 [功能建議](https://github.com/aiqubits/keycompute/issues/new?template=feature_request.yml)
+- 🐛 [回報 Bug](https://github.com/keycompute/keycompute/issues/new?template=bug_report.yml)
+- 💡 [功能建議](https://github.com/keycompute/keycompute/issues/new?template=feature_request.yml)
 - 🔧 [提交程式碼](CONTRIBUTING.md)
 
 ---
@@ -399,6 +388,6 @@ cargo build -p keycompute-server --release
 
 如果這個專案對你有幫助，歡迎給我們一個 ⭐️ Star！
 
-**[快速開始](#快速開始)** • **[問題回報](https://github.com/aiqubits/keycompute/issues)** • **[最新版本](https://github.com/aiqubits/keycompute/releases)**
+**[快速開始](#快速開始)** • **[問題回報](https://github.com/keycompute/keycompute/issues)** • **[最新版本](https://github.com/keycompute/keycompute/releases)**
 
 </div>

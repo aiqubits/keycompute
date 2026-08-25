@@ -196,11 +196,7 @@
 }
 
 /* ── 隐藏辅助类 ─────────────────────────────── */
-.hide-mobile  { display: none; }
-.hide-tablet  { }
-.hide-desktop { }
-
-@media (min-width: 640px)  { .hide-mobile  { display: revert; } }
+@media (max-width: 639px) { .hide-mobile  { display: none; } }
 @media (min-width: 640px) and (max-width: 1023px) { .hide-tablet  { display: none; } }
 @media (min-width: 1024px) { .hide-desktop { display: none; } }
 

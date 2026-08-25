@@ -1,15 +1,19 @@
 # KeyCompute 配置文件示例
-# 复制此文件为 config.toml 并根据需要修改
-# 环境变量优先级高于配置文件，格式：KC__SECTION__KEY=value
-# 本文件中的密码和密钥是开发环境示例。生产环境保留示例值或不配置加密密钥
-# 会被拒绝启动；请通过环境变量提供独立的安全值。
+# 复制此文件为 config.toml 并根据需要修改。
+# 普通 cargo run 生成 debug 可执行文件，固定为开发模式且仅读取此文件；
+# KC__* 和 APP_BASE_URL 不会覆盖本文件中的配置。release/Docker 固定为
+# 生产模式，仅读取环境变量，不读取 config.toml。
+# 本文件中的密码和密钥是开发环境示例。生产启动会拒绝默认 JWT 密钥、
+# 缺失或无效的 Provider API Key 加密密钥；配置 Redis 时还会拒绝默认节点
+# HMAC 密钥；首次创建 system 管理员时会拒绝默认管理员密码。其他 change-me
+# 凭据不会被统一拦截，仍须由运维在生产部署前逐项替换。
 
 # ==================== 应用公开地址配置（全局） ====================
 # 用于密码重置邮件、邀请注册链接等中的公开链接
-# 除此之外，该值也可通过环境变量 APP_BASE_URL 覆盖（优先级最高）
-# 未显式配置时回退为 https://keycompute.cn
+# 生产模式的对应配置为 APP_BASE_URL 环境变量
+# 未显式配置时不生成公开链接；启用邮件服务时必须显式配置
 # 非本地公开地址必须使用 https；仅 localhost / 回环地址可使用 http
-app_base_url = "https://keycompute.cn"
+app_base_url = "http://localhost:8080"
 
 # 读库连接 URL 列表（空数组表示不启用读写分离）
 database_read_urls = []
@@ -24,7 +28,7 @@ port = 3000
 # ==================== 数据库配置 ====================
 [database]
 # PostgreSQL 连接 URL
-url = "postgres://localhost/keycompute"
+url = "postgres://keycompute:change-me-strong-password@127.0.0.1:5432/keycompute"
 # 最大连接数
 max_connections = 10
 # 最小连接数
@@ -69,7 +73,7 @@ max_lifetime_secs = 1800
 # ==================== Redis 配置（可选）====================
 [redis]
 # Redis 连接 URL（注意：需要包含密码，格式：redis://:password@host:port）
-# 生产环境请使用环境变量 KC__REDIS__URL 覆盖此配置
+# 生产模式通过 KC__REDIS__URL 提供对应配置
 url = "redis://:change-me-redis-password@127.0.0.1:6379"
 # 连接池大小
 pool_size = 10
@@ -78,7 +82,7 @@ connect_timeout_secs = 5
 
 # ==================== 认证配置 ====================
 [auth]
-# JWT 密钥（生产环境必须修改，至少 32 字符）
+# JWT 密钥（生产环境必须修改，至少 32 字节；不能是纯空白）
 jwt_secret = "change-me-in-production"
 # JWT 签发者
 jwt_issuer = "keycompute"
@@ -117,25 +121,25 @@ stream_timeout_secs = 600
 # 生成方式：openssl rand -base64 32
 # 或在代码中：keycompute_runtime::ApiKeyCrypto::generate_key()
 #
-# 环境变量方式（推荐）：KC__CRYPTO__SECRET_KEY
+# 生产模式对应环境变量：KC__CRYPTO__SECRET_KEY
 #
 # secret_key = "your-base64-encoded-32-byte-key"
 
 # ==================== 邮件服务配置 ====================
-# 用于发送注册验证码、密码重置和欢迎邮件
-# 启用邮件能力时请完整配置
+# 默认保持禁用；用于发送注册验证码、密码重置和欢迎邮件时，需完整填写
+# SMTP 主机、用户名、密码、发件人地址，并保留有效的 app_base_url
 #
 [email]
 # SMTP 服务器地址
-smtp_host = "smtp.example.com"
+smtp_host = ""
 # SMTP 端口（默认 465）
 smtp_port = 465
 # SMTP 用户名
-smtp_username = "noreply@example.com"
+smtp_username = ""
 # SMTP 密码
-smtp_password = "change-me-smtp-password"
+smtp_password = ""
 # 发件人邮箱地址
-from_address = "noreply@example.com"
+from_address = ""
 # 发件人显示名称（可选）
 from_name = "KeyCompute"
 # 是否使用 TLS（默认 true）
@@ -156,8 +160,9 @@ timeout_secs = 30
 #
 [node_gateway]
 # HMAC 签名密钥（用于签发/验证节点注册 token）
-# 生产环境必须修改（至少 16 字符）；生成命令：openssl rand -base64 32
-# 环境变量: KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET
+# 生产环境配置 Redis、从而启用 Node Gateway 时必须修改（至少 16 字节）
+# 生成命令：openssl rand -base64 32
+# 生产模式对应环境变量: KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET
 registration_token_secret = "change-me-node-registration-token-secret"
 # 会话 TTL（秒），节点会话有效期，默认 300（5 分钟）
 # 超过此时间未心跳的会话将被标记为过期
@@ -186,7 +191,7 @@ sweeper_repush_interval_secs = 10
 # 计费公式: tip = user_billed_amount × node_tip_ratio
 # 提现方式: alipay（管理员线下打款）或 balance（直接转入可用余额）
 #
-# 环境变量方式（推荐，优先级更高）：
+# 以下是生产模式的对应环境变量，不会覆盖本开发文件：
 # KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET=change-me-node-registration-token-secret
 # KC__NODE_GATEWAY__SESSION_TTL_SECS=300
 # KC__NODE_GATEWAY__HEARTBEAT_INTERVAL_SECS=30
@@ -201,7 +206,8 @@ sweeper_repush_interval_secs = 10
 # ==================== 默认系统管理员（环境变量配置） ====================
 # 首次启动时自动创建的系统管理员账号
 # 注意：这些值不在 config.toml 中配置，而是通过环境变量设置
-# 生产环境必须在首次启动前修改（至少 12 字符），否则服务拒绝启动
+# 生产环境首次创建 system 管理员前必须修改（至少 12 个字符且不能是纯空白），否则服务拒绝启动
+# system 管理员创建完成后，后续重启可删除该一次性引导密码
 #
 # 环境变量：
 # KC__DEFAULT_ADMIN_EMAIL=admin@keycompute.local
@@ -209,7 +215,7 @@ sweeper_repush_interval_secs = 10
 #
 # 对应的 docker-compose.yml 中的设置：
 # KC__DEFAULT_ADMIN_EMAIL: ${KC__DEFAULT_ADMIN_EMAIL:-admin@keycompute.local}
-# KC__DEFAULT_ADMIN_PASSWORD: ${KC__DEFAULT_ADMIN_PASSWORD:-change-me-admin-password}
+# KC__DEFAULT_ADMIN_PASSWORD: ${KC__DEFAULT_ADMIN_PASSWORD:-}
 
 # ==================== 支付渠道（仅环境变量） ====================
 # 支付密钥不得写入 config.toml 或 system_settings。管理员页面中的开关只控制新订单；

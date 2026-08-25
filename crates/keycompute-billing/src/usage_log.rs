@@ -398,7 +398,7 @@ impl BillingService {
         let distribution_enabled = keycompute_db::SystemSetting::get_bool(
             pool.as_ref(),
             keycompute_db::models::system_setting::setting_keys::DISTRIBUTION_ENABLED,
-            true,
+            false,
         )
         .await;
         if !distribution_enabled {

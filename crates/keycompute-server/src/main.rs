@@ -1,7 +1,7 @@
 //! KeyCompute 后端服务主入口
 //!
 //! 这是整个 KeyCompute 系统的可执行入口，负责：
-//! 1. 加载配置（环境变量 + 配置文件）
+//! 1. 按构建方式加载配置（debug: config.toml；release: 环境变量）
 //! 2. 初始化可观测性（日志、指标、追踪）
 //! 3. 建立数据库连接并初始化新库结构
 //! 4. 初始化所有业务模块（Auth、RateLimit、Pricing、Routing、Gateway、Billing 等）
@@ -20,18 +20,26 @@ use keycompute_observability::{init_dev_observability, init_observability};
 use keycompute_server::{AppState, AppStateConfig, init_global_crypto, run};
 use keycompute_types::UserRole;
 use sea_orm::{
-    ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait,
+    ConnectionTrait, DatabaseTransaction, DbBackend, FromQueryResult, Statement, TransactionTrait,
     sqlx::{Connection as SqlxConnection, PgConnection},
 };
 use std::time::Duration;
 use tracing::{error, info, warn};
+
+/// 运行模式由可执行文件的构建方式固定，不接受配置或环境变量修改。
+const IS_DEVELOPMENT_BUILD: bool = cfg!(debug_assertions);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // ==================== 阶段 1: 加载配置 ====================
     info!("KeyCompute 启动中...");
 
-    let config = match AppConfig::load() {
+    let config_result = if IS_DEVELOPMENT_BUILD {
+        AppConfig::load_development()
+    } else {
+        AppConfig::load_production()
+    };
+    let config = match config_result {
         Ok(cfg) => {
             info!("配置加载成功");
             cfg
@@ -42,8 +50,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let env = std::env::var("KC__ENV").unwrap_or_else(|_| "production".to_string());
-    let is_production = env != "development" && env != "dev";
+    let is_development = IS_DEVELOPMENT_BUILD;
+    let is_production = !is_development;
 
     // 验证配置
     let config_validation = if is_production {
@@ -57,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     }
     // ==================== 阶段 2: 初始化可观测性 ====================
     // 根据环境选择日志格式
-    if env == "development" || env == "dev" {
+    if is_development {
         init_dev_observability();
         info!("开发环境可观测性已初始化");
     } else {
@@ -130,21 +138,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ==================== 阶段 5: 初始化默认系统管理员 ====================
-    let _system_tenant = match initialize_default_admin(pool.as_ref(), is_production).await {
+    let default_admin_email = env_var_or_default("KC__DEFAULT_ADMIN_EMAIL", DEFAULT_ADMIN_EMAIL);
+    // 空字符串按未配置处理；这使 Compose 能在首次引导完成后安全移除该变量。
+    let default_admin_password = std::env::var("KC__DEFAULT_ADMIN_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let _system_tenant = match initialize_default_admin(
+        pool.as_ref(),
+        is_production,
+        &default_admin_email,
+        default_admin_password,
+    )
+    .await
+    {
         Ok(tenant) => {
             info!(tenant_id = %tenant.id, "系统租户初始化成功");
-            Some(tenant)
-        }
-        Err(e)
-            if e.downcast_ref::<InvalidDefaultAdminBootstrapPassword>()
-                .is_some() =>
-        {
-            error!("默认管理员初始化失败: {}", e);
-            std::process::exit(1);
+            tenant
         }
         Err(e) => {
-            warn!("默认管理员初始化失败: {}", e);
-            None
+            error!("默认管理员初始化失败，服务拒绝继续启动: {}", e);
+            return Err(e);
         }
     };
 
@@ -153,6 +166,22 @@ async fn main() -> anyhow::Result<()> {
     match SystemSetting::init_default_settings(pool.as_ref()).await {
         Ok(_) => info!("系统默认设置初始化完成"),
         Err(e) => warn!("系统默认设置初始化失败（非致命错误）: {}", e),
+    }
+
+    // 分销邀请链接必须使用当前部署显式配置的公开 URL。旧基线默认启用分销，
+    // 因此在路由开放前原子地收敛不兼容状态，避免请求期才返回配置错误。
+    match SystemSetting::reconcile_distribution_public_url(
+        pool.write_conn(),
+        config.resolved_app_base_url().is_some(),
+    )
+    .await
+    {
+        Ok(true) => warn!("未配置 APP_BASE_URL，已禁用分销系统；配置公开 URL 后可由管理员重新启用"),
+        Ok(false) => {}
+        Err(e) => {
+            error!("分销系统公开 URL 状态校验失败，服务拒绝继续启动: {}", e);
+            return Err(e.into());
+        }
     }
 
     // ==================== 阶段 5.6: 初始化系统默认定价 ====================
@@ -437,12 +466,7 @@ fn setup_shutdown_handler() -> tokio::sync::oneshot::Receiver<()> {
     rx
 }
 
-/// 初始化默认系统管理员
-///
-/// 从环境变量读取默认管理员邮箱和密码，如果管理员不存在则创建。
-/// 环境变量：
-/// - KC__DEFAULT_ADMIN_EMAIL: 管理员邮箱
-/// - KC__DEFAULT_ADMIN_PASSWORD: 管理员密码
+/// Resolve an optional environment value, treating an empty string as absent.
 fn non_empty_or_default(value: Option<String>, default: &str) -> String {
     value
         .filter(|value| !value.is_empty())
@@ -455,7 +479,8 @@ fn env_var_or_default(key: &str, default: &str) -> String {
 
 /// 解析用于创建默认管理员的密码。
 ///
-/// 未配置时使用公开示例值以便开箱运行；生产环境强烈建议显式覆盖。
+/// 未配置时使用公开示例值以便开发环境开箱运行；生产环境首次创建
+/// system 管理员时必须显式覆盖。已有 system 管理员后不再需要该引导密码。
 fn resolve_default_admin_password(configured: Option<String>) -> String {
     non_empty_or_default(configured, DEFAULT_ADMIN_PASSWORD)
 }
@@ -477,7 +502,10 @@ fn validate_default_admin_password_for_production(
     configured: Option<String>,
 ) -> anyhow::Result<()> {
     let password = resolve_default_admin_password(configured);
-    if password == DEFAULT_ADMIN_PASSWORD || password.len() < 12 {
+    if password.trim().is_empty()
+        || password == DEFAULT_ADMIN_PASSWORD
+        || password.chars().count() < 12
+    {
         return Err(InvalidDefaultAdminBootstrapPassword.into());
     }
     Ok(())
@@ -501,24 +529,34 @@ fn default_admin_bootstrap_connection(pool: &DbRouter) -> &sea_orm::DatabaseConn
     pool.write_conn()
 }
 
-async fn initialize_default_admin(pool: &DbRouter, is_production: bool) -> anyhow::Result<Tenant> {
-    let pool = default_admin_bootstrap_connection(pool);
-    // 从环境变量读取配置
-    let admin_email = env_var_or_default("KC__DEFAULT_ADMIN_EMAIL", DEFAULT_ADMIN_EMAIL);
-    // 显式提供的密码（区分“未配置”与“配置为空”）
-    let configured_password = std::env::var("KC__DEFAULT_ADMIN_PASSWORD")
-        .ok()
-        .filter(|value| !value.is_empty());
+// Serialize the one-time bootstrap across replicas. The transaction-scoped
+// lock is released automatically on commit or rollback.
+const DEFAULT_ADMIN_BOOTSTRAP_LOCK_ID: i64 = 5_421_647_644_090_913_945;
+
+async fn initialize_default_admin(
+    pool: &DbRouter,
+    is_production: bool,
+    admin_email: &str,
+    configured_password: Option<String>,
+) -> anyhow::Result<Tenant> {
+    let writer = default_admin_bootstrap_connection(pool);
+    let tx = writer.begin().await?;
+    tx.query_one(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock($1)",
+        [DEFAULT_ADMIN_BOOTSTRAP_LOCK_ID.into()],
+    ))
+    .await?;
 
     info!(email = %admin_email, "检查默认管理员账户");
 
-    // 只要已经存在 system 用户，就视为默认系统管理员已完成初始化。
+    // 已存在 system 用户时仍会校验租户归属和登录凭证，拒绝历史半初始化状态。
     let stmt = Statement::from_sql_and_values(
         DbBackend::Postgres,
         "SELECT * FROM users WHERE role = 'system' ORDER BY created_at ASC LIMIT 1",
         [],
     );
-    let existing_system_user = User::find_by_statement(stmt).one(pool).await?;
+    let existing_system_user = User::find_by_statement(stmt).one(&tx).await?;
 
     // The bootstrap password is needed only when this startup will actually
     // create the first system administrator. Initialized deployments should be
@@ -541,15 +579,33 @@ async fn initialize_default_admin(pool: &DbRouter, is_production: bool) -> anyho
             );
         }
         // 获取 system 租户（复用已有租户）
-        let tenant = Tenant::find_by_slug(pool, "system")
+        let tenant = Tenant::find_by_slug(&tx, "system")
             .await
             .map_err(|e| anyhow::anyhow!("Failed to find system tenant: {}", e))?
             .ok_or_else(|| anyhow::anyhow!("system 租户不存在但 system 用户已存在，数据不一致"))?;
+
+        if tenant.id != user.tenant_id {
+            anyhow::bail!("system 用户 {} 不属于 system 租户，数据不一致", user.id);
+        }
+
+        let credential = keycompute_db::UserCredential::find_by_user_id(&tx, user.id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "system 用户 {} 缺少登录凭证，拒绝以不完整引导状态启动",
+                    user.id
+                )
+            })?;
+        if credential.password_hash.trim().is_empty() {
+            anyhow::bail!("system 用户 {} 的密码哈希为空，数据不一致", user.id);
+        }
+
+        tx.commit().await?;
         return Ok(tenant);
     }
 
     // 没有 system 用户时，配置邮箱也不能被普通账号占用。
-    if let Some(existing_user) = User::find_by_email(pool, &admin_email).await? {
+    if let Some(existing_user) = User::find_by_email(&tx, admin_email).await? {
         anyhow::bail!(
             "cannot initialize system admin: email {} is already used by non-system user {}",
             admin_email,
@@ -560,17 +616,25 @@ async fn initialize_default_admin(pool: &DbRouter, is_production: bool) -> anyho
     info!(email = %admin_email, "创建默认系统管理员");
 
     let admin_password = resolve_default_admin_password(configured_password);
-    if !is_production && (admin_password == DEFAULT_ADMIN_PASSWORD || admin_password.len() < 12) {
+    if !is_production
+        && (admin_password.trim().is_empty()
+            || admin_password == DEFAULT_ADMIN_PASSWORD
+            || admin_password.chars().count() < 12)
+    {
         warn!("默认管理员正在使用示例或较弱密码");
     }
 
+    // 在写入任何引导数据前完成密码哈希；之后所有写入均属于同一事务。
+    let hasher = PasswordHasher::new();
+    let password_hash = hasher.hash(&admin_password)?;
+
     // 复用或创建默认 system 租户
-    let tenant = if let Some(existing_tenant) = Tenant::find_by_slug(pool, "system").await? {
+    let tenant = if let Some(existing_tenant) = Tenant::find_by_slug(&tx, "system").await? {
         info!(tenant_id = %existing_tenant.id, "复用已有 system 租户");
         existing_tenant
     } else {
         let tenant = Tenant::create(
-            pool,
+            &tx,
             &CreateTenantRequest {
                 name: "System".to_string(),
                 slug: "system".to_string(),
@@ -587,10 +651,10 @@ async fn initialize_default_admin(pool: &DbRouter, is_production: bool) -> anyho
 
     // 创建管理员用户（role="system" 表示系统管理员）
     let user = User::create(
-        pool,
+        &tx,
         &CreateUserRequest {
             tenant_id: tenant.id,
-            email: admin_email.clone(),
+            email: admin_email.to_string(),
             name: Some("System Administrator".to_string()),
             role: Some(UserRole::System),
         },
@@ -599,13 +663,9 @@ async fn initialize_default_admin(pool: &DbRouter, is_production: bool) -> anyho
 
     info!(user_id = %user.id, "管理员用户创建成功");
 
-    // 哈希密码
-    let hasher = PasswordHasher::new();
-    let password_hash = hasher.hash(&admin_password)?;
-
     // 创建用户凭证
     let credential = keycompute_db::UserCredential::create(
-        pool,
+        &tx,
         &CreateUserCredentialRequest {
             user_id: user.id,
             password_hash,
@@ -617,7 +677,7 @@ async fn initialize_default_admin(pool: &DbRouter, is_production: bool) -> anyho
     use keycompute_db::UpdateUserCredentialRequest;
     credential
         .update(
-            pool,
+            &tx,
             &UpdateUserCredentialRequest {
                 email_verified: Some(true),
                 email_verified_at: Some(chrono::Utc::now()),
@@ -626,11 +686,13 @@ async fn initialize_default_admin(pool: &DbRouter, is_production: bool) -> anyho
         )
         .await?;
 
-    // 初始化默认管理员余额（创建余额记录，初始余额为 0）
-    initialize_admin_balance(pool, tenant.id, user.id).await?;
+    // 初始化默认管理员余额（创建余额记录并充值 100 元）
+    initialize_admin_balance(&tx, tenant.id, user.id).await?;
 
     // 创建默认分销规则（基于系统设置中的比例）
-    initialize_default_distribution_rules(pool, tenant.id, user.id).await?;
+    initialize_default_distribution_rules(&tx, tenant.id, user.id).await?;
+
+    tx.commit().await?;
 
     info!(
         user_id = %user.id,
@@ -691,10 +753,8 @@ async fn initialize_default_distribution_rules(
         effective_until: None,
     };
 
-    match TenantDistributionRule::create(pool, &level1_rule).await {
-        Ok(rule) => info!(rule_id = %rule.id, "一级分销规则创建成功"),
-        Err(e) => warn!("一级分销规则创建失败: {}", e),
-    }
+    let rule = TenantDistributionRule::create(pool, &level1_rule).await?;
+    info!(rule_id = %rule.id, "一级分销规则创建成功");
 
     // 创建二级分销规则（全局规则，对所有用户生效）
     let level2_rule = CreateDistributionRuleRequest {
@@ -708,10 +768,8 @@ async fn initialize_default_distribution_rules(
         effective_until: None,
     };
 
-    match TenantDistributionRule::create(pool, &level2_rule).await {
-        Ok(rule) => info!(rule_id = %rule.id, "二级分销规则创建成功"),
-        Err(e) => warn!("二级分销规则创建失败: {}", e),
-    }
+    let rule = TenantDistributionRule::create(pool, &level2_rule).await?;
+    info!(rule_id = %rule.id, "二级分销规则创建成功");
 
     info!(tenant_id = %tenant_id, "默认分销规则初始化完成");
     Ok(())
@@ -722,7 +780,7 @@ async fn initialize_default_distribution_rules(
 /// 为默认系统管理员充值 100 元初始余额
 /// 系统管理员不需要审计，直接设置余额
 async fn initialize_admin_balance(
-    pool: &(impl ConnectionTrait + TransactionTrait),
+    tx: &DatabaseTransaction,
     tenant_id: uuid::Uuid,
     user_id: uuid::Uuid,
 ) -> anyhow::Result<()> {
@@ -730,7 +788,7 @@ async fn initialize_admin_balance(
     use rust_decimal::Decimal;
 
     // 检查是否已存在余额记录
-    if let Some(existing_balance) = UserBalance::find_by_user(pool, user_id).await? {
+    if let Some(existing_balance) = UserBalance::find_by_user(tx, user_id).await? {
         // 如果已有余额且不为 0，说明已经初始化过，跳过
         if existing_balance.available_balance > Decimal::ZERO {
             info!(
@@ -742,10 +800,9 @@ async fn initialize_admin_balance(
         }
     }
 
-    // recharge 内部已管理事务
     let initial_amount = Decimal::new(100, 0); // 100 元
-    let (updated_balance, transaction) = UserBalance::recharge(
-        pool,
+    let (updated_balance, transaction) = UserBalance::recharge_in_tx(
+        tx,
         user_id,
         tenant_id,
         initial_amount,
@@ -769,13 +826,72 @@ async fn initialize_admin_balance(
 #[cfg(test)]
 mod tests {
     use super::{
-        default_admin_bootstrap_connection, non_empty_or_default, resolve_default_admin_password,
-        stale_trace_threshold_secs, validate_default_admin_bootstrap_password,
-        validate_default_admin_password_for_production,
+        default_admin_bootstrap_connection, initialize_default_admin, non_empty_or_default,
+        resolve_default_admin_password, stale_trace_threshold_secs,
+        validate_default_admin_bootstrap_password, validate_default_admin_password_for_production,
     };
     use keycompute_config::DEFAULT_ADMIN_PASSWORD;
-    use keycompute_db::DbRouter;
-    use sea_orm::DatabaseConnection;
+    use keycompute_db::models::system_setting::setting_keys;
+    use keycompute_db::{
+        DbRouter, SystemSetting, Tenant, TenantDistributionRule, User, UserBalance, UserCredential,
+    };
+    use rust_decimal::Decimal;
+    use sea_orm::{
+        ConnectOptions, ConnectionTrait, Database as SeaDatabase, DatabaseConnection, DbBackend,
+        Statement,
+    };
+    use uuid::Uuid;
+
+    /// Create an isolated PostgreSQL schema so bootstrap tests can exercise the
+    /// real transaction and advisory lock without touching shared test data.
+    async fn isolated_bootstrap_database()
+    -> Option<(DatabaseConnection, DatabaseConnection, String)> {
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("skipping PostgreSQL bootstrap test: DATABASE_URL is not set");
+                return None;
+            }
+        };
+        let admin = SeaDatabase::connect(&database_url)
+            .await
+            .expect("DATABASE_URL should be reachable");
+        let schema = format!("bootstrap_test_{}", Uuid::new_v4().simple());
+        admin
+            .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .expect("isolated bootstrap schema should be created");
+
+        let mut options = ConnectOptions::new(database_url);
+        options
+            .max_connections(8)
+            .min_connections(1)
+            .set_schema_search_path(&schema);
+        let isolated = SeaDatabase::connect(options)
+            .await
+            .expect("isolated bootstrap database should connect");
+        keycompute_db::initialize_schema(&isolated)
+            .await
+            .expect("isolated bootstrap schema should initialize");
+
+        Some((admin, isolated, schema))
+    }
+
+    async fn drop_isolated_bootstrap_database(
+        admin: DatabaseConnection,
+        isolated: DatabaseConnection,
+        schema: String,
+    ) {
+        isolated
+            .close()
+            .await
+            .expect("isolated connection should close");
+        admin
+            .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .expect("isolated bootstrap schema should be removed");
+        admin.close().await.expect("admin connection should close");
+    }
 
     #[test]
     fn test_non_empty_or_default_uses_non_empty_value() {
@@ -829,6 +945,20 @@ mod tests {
         );
         assert!(validate_default_admin_password_for_production(Some("12345".to_string())).is_err());
         assert!(
+            validate_default_admin_password_for_production(Some("            ".to_string()))
+                .is_err()
+        );
+        // UTF-8 字节数超过 12、但字符数不足 12 的密码仍应被拒绝。
+        assert!(
+            validate_default_admin_password_for_production(Some("管理密码".to_string())).is_err()
+        );
+        assert!(
+            validate_default_admin_password_for_production(Some(
+                "安全管理密码字符正好十二".to_string()
+            ))
+            .is_ok()
+        );
+        assert!(
             validate_default_admin_password_for_production(Some(
                 "independent-admin-password".to_string()
             ))
@@ -850,6 +980,109 @@ mod tests {
             default_admin_bootstrap_connection(router.as_ref()),
             DatabaseConnection::Disconnected
         ));
+    }
+
+    #[tokio::test]
+    async fn default_admin_bootstrap_is_concurrent_and_idempotent_in_postgres() {
+        let Some((admin, isolated, schema)) = isolated_bootstrap_database().await else {
+            return;
+        };
+        let router = DbRouter::single(isolated.clone());
+        let email = "bootstrap-concurrency@example.com";
+        let password = "independent-bootstrap-password";
+
+        let (first, second) = tokio::join!(
+            initialize_default_admin(router.as_ref(), true, email, Some(password.to_string())),
+            initialize_default_admin(router.as_ref(), true, email, Some(password.to_string()))
+        );
+        let first = first.expect("first bootstrap should succeed");
+        let second = second.expect("concurrent bootstrap should reuse committed state");
+        assert_eq!(first.id, second.id);
+
+        let user = User::find_by_email(&isolated, email)
+            .await
+            .unwrap()
+            .expect("system user should exist");
+        assert_eq!(user.role, "system");
+        assert_eq!(user.tenant_id, first.id);
+        let credential = UserCredential::find_by_user_id(&isolated, user.id)
+            .await
+            .unwrap()
+            .expect("credential should exist");
+        assert!(credential.email_verified);
+        assert!(!credential.password_hash.trim().is_empty());
+        let balance = UserBalance::find_by_user(&isolated, user.id)
+            .await
+            .unwrap()
+            .expect("balance should exist");
+        assert_eq!(balance.available_balance, Decimal::new(100, 0));
+        assert_eq!(
+            TenantDistributionRule::find_all_by_tenant(&isolated, first.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let recharge_count = isolated
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT COUNT(*)::BIGINT AS count FROM balance_transactions WHERE user_id = $1 AND transaction_type = 'recharge'",
+                [user.id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "count")
+            .unwrap();
+        assert_eq!(recharge_count, 1);
+
+        drop(router);
+        drop_isolated_bootstrap_database(admin, isolated, schema).await;
+    }
+
+    #[tokio::test]
+    async fn default_admin_bootstrap_rolls_back_partial_writes_in_postgres() {
+        let Some((admin, isolated, schema)) = isolated_bootstrap_database().await else {
+            return;
+        };
+        // DECIMAL(5,4) cannot store this ratio. The failure occurs after the
+        // tenant, user, credential, and balance writes, proving the outer
+        // bootstrap transaction rolls the entire sequence back.
+        SystemSetting::update_value(
+            &isolated,
+            setting_keys::DISTRIBUTION_LEVEL1_DEFAULT_RATIO,
+            "100",
+        )
+        .await
+        .unwrap();
+        let router = DbRouter::single(isolated.clone());
+        let email = "bootstrap-rollback@example.com";
+
+        assert!(
+            initialize_default_admin(
+                router.as_ref(),
+                true,
+                email,
+                Some("independent-bootstrap-password".to_string()),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            User::find_by_email(&isolated, email)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Tenant::find_by_slug(&isolated, "system")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(router);
+        drop_isolated_bootstrap_database(admin, isolated, schema).await;
     }
 
     #[test]

@@ -50,7 +50,9 @@ impl Default for NodeGatewayAppConfig {
 impl NodeGatewayAppConfig {
     /// 从配置文件中加载
     ///
-    /// 缺失、空值或示例密钥不会阻止服务启动；生产环境会记录安全建议。
+    /// 本转换函数为开发和独立组件测试保留示例回退。KeyCompute 主服务会在
+    /// 生产环境且 Redis 启用 Node Gateway 时，于调用本函数前拒绝缺失、空值、
+    /// 示例值或不足 16 字节的密钥。
     pub fn from_config(config: &NodeGatewayConfig) -> Self {
         let secret = config
             .registration_token_secret
@@ -60,7 +62,7 @@ impl NodeGatewayAppConfig {
 
         if secret == DEFAULT_REGISTRATION_TOKEN_SECRET {
             tracing::warn!(
-                "Node Gateway 正在使用示例 registration_token_secret；生产环境强烈建议设置独立随机密钥"
+                "Node Gateway 正在使用开发示例 registration_token_secret；KeyCompute 主服务的生产 Redis 部署会在此前拒绝该值"
             );
         }
 

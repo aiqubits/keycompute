@@ -1,0 +1,10 @@
+# Host-local dependency ports for running the backend with `cargo run`.
+# Combine this file with docker-compose.yml; do not use it for production.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"

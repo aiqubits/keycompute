@@ -10,8 +10,8 @@ use crate::stores::auth_store::AuthStore;
 use crate::stores::public_settings_store::PublicSettingsStore;
 use crate::stores::referral_store::ReferralStore;
 use crate::stores::user_store::{UserInfo, UserStore};
-use ui::ThemeCtx;
 use ui::components::modal::Modal;
+use ui::{GITHUB_REPOSITORY_URL, ThemeCtx};
 
 // ── 赞助者数据 ───────────────────────────────────
 const SPONSOR_DATA: &str = include_str!("sponsors.txt");
@@ -249,7 +249,7 @@ pub fn Home() -> Element {
                     // Logo + 标题区域
                     div { class: "kc-home-logo",
                         img {
-                            src: asset!("/assets/logo.jpg"),
+                            src: crate::BRAND_LOGO,
                             alt: "KeyCompute",
                         }
                         span { class: "kc-home-logo-text", "{site_name}" }
@@ -319,7 +319,7 @@ pub fn Home() -> Element {
                         // GitHub 仓库链接
                         a {
                             class: "kc-home-github-link",
-                            href: "https://github.com/keycompute",
+                            href: GITHUB_REPOSITORY_URL,
                             target: "_blank",
                             rel: "noopener noreferrer",
                             title: "GitHub",
@@ -779,7 +779,7 @@ pub fn Home() -> Element {
                     "© 2026 "
                     a {
                         class: "footer-link",
-                        href: "https://github.com/aiqubits/keycompute",
+                        href: GITHUB_REPOSITORY_URL,
                         target: "_blank",
                         rel: "noopener noreferrer",
                         {site_name}

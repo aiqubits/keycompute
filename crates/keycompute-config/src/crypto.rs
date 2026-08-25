@@ -9,7 +9,8 @@ use serde::Deserialize;
 pub struct CryptoConfig {
     /// 加密密钥（Base64 编码的 32 字节密钥）
     ///
-    /// 生产环境强烈建议设置；未配置时 API Key 将以明文存储。
+    /// 生产环境必须设置，否则服务拒绝启动；仅开发环境在未配置时
+    /// 允许回退为明文存储。
     /// 可通过以下方式生成：
     /// - 命令行：`openssl rand -base64 32`
     /// - 代码：`ApiKeyCrypto::generate_key()`

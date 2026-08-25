@@ -66,10 +66,16 @@ Use this setup when you want a faster edit / run loop.
 cp config.example.toml config.toml
 ```
 
+An ordinary `cargo run` creates a debug binary, which is always in development
+mode. It reads only `config.toml`, listens on `0.0.0.0`, and may use the public
+local credentials shown in the template.
+`.env.example` and `KC__*` variables are Compose inputs; do not source `.env`
+for this `cargo run` workflow.
+
 2. Start the local dependencies:
 
 ```bash
-docker compose up -d postgres redis
+docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis
 ```
 
 3. Start the backend:
@@ -87,8 +93,12 @@ dx serve --package web --platform web --hot-reload true --addr 0.0.0.0
 Notes:
 
 - The backend initializes the embedded schema on startup. Database upgrades are intentionally unsupported: recreate the database after schema changes.
-- `config.toml` is intended for local development. Environment variables override values from `config.toml`.
-- If you work on password reset emails or public invite links, set `APP_BASE_URL` explicitly.
+- `config.toml` is the only application configuration source for an ordinary
+  debug `cargo run`; `KC__*` and `APP_BASE_URL` do not override it. A release
+  binary (including the Docker image) is always production, reads environment
+  variables, and ignores `config.toml`. There is no runtime mode setting.
+- If you work on password reset emails or public invite links, set
+  `app_base_url` in local `config.toml`; release deployments use `APP_BASE_URL`.
 
 ## Project Structure
 
@@ -114,8 +124,10 @@ keycompute/
 │   ├── desktop/                    # Dioxus desktop app
 │   └── mobile/                     # Dioxus mobile app
 ├── nginx/                          # Reverse proxy config
-├── docker-compose.yml
-└── .github/workflows/              # CI checks
+├── docker-compose.yml             # Production stack
+├── docker-compose.dev.yml         # Local dependency ports
+├── docker-compose.replicas.yml    # Production read replicas
+└── .github/workflows/             # CI checks
 ```
 
 ## Code Quality Checks
@@ -163,10 +175,15 @@ If your change touches `desktop` or `mobile`, run the relevant package commands 
 
 - `.env.example`, `config.example.toml`, and the fallback values in the Compose
   files are development examples. Operators must override them for production.
-- Production startup rejects placeholder JWT and node-registration secrets,
-  default or weak administrator passwords, and an omitted Provider API-key
-  encryption key. Keep code, templates, and tests aligned with this
-  fail-closed policy.
+- Production startup always rejects a blank/default JWT secret (minimum 32
+  bytes) and a missing or invalid Provider API-key encryption key (Base64 for
+  exactly 32 bytes). When Redis enables Node Gateway, it also rejects a
+  blank/default node-registration secret shorter than 16 bytes. Only the first
+  `system` administrator bootstrap requires a non-default, non-blank password
+  of at least 12 characters; later restarts may omit that one-time secret.
+- PostgreSQL, Redis, SMTP, and payment example credentials are not covered by
+  the application placeholder checks. Operators must still replace them for
+  production. Keep code, templates, and tests aligned with this contract.
 - New example credentials must be clearly marked, remain overridable through
   documented configuration, and have tests that keep code, templates, and
   Compose fallbacks aligned.

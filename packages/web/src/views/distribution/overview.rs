@@ -29,9 +29,7 @@ pub fn DistributionOverview() -> Element {
     let nav = use_navigator();
 
     use_effect(move || {
-        if public_settings_store.loaded()
-            && matches!(public_settings_store.distribution_enabled(), Some(false))
-        {
+        if public_settings_store.loaded() && !public_settings_store.distribution_is_enabled() {
             ui_store.show_error(i18n.t("distribution.disabled_message"));
             nav.replace(Route::Dashboard {});
         }
@@ -52,7 +50,7 @@ pub fn DistributionOverview() -> Element {
         };
     }
 
-    if matches!(public_settings_store.distribution_enabled(), Some(false)) {
+    if !public_settings_store.distribution_is_enabled() {
         return rsx! {};
     }
 

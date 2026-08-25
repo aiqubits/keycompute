@@ -113,7 +113,7 @@ impl Default for PublicSettings {
             site_favicon_url: None,
             maintenance_mode: false,
             maintenance_message: None,
-            distribution_enabled: true,
+            distribution_enabled: false,
             alipay_enabled: false,
             wechatpay_enabled: false,
             system_notice: None,

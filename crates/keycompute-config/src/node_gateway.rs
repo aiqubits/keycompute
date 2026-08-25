@@ -6,7 +6,8 @@ use serde::Deserialize;
 
 /// Node Gateway 注册 Token 的示例密钥。
 ///
-/// 该值便于开箱运行，生产环境强烈建议使用独立的随机密钥覆盖。
+/// 该值便于开发环境开箱运行。生产环境配置 Redis、从而启用 Node Gateway
+/// 时，启动检查会拒绝该值，并要求独立的随机密钥。
 pub const DEFAULT_REGISTRATION_TOKEN_SECRET: &str = "change-me-node-registration-token-secret";
 
 /// Node Gateway 配置
@@ -14,7 +15,7 @@ pub const DEFAULT_REGISTRATION_TOKEN_SECRET: &str = "change-me-node-registration
 pub struct NodeGatewayConfig {
     /// HMAC 签名密钥（用于签发/验证节点注册 token 的 HMAC 签名）
     /// 环境变量: KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET
-    /// 默认值: change-me-node-registration-token-secret（生产环境强烈建议修改）
+    /// 默认值: change-me-node-registration-token-secret（仅供开发；生产环境启用 Redis 时必须修改）
     pub registration_token_secret: Option<String>,
     /// 会话 TTL(秒),默认 300
     pub session_ttl_secs: Option<u64>,

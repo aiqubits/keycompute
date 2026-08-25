@@ -1,5 +1,18 @@
 # Node Control MVP Proposal
 
+> **Document status:** This is the original design record. The Node Control MVP has since
+> been implemented, so the implemented routes and security decisions below supersede the
+> earlier alternatives. For deployment settings, use the root README files, `.env.example`,
+> and `config.example.toml`.
+>
+> **Current startup/security contract:** Node Gateway is available only when Redis is
+> configured. In production with Redis, server startup requires a non-default
+> `KC__NODE_GATEWAY__REGISTRATION_TOKEN_SECRET` of at least 16 bytes. Node registration
+> uses an administrator-approved, HMAC-signed, one-time registration token; subsequent
+> heartbeat, polling, and completion requests use the issued node session token. Rotating
+> the HMAC secret invalidates copied-but-unconsumed registration tokens; approved users
+> must fetch a new token, while existing node sessions remain valid.
+
 ## Background
 
 KeyCompute currently works well as a centralized gateway for cloud providers and self-hosted endpoints that are directly reachable by the server. This model is suitable for:
@@ -37,13 +50,14 @@ This proposal introduces a new capability called `Node Control`, where user-owne
 
 The proposal adds a new execution mode alongside existing provider routing:
 
-1. A `node-agent` runs on a user machine
+1. The `node-token` client runs on a user machine
 2. The node registers itself to KeyCompute and periodically sends heartbeats
 3. The node reports its supported models and capabilities
 4. When KeyCompute receives an API request, it can route the request to a matching execution node
 5. Nodes poll the server for claimable tasks
 6. A node claims a task, executes it locally through Ollama or vLLM, and uploads the result
-7. KeyCompute returns the final response or exposes async task lookup
+7. KeyCompute waits up to the configured task deadline and returns the final response; public
+   asynchronous task lookup remains a proposed extension
 
 This keeps KeyCompute as the control plane and turns consumer PCs into pull-based workers.
 
@@ -139,22 +153,20 @@ For MVP this can also be embedded into a single JSON field on `nodes`.
 - `finished_at`
 - `expires_at`
 
-## Minimal API Surface
+## Implemented API Surface
 
 ### Node APIs
 
-- `POST /api/v1/nodes/register`
-- `POST /api/v1/nodes/heartbeat`
-- `POST /api/v1/nodes/tasks/request`
-- `POST /api/v1/nodes/tasks/{id}/claim`
-- `POST /api/v1/nodes/tasks/{id}/running`
-- `POST /api/v1/nodes/tasks/{id}/complete`
+- `POST /node/v1/register` — consumes the approved one-time registration token
+- `POST /node/v1/heartbeat` — requires a node session token
+- `POST /node/v1/tasks/poll` — requires a node session token and claims eligible work
+- `POST /node/v1/tasks/{task_id}/complete` — requires a node session token and is idempotent
 
 ### Task Query API
 
-- `GET /api/v1/tasks/{id}`
-
-This allows clients to inspect task state for long-running jobs.
+The original proposal included `GET /api/v1/tasks/{id}`, but the current MVP does not expose
+that public route. The server waits for completion within the configured task deadline while
+the node agent polls through `/node/v1/tasks/poll`.
 
 ## Suggested Task Flow
 
@@ -166,13 +178,13 @@ This allows clients to inspect task state for long-running jobs.
 4. KeyCompute waits briefly for completion
 5. If the result arrives within the wait window, KeyCompute returns it synchronously
 
-### Slow Path
+### Proposed Slow Path (not currently exposed)
 
 1. Client sends request to KeyCompute
 2. KeyCompute creates a task
 3. KeyCompute waits for a short timeout
 4. If no result arrives, KeyCompute returns `task_id`
-5. Client polls `GET /api/v1/tasks/{id}` later
+5. A future public task-query API could allow the client to poll later
 
 This hybrid model preserves simple API ergonomics while supporting slower consumer nodes.
 
@@ -233,12 +245,14 @@ That allows KeyCompute to support both:
 - Opens a path toward hybrid cloud plus edge execution
 - Provides a simpler MVP path than a full message-broker marketplace architecture
 
-## Open Questions
+## Decisions After MVP
 
-- Should node capabilities live in a dedicated table or JSON for the first release
-- Should task claiming use SQL row locking first, or introduce Redis-backed leases immediately
-- Should node agents authenticate with static tokens, signed registration, or short-lived credentials
-- Should node-backed execution appear as a new provider type in the admin UI, or as a separate resource
+- Capabilities are persisted with the node/session data used by the current scheduler.
+- PostgreSQL is authoritative for task state; Redis supplies queueing and coordination, with
+  database checks as the fallback for completion state.
+- Authentication is resolved: administrator-approved HMAC-signed registration tokens are
+  consumed once, then short-lived node session tokens protect runtime requests.
+- Node resources remain a separate control-plane concept in the current admin UI.
 
 ## Summary
 

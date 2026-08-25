@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::icons::{IconChevronDown, IconHome, IconLogOut, IconMenu, IconSettings, IconUser};
+use crate::layout::GITHUB_REPOSITORY_URL;
 
 /// 用户下拉菜单项回调
 #[derive(Clone, Copy, PartialEq)]
@@ -117,10 +118,10 @@ pub fn Header(
                     IconHome { size: 18 }
                 }
 
-                // GitHub 仓库链接（与首页样式一致，按后台比例缩放）
+                // GitHub 仓库链接（全尺寸可见，与首页样式一致，按后台比例缩放）
                 a {
-                    class: "header-github-link hide-mobile",
-                    href: "https://github.com/keycompute",
+                    class: "header-github-link",
+                    href: GITHUB_REPOSITORY_URL,
                     target: "_blank",
                     rel: "noopener noreferrer",
                     title: "GitHub",

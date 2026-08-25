@@ -83,13 +83,13 @@ impl MetricsRequestLifecycleRecorder {
             .remove(&request_id);
         let Some(state) = state else { return };
         MONITORING_ACTIVE_REQUESTS
-            .with_label_values(&[&state.protocol, state.route])
+            .with_label_values(&[state.protocol.as_str(), state.route])
             .dec();
         MONITORING_REQUEST_TOTAL
-            .with_label_values(&[&state.protocol, state.route, status.as_str()])
+            .with_label_values(&[state.protocol.as_str(), state.route, status.as_str()])
             .inc();
         MONITORING_REQUEST_LATENCY
-            .with_label_values(&[&state.protocol, state.route, status.as_str()])
+            .with_label_values(&[state.protocol.as_str(), state.route, status.as_str()])
             .observe(
                 at.signed_duration_since(state.received_at)
                     .num_milliseconds()
@@ -122,7 +122,7 @@ impl RequestLifecycleRecorder for MetricsRequestLifecycleRecorder {
             .expect("request metrics state poisoned")
             .insert(request_id, state.clone());
         MONITORING_ACTIVE_REQUESTS
-            .with_label_values(&[&state.protocol, state.route])
+            .with_label_values(&[state.protocol.as_str(), state.route])
             .inc();
         if let Err(error) = result {
             tracing::warn!(%request_id, %error, "request tracing disabled after start failure");
@@ -161,11 +161,11 @@ impl RequestLifecycleRecorder for MetricsRequestLifecycleRecorder {
                 is_new_node_task_transition(state.route, state.status, route, status);
             if route_changed {
                 MONITORING_ACTIVE_REQUESTS
-                    .with_label_values(&[&state.protocol, state.route])
+                    .with_label_values(&[state.protocol.as_str(), state.route])
                     .dec();
                 state.route = route.as_str();
                 MONITORING_ACTIVE_REQUESTS
-                    .with_label_values(&[&state.protocol, state.route])
+                    .with_label_values(&[state.protocol.as_str(), state.route])
                     .inc();
             }
             state.status = status;

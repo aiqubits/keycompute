@@ -5,8 +5,12 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use integration_tests::common::TestContext;
+use integration_tests::db::create_test_pool;
+use keycompute_db::SystemSetting;
+use keycompute_db::models::system_setting::setting_keys;
 use keycompute_server::create_router;
 use keycompute_server::state::AppState;
+use sea_orm::TransactionTrait;
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -133,4 +137,43 @@ async fn test_update_single_setting_requires_admin() {
         response.status() == StatusCode::UNAUTHORIZED
             || response.status() == StatusCode::INTERNAL_SERVER_ERROR
     );
+}
+
+/// 未配置公开 URL 时，即使历史基线将分销设为启用，启动期收敛也必须原子禁用；
+/// 已配置 URL 时则不得覆盖管理员持久化的选择。
+#[tokio::test]
+async fn test_distribution_setting_reconciles_with_public_url() {
+    let pool = create_test_pool().await;
+    let tx = pool.begin().await.unwrap();
+
+    SystemSetting::update_value(&tx, setting_keys::DISTRIBUTION_ENABLED, "true")
+        .await
+        .unwrap();
+    assert!(
+        !SystemSetting::reconcile_distribution_public_url(&tx, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        SystemSetting::find_by_key(&tx, setting_keys::DISTRIBUTION_ENABLED)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse_bool()
+    );
+
+    assert!(
+        SystemSetting::reconcile_distribution_public_url(&tx, false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !SystemSetting::find_by_key(&tx, setting_keys::DISTRIBUTION_ENABLED)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse_bool()
+    );
+
+    tx.rollback().await.unwrap();
 }

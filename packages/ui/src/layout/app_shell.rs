@@ -33,6 +33,7 @@ pub struct UiState {
 /// - `nav_sections`：侧边栏导航分组列表
 /// - `page_title`：当前页面标题（显示在顶部栏）
 /// - `user_name`：当前登录用户名（显示头像首字母）
+/// - `site_logo_src`：侧边栏站点 Logo 地址
 /// - `children`：主内容区内容
 /// - `on_user_menu`：用户下拉菜单操作回调
 #[component]
@@ -56,6 +57,7 @@ pub fn AppShell(
     #[props(default)] expand_label: String,
     #[props(default)] collapse_label: String,
     #[props(default = "KeyCompute".to_string())] site_name: String,
+    #[props(default)] site_logo_src: String,
     #[props(default)] on_user_menu: EventHandler<UserMenuAction>,
     children: Element,
 ) -> Element {
@@ -167,6 +169,7 @@ pub fn AppShell(
                 collapse_label: collapse_label.clone(),
                 close_menu_title: close_menu_title.clone(),
                 site_name: site_name.clone(),
+                site_logo_src: site_logo_src.clone(),
             }
 
             div { class: "{main_class}",
@@ -219,5 +222,12 @@ mod tests {
         assert!(css.contains(".sidebar.collapsed .sidebar-section-title"));
         assert!(css.contains(".sidebar.collapsed .sidebar-item-label"));
         assert!(css.contains(".sidebar.collapsed .sidebar-item {"));
+    }
+
+    #[test]
+    fn visibility_helpers_preserve_component_display_outside_their_breakpoint() {
+        let css = include_str!("../../assets/styling/responsive.css");
+        assert!(css.contains("@media (max-width: 639px) { .hide-mobile"));
+        assert!(!css.contains(".hide-mobile  { display: revert; }"));
     }
 }

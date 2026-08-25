@@ -8,8 +8,8 @@
 //! # 配置
 //!
 //! 通过 `keycompute-config` 模块加载配置：
-//! - 环境变量：`KC__EMAIL__SMTP_HOST`、`KC__EMAIL__SMTP_PORT` 等
-//! - 配置文件：`config.toml` 中的 `[email]` 部分
+//! - debug 开发启动：`config.toml` 中的 `[email]` 部分
+//! - release 生产启动：`KC__EMAIL__SMTP_HOST`、`KC__EMAIL__SMTP_PORT` 等环境变量
 //!
 //! # 热更新支持
 //!
@@ -81,6 +81,14 @@ enum TransportState {
 impl TransportState {
     fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
+    }
+
+    fn require_ready(&self) -> Result<&AsyncSmtpTransport<Tokio1Executor>, EmailError> {
+        match self {
+            Self::Ready(transport) => Ok(transport),
+            Self::Disabled => Err(EmailError::NotConfigured),
+            Self::InvalidConfig(msg) => Err(EmailError::InvalidConfig(msg.clone())),
+        }
     }
 }
 
@@ -471,6 +479,7 @@ KeyCompute 团队
         body: &str,
     ) -> Result<(), EmailError> {
         let runtime = self.runtime.read().await.clone();
+        let transport = runtime.transport.require_ready()?;
         let from_mailbox = Self::build_from_mailbox(&runtime.config)?;
 
         let to_mailbox: Mailbox = to
@@ -485,18 +494,10 @@ KeyCompute 团队
             .body(body.to_string())
             .map_err(|e| EmailError::BuildError(e.to_string()))?;
 
-        match &runtime.transport {
-            TransportState::Ready(transport) => {
-                transport
-                    .send(email)
-                    .await
-                    .map_err(|e| EmailError::SendError(e.to_string()))?;
-            }
-            TransportState::Disabled => return Err(EmailError::NotConfigured),
-            TransportState::InvalidConfig(msg) => {
-                return Err(EmailError::InvalidConfig(msg.clone()));
-            }
-        }
+        transport
+            .send(email)
+            .await
+            .map_err(|e| EmailError::SendError(e.to_string()))?;
 
         tracing::info!(
             to = %to,
@@ -528,6 +529,7 @@ KeyCompute 团队
         html_body: &str,
     ) -> Result<(), EmailError> {
         let runtime = self.runtime.read().await.clone();
+        let transport = runtime.transport.require_ready()?;
         let from_mailbox = Self::build_from_mailbox(&runtime.config)?;
 
         let to_mailbox: Mailbox = to
@@ -554,18 +556,10 @@ KeyCompute 团队
             )
             .map_err(|e| EmailError::BuildError(e.to_string()))?;
 
-        match &runtime.transport {
-            TransportState::Ready(transport) => {
-                transport
-                    .send(email)
-                    .await
-                    .map_err(|e| EmailError::SendError(e.to_string()))?;
-            }
-            TransportState::Disabled => return Err(EmailError::NotConfigured),
-            TransportState::InvalidConfig(msg) => {
-                return Err(EmailError::InvalidConfig(msg.clone()));
-            }
-        }
+        transport
+            .send(email)
+            .await
+            .map_err(|e| EmailError::SendError(e.to_string()))?;
 
         tracing::info!(
             to = %to,
@@ -700,11 +694,15 @@ mod tests {
     async fn test_send_without_config() {
         let service = EmailService::new(EmailConfig::default());
 
-        let result = service
+        let text_result = service
             .send_text_email("test@example.com", "Test", "Body")
             .await;
+        let html_result = service
+            .send_html_email("test@example.com", "Test", "Body", "<p>Body</p>")
+            .await;
 
-        assert!(matches!(result, Err(EmailError::NotConfigured)));
+        assert!(matches!(text_result, Err(EmailError::NotConfigured)));
+        assert!(matches!(html_result, Err(EmailError::NotConfigured)));
     }
 
     #[tokio::test]

@@ -172,7 +172,9 @@ impl Default for PublicSettings {
             site_favicon_url: None,
             maintenance_mode: false,
             maintenance_message: None,
-            distribution_enabled: true,
+            // Missing settings must not expose distribution routes. Startup
+            // explicitly reconciles the persisted value with APP_BASE_URL.
+            distribution_enabled: false,
             alipay_enabled: false,
             wechatpay_enabled: false,
             system_notice: None,
@@ -341,7 +343,9 @@ impl SystemSetting {
             (setting_keys::LOGIN_LOCKOUT_MINUTES, "30", "int"),
             (setting_keys::JWT_EXPIRE_HOURS, "72", "int"),
             (setting_keys::SYSTEM_NOTICE_ENABLED, "false", "bool"),
-            (setting_keys::DISTRIBUTION_ENABLED, "true", "bool"),
+            // Distribution creates public invitation links, so an absent
+            // setting must fail closed until startup verifies APP_BASE_URL.
+            (setting_keys::DISTRIBUTION_ENABLED, "false", "bool"),
             (
                 setting_keys::DISTRIBUTION_LEVEL1_DEFAULT_RATIO,
                 "0.03",
@@ -402,6 +406,41 @@ impl SystemSetting {
         }
     }
 
+    /// Ensure distribution cannot remain enabled without a public application URL.
+    ///
+    /// The baseline historically seeds distribution as enabled. Keep that
+    /// migration immutable, but atomically disable (or create) the setting when
+    /// the current deployment has no URL from which referral links can be built.
+    /// Returns `true` when the database row was inserted or changed.
+    pub async fn reconcile_distribution_public_url(
+        db: &impl ConnectionTrait,
+        has_public_app_url: bool,
+    ) -> Result<bool, DbError> {
+        if has_public_app_url {
+            return Ok(false);
+        }
+
+        let result = db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                INSERT INTO system_settings (
+                    key, value, value_type, description, created_at, updated_at
+                )
+                VALUES ($1, 'false', 'bool', '是否启用分销系统', NOW(), NOW())
+                ON CONFLICT (key) DO UPDATE SET
+                    value = 'false',
+                    value_type = 'bool',
+                    updated_at = NOW()
+                WHERE LOWER(TRIM(system_settings.value)) IN ('true', '1')
+                "#,
+                [setting_keys::DISTRIBUTION_ENABLED.into()],
+            ))
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// 获取公开设置
     pub async fn get_public_settings(db: &impl ConnectionTrait) -> PublicSettings {
         let settings = Self::find_non_sensitive(db).await.unwrap_or_default();
@@ -429,7 +468,7 @@ impl SystemSetting {
             site_favicon_url: get_value(setting_keys::SITE_FAVICON_URL),
             maintenance_mode: get_bool_value(setting_keys::MAINTENANCE_MODE, false),
             maintenance_message: get_value(setting_keys::MAINTENANCE_MESSAGE),
-            distribution_enabled: get_bool_value(setting_keys::DISTRIBUTION_ENABLED, true),
+            distribution_enabled: get_bool_value(setting_keys::DISTRIBUTION_ENABLED, false),
             alipay_enabled: get_bool_value(setting_keys::ALIPAY_ENABLED, false),
             wechatpay_enabled: get_bool_value(setting_keys::WECHATPAY_ENABLED, false),
             system_notice: get_value(setting_keys::SYSTEM_NOTICE),
@@ -474,5 +513,10 @@ mod tests {
             ..setting
         };
         assert!(!setting.parse_bool());
+    }
+
+    #[test]
+    fn public_settings_fail_closed_when_distribution_setting_is_missing() {
+        assert!(!PublicSettings::default().distribution_enabled);
     }
 }
