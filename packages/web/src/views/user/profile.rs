@@ -1,6 +1,7 @@
 #![allow(clippy::clone_on_copy)]
 
 use dioxus::prelude::*;
+use ui::PageHeader;
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::services::api_client::with_auto_refresh;
@@ -116,12 +117,9 @@ pub fn UserProfile() -> Element {
     rsx! {
         div {
             class: "page-container",
-            div {
-                class: "page-header",
-                div {
-                    h1 { class: "page-title", {i18n.t("page.profile")} }
-                    p { class: "page-description", {i18n.t("profile.page_desc")} }
-                }
+            PageHeader {
+                title: i18n.t("page.profile").to_string(),
+                description: i18n.t("profile.page_desc").to_string(),
             }
 
             if let Some(msg) = save_msg() {

@@ -66,15 +66,14 @@
     margin-left: 0 !important;
   }
 
-  /* 显示底部导航 */
-  .bottom-nav {
-    display: block;
-  }
-
-  /* 内容区为底部导航留空间 */
+  /* 当前 AppShell 使用抽屉式侧栏，未渲染底部导航。 */
   .content-area {
     padding: var(--space-md) 12px;
-    padding-bottom: calc(var(--bottom-nav-height) + var(--space-md));
+  }
+
+  .page-header-actions {
+    width: 100%;
+    justify-content: flex-start;
   }
 
   .sidebar-logo {
@@ -99,9 +98,6 @@
     padding: 0 var(--space-md);
   }
 
-  .header-page-title {
-    font-size: var(--font-size-base);
-  }
 }
 
 /* ── Tablet (640px - 1023px) ────────────────── */
@@ -162,10 +158,6 @@
 @media (min-width: 1024px) {
   /* 侧边栏遮罩在桌面上始终不显示 */
   .sidebar-overlay {
-    display: none !important;
-  }
-
-  .bottom-nav {
     display: none !important;
   }
 }

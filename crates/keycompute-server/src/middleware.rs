@@ -421,12 +421,12 @@ pub async fn public_auth_rate_limit_middleware(
         && let Err(response) =
             enforce_public_rate_limit(&state, scope, "ip", client_ip, &config).await
     {
-        return response;
+        return *response;
     } else if client_ip.is_none()
         && let Err(response) =
             enforce_public_rate_limit(&state, scope, "ip-fallback", "anonymous", &config).await
     {
-        return response;
+        return *response;
     }
 
     let (cookie_identity, set_cookie_header) =
@@ -434,7 +434,7 @@ pub async fn public_auth_rate_limit_middleware(
     if let Err(response) =
         enforce_public_rate_limit(&state, scope, "cookie", &cookie_identity, &config).await
     {
-        return response;
+        return *response;
     }
 
     let mut response = next.run(req).await;
@@ -464,7 +464,7 @@ pub async fn payment_notify_rate_limit_middleware(
     let config = RateLimitConfig::new(3000, u32::MAX);
     if let Err(response) = enforce_public_rate_limit(&state, scope, "ip", &identity, &config).await
     {
-        return response;
+        return *response;
     }
     req.extensions_mut().insert(PaymentNotifyClientIp(identity));
     next.run(req).await
@@ -587,7 +587,7 @@ async fn enforce_public_rate_limit(
     dimension: &str,
     identity: &str,
     config: &RateLimitConfig,
-) -> std::result::Result<(), Response> {
+) -> std::result::Result<(), Box<Response>> {
     let rate_key = build_public_rate_limit_key(scope, dimension, identity);
 
     match state
@@ -605,7 +605,7 @@ async fn enforce_public_rate_limit(
                 "Public auth rate limit exceeded: {}",
                 msg
             );
-            Err(rate_limit_exceeded_response())
+            Err(Box::new(rate_limit_exceeded_response()))
         }
         Err(e) => {
             // 限流检查出错（如 Redis 不可用），按 fail-closed 原则拒绝请求
@@ -615,7 +615,7 @@ async fn enforce_public_rate_limit(
                 error = %e,
                 "Public auth rate limit check failed, denying request"
             );
-            Err(service_unavailable_response())
+            Err(Box::new(service_unavailable_response()))
         }
     }
 }

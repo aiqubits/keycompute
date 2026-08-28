@@ -152,6 +152,8 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     // ── 表格 ────────────────────────────────────
     m.insert("table.no_data", "暂无数据");
     m.insert("table.loading", "加载中...");
+    m.insert("table.previous", "‹ 上一页");
+    m.insert("table.next", "下一页 ›");
     m.insert("table.actions", "操作");
     m.insert("table.status", "状态");
     m.insert("table.created_at", "创建时间");
@@ -173,11 +175,18 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     );
     m.insert("common.refresh", "刷新");
     m.insert("common.back", "返回");
+    m.insert("common.clear", "清空");
+    m.insert("common.close", "关闭");
     m.insert("common.time", "时间");
     m.insert("common.total_items", "共");
     m.insert("common.range", "范围");
     m.insert("common.created_at_label", "创建于");
     m.insert("common.load_failed", "加载失败");
+    m.insert(
+        "common.user_info_load_failed",
+        "用户信息加载失败，无法验证管理员权限。",
+    );
+    m.insert("common.retry", "重试");
     m.insert("common.redirecting", "跳转中");
     m.insert("common.redirect_to_login", "正在跳转到登录页…");
     m.insert("common.redirect_to_home", "正在跳转到首页…");
@@ -277,6 +286,11 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("api_keys.name_placeholder", "为此 Key 取个名字");
     m.insert("api_keys.creating", "创建中...");
     m.insert("api_keys.create_failed", "创建失败");
+    m.insert("api_keys.delete_confirm_title", "删除 API Key");
+    m.insert(
+        "api_keys.delete_confirm_message",
+        "确定删除 API Key“{name}”吗？删除后无法恢复。",
+    );
     m.insert("api_keys.loading_failed", "加载失败");
     m.insert("api_keys.registry", "API 密钥管理");
     m.insert("api_keys.empty_meta", "当前筛选条件下没有可用凭证。");
@@ -290,6 +304,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("layout.back_to_home", "返回首页");
     m.insert("layout.open_menu", "打开菜单");
     m.insert("layout.close_menu", "关闭菜单");
+    m.insert("layout.user_menu", "用户菜单");
     m.insert("layout.switch_to_light", "切换到亮色主题");
     m.insert("layout.switch_to_dark", "切换到暗色主题");
     m.insert("layout.switch_to_zh", "切换到中文");
@@ -441,6 +456,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("reset_password.submit", "确认重置");
 
     // ── Account Settings ────────────────────────
+    m.insert("account_settings.subtitle", "更新登录密码与账户安全信息");
     m.insert("account_settings.fill_all_passwords", "请填写所有密码字段");
     m.insert("account_settings.password_mismatch", "两次新密码输入不一致");
     m.insert("account_settings.password_too_short", "新密码至少需要 8 位");
@@ -515,6 +531,8 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("usage.prompt_tokens", "提示词");
     m.insert("usage.completion_tokens", "补全");
     m.insert("usage.total_cost", "累计费用");
+    m.insert("usage.status_success", "成功");
+    m.insert("usage.status_failed", "失败");
     m.insert("usage.usage_billed", "按使用量计费");
     m.insert("usage.trend", "调用趋势");
     m.insert("usage.records", "调用记录");
@@ -560,6 +578,39 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("payment_orders.filter_paid", "已支付");
     m.insert("payment_orders.filter_failed", "已失败");
     m.insert("payment_orders.filter_closed", "已关闭");
+    m.insert("payment_orders.status_pending", "待支付");
+    m.insert("payment_orders.status_processing", "处理中");
+    m.insert("payment_orders.status_paid", "已支付");
+    m.insert("payment_orders.status_failed", "已失败");
+    m.insert("payment_orders.status_closed", "已关闭");
+    m.insert("payment_orders.status_cancelled", "已取消");
+    m.insert("payment_orders.provider_available", "可用");
+    m.insert("payment_orders.provider_disabled", "已停用");
+    m.insert("payment_orders.provider_misconfigured", "配置不完整");
+    m.insert("payment_orders.provider_state_error", "状态异常");
+    m.insert("payment_orders.provider_unverified", "待验证");
+    m.insert("payment_orders.provider_unavailable", "不可用");
+    m.insert("payment_orders.provider_degraded", "性能下降");
+    m.insert(
+        "payment_orders.provider_misconfigured_message",
+        "渠道已启用，但密钥或回调配置不完整。",
+    );
+    m.insert(
+        "payment_orders.provider_state_error_message",
+        "渠道状态不可用或无效，已暂停接受新订单。",
+    );
+    m.insert(
+        "payment_orders.provider_unverified_message",
+        "配置已加载，完成真实渠道验证后才会投入使用。",
+    );
+    m.insert(
+        "payment_orders.provider_unavailable_message",
+        "渠道认证或验签失败，已暂停接受新订单。",
+    );
+    m.insert(
+        "payment_orders.provider_degraded_message",
+        "渠道近期请求不稳定，当前仍接受新订单并持续观察。",
+    );
 
     // ── Recharge ──────────────────────────────
     m.insert("recharge.title", "账户充值");
@@ -629,6 +680,10 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("distribution.total_earnings", "总收益");
     m.insert("distribution.available_balance", "可用余额");
     m.insert("distribution.pending", "待结算");
+    m.insert("distribution.status_settled", "已结算");
+    m.insert("distribution.status_pending", "待结算");
+    m.insert("distribution.status_cancelled", "已取消");
+    m.insert("distribution.status_failed", "失败");
     m.insert("distribution.referral_count", "推荐人数");
     m.insert("distribution.my_invite_link", "我的邀请链接");
     m.insert("distribution.referral_users", "推荐用户");
@@ -750,6 +805,11 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("pricing.set_default", "设为默认");
     m.insert("pricing.deleted", "定价已删除");
     m.insert("pricing.delete_failed", "删除失败");
+    m.insert("pricing.delete_confirm_title", "删除定价");
+    m.insert(
+        "pricing.delete_confirm_message",
+        "确定删除模型“{model}”的这条定价吗？删除后无法恢复。",
+    );
     m.insert("pricing.created", "定价创建成功");
     m.insert("pricing.updated", "定价更新成功");
     m.insert("pricing.fill_all", "请填写所有字段");
@@ -868,6 +928,10 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("system.fallback_chain", "备用链路");
     m.insert("system.items", "个");
     m.insert("system.route_failed", "路由失败");
+    m.insert(
+        "system.no_routable_probe_model",
+        "当前租户没有可用于 Provider 路由探测的启用账号模型",
+    );
     m.insert("system.provider_status", "Provider 状态");
     m.insert("system.no_provider_configured", "未配置任何 Provider");
     m.insert("system.provider_column", "Provider");
@@ -1107,6 +1171,11 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("monitoring.probe_done", "探测完成");
     m.insert("monitoring.probe_failed", "探测失败");
     m.insert("monitoring.probe_all_accounts", "探测全部账号");
+    m.insert("monitoring.probe_confirm_title", "确认探测全部账号");
+    m.insert(
+        "monitoring.probe_confirm_message",
+        "该操作会向所有已配置账号发起真实上游探测，可能产生少量费用。是否继续？",
+    );
     m.insert("monitoring.last_updated", "最后更新");
     m.insert("monitoring.empty_range", "当前时间范围无流量");
     m.insert("monitoring.empty_filtered", "筛选条件无匹配结果");
@@ -1216,6 +1285,7 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("users.display_name_placeholder", "留空则不修改");
     m.insert("users.role_user", "user（普通用户）");
     m.insert("users.role_admin", "admin（管理员）");
+    m.insert("users.role_system", "system（受保护）");
     m.insert("users.delete_confirm_title", "确认删除");
     m.insert("users.delete_confirm_prefix", "确定要删除用户");
     m.insert("users.delete_confirm_suffix", "吗？此操作不可撤销。");

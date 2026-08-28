@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use ui::{LineChart, LineSeriesData, Pagination};
+use ui::{LineChart, LineSeriesData, PageHeader, Pagination, Table, TableHead};
 
 const PAGE_SIZE: usize = 20;
 
@@ -62,10 +62,9 @@ pub fn Usage() -> Element {
     rsx! {
         div {
             class: "page-container",
-            div {
-                class: "page-header",
-                h1 { class: "page-title", {i18n.t("page.usage")} }
-                p { class: "page-subtitle", {i18n.t("usage.subtitle")} }
+            PageHeader {
+                title: i18n.t("page.usage").to_string(),
+                description: i18n.t("usage.subtitle").to_string(),
             }
 
             // 汇总卡片
@@ -128,16 +127,17 @@ pub fn Usage() -> Element {
                         p { class: "empty-text", {i18n.t("usage.no_records")} }
                     },
                     Some(Ok(recs)) => rsx! {
-                        div { class: "table-container",
-                            table { class: "data-table",
+                        Table {
+                            class: "data-table".to_string(),
+                            col_count: 6,
                                 thead {
                                     tr {
-                                        th { {i18n.t("common.time")} }
-                                        th { {i18n.t("usage.model")} }
-                                        th { {i18n.t("usage.prompt_tokens")} }
-                                        th { {i18n.t("usage.completion_tokens")} }
-                                        th { {i18n.t("usage.total_token")} }
-                                        th { {i18n.t("common.cost")} }
+                                        TableHead { {i18n.t("common.time")} }
+                                        TableHead { {i18n.t("usage.model")} }
+                                        TableHead { {i18n.t("usage.prompt_tokens")} }
+                                        TableHead { {i18n.t("usage.completion_tokens")} }
+                                        TableHead { {i18n.t("usage.total_token")} }
+                                        TableHead { {i18n.t("common.cost")} }
                                     }
                                 }
                                 tbody {
@@ -165,7 +165,6 @@ pub fn Usage() -> Element {
                                         }
                                     }
                                 }
-                            }
                         }
                         {
                             let total = recs.len();
@@ -176,6 +175,8 @@ pub fn Usage() -> Element {
                                     Pagination {
                                         current: page(),
                                         total_pages,
+                                        previous_label: i18n.t("table.previous").to_string(),
+                                        next_label: i18n.t("table.next").to_string(),
                                         on_page_change: move |p| page.set(p),
                                     }
                                 }

@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use ui::PageHeader;
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::services::user_service;
@@ -93,11 +94,9 @@ pub fn UserSettings() -> Element {
     rsx! {
         div {
             class: "page-container account-settings-page",
-            div {
-                class: "page-header",
-                div {
-                    h1 { class: "page-title", {i18n.t("page.account_settings")} }
-                }
+            PageHeader {
+                title: i18n.t("page.account_settings").to_string(),
+                description: i18n.t("account_settings.subtitle").to_string(),
             }
 
             if let Some(msg) = success_msg() {

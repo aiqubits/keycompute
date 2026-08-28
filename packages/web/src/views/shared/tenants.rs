@@ -1,6 +1,6 @@
 use client_api::api::tenant::TenantInfo;
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant, Pagination, Table, TableHead};
+use ui::{Badge, BadgeVariant, PageHeader, Pagination, Table, TableHead};
 
 const PAGE_SIZE: usize = 20;
 
@@ -8,6 +8,7 @@ use crate::hooks::use_i18n::use_i18n;
 use crate::services::{api_client::with_auto_refresh, tenant_service};
 use crate::stores::auth_store::AuthStore;
 use crate::stores::user_store::UserStore;
+use crate::utils::display::short_id;
 use crate::utils::time::format_time;
 use crate::views::shared::accounts::NoPermissionView;
 
@@ -73,9 +74,10 @@ pub fn Tenants() -> Element {
     };
 
     rsx! {
-        div { class: "page-header",
-            h1 { class: "page-title", {i18n.t("page.tenants")} }
-            p { class: "page-description", {i18n.t("tenants.subtitle")} }
+        div { class: "page-container tenants-page",
+        PageHeader {
+            title: i18n.t("page.tenants").to_string(),
+            description: i18n.t("tenants.subtitle").to_string(),
         }
 
         div { class: "toolbar",
@@ -118,7 +120,7 @@ pub fn Tenants() -> Element {
                     tbody {
                         for t in paged().iter() {
                             tr {
-                                td { code { "{t.id}" } }
+                                td { code { title: "{t.id}", {short_id(&t.id)} } }
                                 td { "{t.name}" }
                                 td {
                                     if t.is_active {
@@ -142,8 +144,11 @@ pub fn Tenants() -> Element {
             Pagination {
                 current: page(),
                 total_pages: total_pages(),
+                previous_label: i18n.t("table.previous").to_string(),
+                next_label: i18n.t("table.next").to_string(),
                 on_page_change: move |p| page.set(p),
             }
+        }
         }
     }
 }

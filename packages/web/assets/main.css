@@ -14,7 +14,7 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
-  font-family: var(--font-family, "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+  font-family: var(--font-family, "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", sans-serif);
   font-feature-settings: "cv02", "cv03", "cv04", "tnum";
   text-rendering: optimizeLegibility;
 }
@@ -755,30 +755,6 @@ input, textarea, select {
 }
 
 /* ── Authenticated Console Surface ──────────── */
-.page-container {
-  display: flex;
-  flex-direction: column;
-  gap: 22px;
-  animation: kc-console-enter 0.38s ease-out both;
-}
-
-.page-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 24px;
-}
-
-.page-title {
-  margin: 0;
-  color: var(--text-primary);
-  font-family: var(--font-display, "Space Grotesk", sans-serif);
-  font-size: clamp(1.7rem, 3vw, 2.45rem);
-  font-weight: 700;
-  line-height: 1.08;
-  letter-spacing: -0.05em;
-}
-
 .page-subtitle {
   display: inline-flex;
   align-items: flex-start;
@@ -1232,7 +1208,6 @@ input, textarea, select {
 }
 
 @media (max-width: 780px) {
-  .page-header,
   .kc-api-header,
   .kc-api-actions,
   .kc-api-table-meta {
@@ -1246,25 +1221,6 @@ input, textarea, select {
 }
 
 /* ── Console Restyle: Reference Dashboard ───── */
-.page-container {
-  gap: 24px;
-  animation: none;
-}
-
-.page-header {
-  align-items: center;
-  margin-bottom: 8px;
-}
-
-.page-title {
-  color: var(--text-primary);
-  font-family: var(--font-family);
-  font-size: 28px;
-  font-weight: 700;
-  line-height: 1.2;
-  letter-spacing: 0;
-}
-
 .page-subtitle {
   max-width: none;
   margin-top: 4px;
@@ -1852,7 +1808,6 @@ input, textarea, select {
 }
 
 @media (max-width: 780px) {
-  .page-header,
   .kc-api-header,
   .kc-api-actions,
   .kc-api-table-meta {
@@ -1910,17 +1865,73 @@ input, textarea, select {
 }
 
 .page-container {
+  display: flex;
+  flex-direction: column;
   width: 100%;
   gap: 20px;
 }
 
 .page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
   min-height: 40px;
+  margin-bottom: 8px;
   padding-bottom: 2px;
 }
 
-.page-header > div:first-child {
+.page-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-family);
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.page-header-main {
   min-width: 0;
+  flex: 1;
+}
+
+.page-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.page-header-leading {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.page-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.search-input-wrapper {
+  position: relative;
+  display: block;
+}
+
+.search-input-wrapper .input-field {
+  padding-right: 36px;
+}
+
+.search-input-wrapper .input-clear-button {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  min-width: 28px;
+  padding: 0;
+  transform: translateY(-50%);
 }
 
 .page-description {
@@ -2048,6 +2059,19 @@ input, textarea, select {
   padding: 20px;
 }
 
+.section-body {
+  padding: 20px;
+}
+
+.section-body-title {
+  margin: 0 0 16px;
+}
+
+.recharge-page > .card {
+  width: 100%;
+  max-width: 720px;
+}
+
 .card-footer {
   background: color-mix(in srgb, var(--bg-card) 88%, var(--bg-primary));
   border-top: 1px solid var(--border-color);
@@ -2071,6 +2095,33 @@ input, textarea, select {
   min-width: 680px;
   border-collapse: collapse;
   font-variant-numeric: tabular-nums;
+}
+
+.table-container-empty .table {
+  min-width: 100%;
+}
+
+.responsive-chart {
+  min-width: 0;
+}
+
+@media (max-width: 639px) {
+  .table-container:not(.table-container-empty) .table th:first-child,
+  .table-container:not(.table-container-empty) .table td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--bg-card);
+  }
+
+  .table-container:not(.table-container-empty) .table th:last-child,
+  .table-container:not(.table-container-empty) .table td:last-child {
+    position: sticky;
+    right: 0;
+    z-index: 1;
+    background: var(--bg-card);
+    box-shadow: -8px 0 12px -12px rgba(15, 23, 42, 0.55);
+  }
 }
 
 .data-table th,

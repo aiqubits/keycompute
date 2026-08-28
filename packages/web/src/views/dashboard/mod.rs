@@ -12,6 +12,7 @@ use crate::services::{
 use crate::stores::auth_store::AuthStore;
 use crate::stores::public_settings_store::PublicSettingsStore;
 use crate::stores::user_store::UserStore;
+use crate::utils::display::usage_status_label;
 use crate::utils::time::format_time;
 
 #[derive(Clone)]
@@ -244,7 +245,7 @@ pub fn Dashboard() -> Element {
             format!(
                 "{} {}",
                 earnings.currency,
-                crate::utils::format_money_str(&earnings.total_earnings)
+                crate::utils::format_precise_money_str(&earnings.total_earnings)
             )
         })
         .unwrap_or_else(|| "—".to_string());
@@ -253,7 +254,7 @@ pub fn Dashboard() -> Element {
             format!(
                 "{} {}",
                 earnings.currency,
-                crate::utils::format_money_str(&earnings.pending_earnings)
+                crate::utils::format_precise_money_str(&earnings.pending_earnings)
             )
         })
         .unwrap_or_else(|| "—".to_string());
@@ -441,7 +442,7 @@ pub fn Dashboard() -> Element {
                                                 } else {
                                                     "dashboard-inline-status dashboard-inline-status-warn"
                                                 },
-                                                "{record.status}"
+                                                {usage_status_label(&record.status, &i18n)}
                                             }
                                         }
                                         div { class: "dashboard-activity-time", { format_time(&record.created_at) } }

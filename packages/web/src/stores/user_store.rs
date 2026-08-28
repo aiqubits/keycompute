@@ -33,13 +33,14 @@ impl UserInfo {
 #[derive(Clone, Copy)]
 pub struct UserStore {
     pub info: Signal<Option<UserInfo>>,
+    pub load_failed: Signal<bool>,
 }
 
 impl UserStore {
     /// 创建新的 UserStore。
     /// 注意：Signal 必须在组件顶层创建后传入
-    pub fn new(info: Signal<Option<UserInfo>>) -> Self {
-        Self { info }
+    pub fn new(info: Signal<Option<UserInfo>>, load_failed: Signal<bool>) -> Self {
+        Self { info, load_failed }
     }
 
     #[allow(dead_code)]
@@ -50,6 +51,7 @@ impl UserStore {
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         *self.info.write() = None;
+        self.load_failed.set(false);
     }
 
     #[allow(dead_code)]

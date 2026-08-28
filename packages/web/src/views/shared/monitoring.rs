@@ -3,12 +3,13 @@ use client_api::api::admin::{
     MonitoringTargetHealthResponse,
 };
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant};
+use ui::{Badge, BadgeVariant, ConfirmModal, PageHeader};
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::i18n::I18n;
 use crate::services::{api_client::with_auto_refresh, monitoring_service};
 use crate::stores::{auth_store::AuthStore, user_store::UserStore};
+use crate::utils::time::format_time;
 use crate::views::shared::accounts::NoPermissionView;
 
 #[derive(Clone)]
@@ -48,6 +49,7 @@ pub fn Monitoring() -> Element {
     let mut relative_to = use_signal(chrono::Utc::now);
     let mut probe_message = use_signal(String::new);
     let mut probing = use_signal(|| false);
+    let mut probe_confirm_open = use_signal(|| false);
 
     use_future(move || async move {
         loop {
@@ -120,13 +122,38 @@ pub fn Monitoring() -> Element {
         }
     });
 
+    let mut start_probe = move || {
+        if probing() {
+            return;
+        }
+        probing.set(true);
+        spawn(async move {
+            probe_message.set(i18n.t("monitoring.probe_in_progress").to_string());
+            let result = with_auto_refresh(auth_store, move |token| async move {
+                monitoring_service::probe_targets(&token, None).await
+            })
+            .await;
+            probe_message.set(if result.is_ok() {
+                i18n.t("monitoring.probe_done").to_string()
+            } else {
+                i18n.t("monitoring.probe_failed").to_string()
+            });
+            probing.set(false);
+            let current_relative_to = relative_to();
+            let next_relative_to =
+                refreshed_relative_to(&cursor(), current_relative_to, chrono::Utc::now());
+            if next_relative_to != current_relative_to {
+                relative_to.set(next_relative_to);
+            }
+            refresh_tick += 1;
+        });
+    };
+
     rsx! {
         div { class: "page-container monitoring-page",
-            div { class: "page-header",
-                div {
-                    h1 { class: "page-title", {i18n.t("page.monitoring")} }
-                    p { class: "page-description", {i18n.t("monitoring.subtitle")} }
-                }
+            PageHeader {
+                title: i18n.t("page.monitoring").to_string(),
+                description: i18n.t("monitoring.subtitle").to_string(),
             }
 
             div { class: "monitoring-toolbar",
@@ -217,33 +244,7 @@ pub fn Monitoring() -> Element {
                     r#type: "button",
                     disabled: probing(),
                     onclick: move |_| {
-                        if probing() {
-                            return;
-                        }
-                        probing.set(true);
-                        spawn(async move {
-                            probe_message.set(i18n.t("monitoring.probe_in_progress").to_string());
-                            let result = with_auto_refresh(auth_store, move |token| async move {
-                                monitoring_service::probe_targets(&token, None).await
-                            })
-                            .await;
-                            probe_message.set(if result.is_ok() {
-                                i18n.t("monitoring.probe_done").to_string()
-                            } else {
-                                i18n.t("monitoring.probe_failed").to_string()
-                            });
-                            probing.set(false);
-                            let current_relative_to = relative_to();
-                            let next_relative_to = refreshed_relative_to(
-                                &cursor(),
-                                current_relative_to,
-                                chrono::Utc::now(),
-                            );
-                            if next_relative_to != current_relative_to {
-                                relative_to.set(next_relative_to);
-                            }
-                            refresh_tick += 1;
-                        });
+                        probe_confirm_open.set(true);
                     },
                     {i18n.t("monitoring.probe_all_accounts")}
                 }
@@ -252,11 +253,25 @@ pub fn Monitoring() -> Element {
                 }
             }
 
+            ConfirmModal {
+                open: probe_confirm_open,
+                title: i18n.t("monitoring.probe_confirm_title").to_string(),
+                message: i18n.t("monitoring.probe_confirm_message").to_string(),
+                confirm_text: i18n.t("monitoring.probe_all_accounts").to_string(),
+                cancel_text: i18n.t("form.cancel").to_string(),
+                close_label: i18n.t("common.close").to_string(),
+                onconfirm: move |_| {
+                    probe_confirm_open.set(false);
+                    start_probe();
+                },
+                oncancel: move |_| probe_confirm_open.set(false),
+            }
+
             match console() {
                 None => rsx! { p { class: "text-secondary monitoring-load-state", {i18n.t("table.loading")} } },
                 Some(Err(ref error)) => rsx! { div { class: "alert alert-error", "{i18n.t(\"common.load_failed\")}: {error}" } },
                 Some(Ok(MonitoringData::Unified { ref summary, ref requests, ref health, ref updated_at })) => rsx! {
-                    p { class: "text-secondary monitoring-updated-at", "{i18n.t(\"monitoring.last_updated\")}: {updated_at}" }
+                    p { class: "text-secondary monitoring-updated-at", "{i18n.t(\"monitoring.last_updated\")}: {format_time(updated_at)}" }
                     MonitoringSummaryCards { data: summary.clone() }
                     MonitoringTrends { series: summary.series.clone() }
 

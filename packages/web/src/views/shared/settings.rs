@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use ui::{Button, ButtonVariant};
+use ui::{Button, ButtonVariant, PageHeader};
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::services::{api_client::with_auto_refresh, settings_service};
@@ -49,20 +49,17 @@ pub fn Settings() -> Element {
     let default_user_quota = get_val("default_user_quota");
     let jwt_expire = get_val("jwt_expire_hours");
     let distribution_enabled = get_val("distribution_enabled");
+    let page_description = if is_admin {
+        i18n.t("settings.admin_desc")
+    } else {
+        i18n.t("settings.user_desc")
+    };
 
     rsx! {
         div { class: "page-container settings-console-page",
-            div { class: "page-header",
-                div {
-                    h1 { class: "page-title", {i18n.t("page.settings")} }
-                    p { class: "page-description",
-                        if is_admin {
-                            {i18n.t("settings.admin_desc")}
-                        } else {
-                            {i18n.t("settings.user_desc")}
-                        }
-                    }
-                }
+            PageHeader {
+                title: i18n.t("page.settings").to_string(),
+                description: page_description.to_string(),
             }
 
             if !is_admin {

@@ -1,9 +1,13 @@
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, ConfirmModal, Table, TableHead};
+use ui::{
+    Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, ConfirmModal, PageHeader, Table,
+    TableHead,
+};
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::services::{api_client::with_auto_refresh, node_gateway_service};
 use crate::stores::{auth_store::AuthStore, ui_store::UiStore, user_store::UserStore};
+use crate::utils::time::{format_time, format_time_opt};
 use crate::views::shared::accounts::NoPermissionView;
 
 #[component]
@@ -186,6 +190,7 @@ pub fn NodeGateway() -> Element {
                 i18n.t("node_gateway.reject")
             },
             cancel_text: i18n.t("form.cancel"),
+            close_label: i18n.t("common.close"),
             danger: modal_action() == "reject",
             onconfirm: move |_| {
                 let token_id = modal_token_id();
@@ -207,12 +212,16 @@ pub fn NodeGateway() -> Element {
                 },
                 div {
                     class: "modal",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: i18n.t("node_gateway.revoke_confirm_title"),
                     onclick: move |e| e.stop_propagation(),
                     div { class: "modal-header",
                         h2 { class: "modal-title", {i18n.t("node_gateway.revoke_confirm_title")} }
                         button {
                             class: "btn btn-ghost btn-sm",
                             r#type: "button",
+                            aria_label: i18n.t("common.close"),
                             onclick: move |_| {
                                 revoke_modal_open.set(false);
                                 revoke_reason.set(String::new());
@@ -271,6 +280,7 @@ pub fn NodeGateway() -> Element {
             message: i18n.t("node_gateway.delete_confirm_msg"),
             confirm_text: i18n.t("node_gateway.delete"),
             cancel_text: i18n.t("form.cancel"),
+            close_label: i18n.t("common.close"),
             danger: true,
             onconfirm: move |_| {
                 let node_id = delete_node_id();
@@ -289,6 +299,7 @@ pub fn NodeGateway() -> Element {
             message: i18n.t("node_gateway.recover_confirm_msg"),
             confirm_text: i18n.t("node_gateway.recover"),
             cancel_text: i18n.t("form.cancel"),
+            close_label: i18n.t("common.close"),
             danger: false,
             onconfirm: move |_| {
                 let node_id = recover_node_id();
@@ -301,11 +312,9 @@ pub fn NodeGateway() -> Element {
         }
 
         div { class: "page-container node-gateway-page",
-            div { class: "page-header",
-                div {
-                    h1 { class: "page-title", {i18n.t("page.node_gateway")} }
-                    p { class: "page-description", {i18n.t("node_gateway.subtitle")} }
-                }
+            PageHeader {
+                title: i18n.t("page.node_gateway").to_string(),
+                description: i18n.t("node_gateway.subtitle").to_string(),
             }
 
             match overview() {
@@ -486,7 +495,7 @@ pub fn NodeGateway() -> Element {
                                             }
                                         }
                                         td { "{node.consecutive_failure_count}/{node.failure_threshold}" }
-                                        td { span { class: "account-time-value", {node.last_heartbeat_at.as_deref().unwrap_or("—")} } }
+                                        td { span { class: "account-time-value", {format_time_opt(node.last_heartbeat_at.as_deref())} } }
                                         td {
                                             if let Some(ref preview) = node.token_preview {
                                                 code { "{preview}" }
@@ -571,7 +580,7 @@ pub fn NodeGateway() -> Element {
                                         td { TaskStatusBadge { status: task.status.clone() } }
                                         td { "{task.assigned_node_id.as_deref().map(short_id).unwrap_or_else(|| \"—\".to_string())}" }
                                         td { "{task.failure_count}/{task.failure_threshold}" }
-                                        td { span { class: "account-time-value", "{task.deadline_at}" } }
+                                        td { span { class: "account-time-value", {format_time(&task.deadline_at)} } }
                                         td { span { class: "account-id", "{short_id(&task.id)}" } }
                                     }
                                 }

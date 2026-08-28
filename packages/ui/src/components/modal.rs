@@ -22,6 +22,9 @@ pub fn Modal(
     /// 关闭回调（点击遮罩或关闭按钮触发）
     #[props(default)]
     onclose: EventHandler<()>,
+    /// 关闭按钮的无障碍文案
+    #[props(default = "Close".to_string())]
+    close_label: String,
     /// 底部操作区（可选，若不传则不渲染 modal-footer）
     #[props(default)]
     footer: Option<Element>,
@@ -38,19 +41,30 @@ pub fn Modal(
     rsx! {
         div {
             class: "modal-backdrop",
+            tabindex: "-1",
+            onkeydown: move |event| {
+                if event.key() == Key::Escape {
+                    onclose.call(());
+                }
+            },
             onclick: move |_| onclose.call(()),
             div {
                 class: "modal",
+                role: "dialog",
+                aria_modal: "true",
+                aria_labelledby: "app-modal-title",
                 style: "max-width: {max_width}",
                 // 阻止冒泡，避免点击内部关闭弹窗
                 onclick: move |e| e.stop_propagation(),
 
                 // 头部
                 div { class: "modal-header",
-                    h2 { class: "modal-title", "{title}" }
+                    h2 { id: "app-modal-title", class: "modal-title", "{title}" }
                     button {
                         class: "modal-close btn btn-ghost btn-sm",
                         r#type: "button",
+                        autofocus: true,
+                        aria_label: "{close_label}",
                         onclick: move |_| onclose.call(()),
                         "✕"
                     }
@@ -89,6 +103,9 @@ pub fn ConfirmModal(
     /// 取消按钮文字
     #[props(default = "取消".to_string())]
     cancel_text: String,
+    /// 右上角关闭按钮的无障碍文案
+    #[props(default = "Close".to_string())]
+    close_label: String,
     /// 确认按钮是否为危险变体
     #[props(default = false)]
     danger: bool,
@@ -112,16 +129,27 @@ pub fn ConfirmModal(
     rsx! {
         div {
             class: "modal-backdrop",
+            tabindex: "-1",
+            onkeydown: move |event| {
+                if event.key() == Key::Escape {
+                    oncancel.call(());
+                }
+            },
             onclick: move |_| oncancel.call(()),
             div {
                 class: "modal",
+                role: "alertdialog",
+                aria_modal: "true",
+                aria_labelledby: "confirm-modal-title",
                 onclick: move |e| e.stop_propagation(),
 
                 div { class: "modal-header",
-                    h2 { class: "modal-title", "{title}" }
+                    h2 { id: "confirm-modal-title", class: "modal-title", "{title}" }
                     button {
                         class: "modal-close btn btn-ghost btn-sm",
                         r#type: "button",
+                        autofocus: true,
+                        aria_label: "{close_label}",
                         onclick: move |_| oncancel.call(()),
                         "✕"
                     }
@@ -149,5 +177,18 @@ pub fn ConfirmModal(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dialogs_expose_the_minimum_accessibility_contract() {
+        let source = include_str!("modal.rs");
+        assert!(source.contains("aria_modal: \"true\""));
+        assert!(source.contains("aria_labelledby"));
+        assert!(source.contains("aria_label:"));
+        assert!(source.contains("aria_label: \"{close_label}\""));
+        assert!(source.contains("Key::Escape"));
     }
 }

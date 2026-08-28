@@ -59,6 +59,27 @@ RUN ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
     chmod +x /usr/local/bin/esbuild && \
     rm -rf /tmp/esbuild.tgz /tmp/package
 
+# Debian Bookworm 提供的 Binaryen 108 无法解析 Rust 1.92 默认生成的
+# reference-types/table.fill 指令，dx 会因此跳过 wasm-opt。用官方发布版覆盖
+# /usr/bin/wasm-opt，并校验架构对应的固定摘要，保证生产 Wasm 确实完成优化。
+ENV BINARYEN_VERSION=131
+RUN set -eux; \
+    ARCH="$(uname -m)"; \
+    case "$ARCH" in \
+        x86_64) SHA256="b5bf1f0eaf17c63ee588ff7a5954dc8f6ce2c26989051c66f24dfe9ece3e46db" ;; \
+        aarch64) SHA256="ba991f677edd9a21d2bc96c0144bc8ac5b112d4d98a3eb266e075e22e557df2a" ;; \
+        *) echo "Unsupported Binaryen architecture: $ARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -L --proto '=https' --tlsv1.2 -sSf \
+        --retry 5 --retry-all-errors --connect-timeout 20 \
+        "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${ARCH}-linux.tar.gz" \
+        -o /tmp/binaryen.tar.gz; \
+    echo "$SHA256  /tmp/binaryen.tar.gz" | sha256sum -c -; \
+    tar xzf /tmp/binaryen.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" /usr/local/bin/wasm-opt; \
+    rm -rf /tmp/binaryen.tar.gz "/tmp/binaryen-version_${BINARYEN_VERSION}"; \
+    wasm-opt --version
+
 WORKDIR /app
 
 # 使用 Docker 专用 Web-only workspace，避免 dx 的 `cargo metadata` 扫描
@@ -87,7 +108,7 @@ RUN --mount=type=cache,id=keycompute-web-cargo-registry,target=/usr/local/cargo/
 # dx build 产物输出到 /app/target/dx/web/release/web/public。
 # --platform web 显式指定平台，Docker/CI 无图形环境下避免平台推断错误
 # NO_DOWNLOADS=1 是 dioxus-cli 0.7.9 实际生效的开关（见 CliSettings::prefer_no_downloads）：
-# 强制 dx 使用 PATH 中的本地工具链（apt binaryen 的 wasm-opt + 上面预装的 wasm-bindgen-cli/esbuild），
+# 强制 dx 使用 PATH 中的本地工具链（固定版本的 wasm-opt/wasm-bindgen-cli/esbuild），
 # 而不是构建时从 GitHub 下载（避免连接超时）。
 # 此前的 DX_SKIP_WASM_OPT 会被 dx 静默忽略，仍然触发网络下载。
 # API_BASE_URL 未设置时编译期缺省为空字符串（同源相对路径，经 Nginx 反代访问后端）；

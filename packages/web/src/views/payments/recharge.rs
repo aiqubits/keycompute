@@ -5,6 +5,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use client_api::api::payment::{CreatePaymentOrderRequest, PaymentMethodsResponse};
 use rust_decimal::Decimal;
+use ui::PageHeader;
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::router::Route;
@@ -302,17 +303,20 @@ pub fn Recharge() -> Element {
     };
 
     rsx! {
-        div { class: "page-container",
-            div { class: "page-header",
-                button {
-                    class: "btn btn-ghost btn-sm",
-                    r#type: "button",
-                    onclick: move |_| {
-                        nav.push(Route::PaymentsOverview {});
-                    },
-                    {format!("← {}", i18n.t("common.back"))}
-                }
-                h1 { class: "page-title", {i18n.t("recharge.title")} }
+        div { class: "page-container recharge-page",
+            PageHeader {
+                title: i18n.t("recharge.title").to_string(),
+                leading: rsx! {
+                    button {
+                        class: "btn btn-ghost btn-sm",
+                        r#type: "button",
+                        aria_label: i18n.t("common.back"),
+                        onclick: move |_| {
+                            nav.push(Route::PaymentsOverview {});
+                        },
+                        "←"
+                    }
+                },
             }
 
             // 充値表单区
@@ -391,7 +395,7 @@ pub fn Recharge() -> Element {
                                                 .is_some_and(|limits| amount_within_limits(preset, limits))
                                             {
                                                 button {
-                                                    class: if amount() == preset { "btn btn-primary btn-sm" } else { "btn btn-outline btn-sm" },
+                                                    class: if amount() == preset { "btn btn-primary btn-sm" } else { "btn btn-secondary btn-sm" },
                                                     r#type: "button",
                                                     onclick: move |_| amount.set(preset.to_string()),
                                                     "¥{preset}"

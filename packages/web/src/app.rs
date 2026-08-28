@@ -21,6 +21,7 @@ pub fn App() -> Element {
     let auth_initial = AuthStore::load_from_storage();
     let auth_state = use_signal(|| auth_initial);
     let user_info = use_signal(|| None::<UserInfo>);
+    let user_load_failed = use_signal(|| false);
     let public_settings_state = use_signal(PublicSettingsState::default);
     let toast_signal = use_signal(|| None::<ToastMsg>);
     let lang_signal = use_signal(|| {
@@ -45,7 +46,7 @@ pub fn App() -> Element {
     });
 
     let auth_store = use_context_provider(|| AuthStore::new(auth_state));
-    let mut user_store = use_context_provider(|| UserStore::new(user_info));
+    let mut user_store = use_context_provider(|| UserStore::new(user_info, user_load_failed));
     let public_settings_store =
         use_context_provider(|| PublicSettingsStore::new(public_settings_state));
     let _ui_store = use_context_provider(|| UiStore::new(toast_signal));
@@ -88,6 +89,7 @@ pub fn App() -> Element {
         // 依赖 auth_store 的认证状态，登录/登出时会重新执行
         let is_auth = auth_store.is_authenticated();
         if !is_auth {
+            user_store.load_failed.set(false);
             return;
         }
 
@@ -97,6 +99,7 @@ pub fn App() -> Element {
 
         // 恢复 token 到 API 客户端
         get_client().set_token(&token);
+        user_store.load_failed.set(false);
         spawn(async move {
             match user_service::get_current_user(&token).await {
                 Ok(user) => {
@@ -107,14 +110,16 @@ pub fn App() -> Element {
                         role: user.role,
                         tenant_id: user.tenant_id.to_string(),
                     });
+                    user_store.load_failed.set(false);
                 }
                 Err(err) if err.is_auth_error() => {
                     let mut auth_store = auth_store;
                     auth_store.logout();
                     get_client().clear_token();
                     *user_store.info.write() = None;
+                    user_store.load_failed.set(false);
                 }
-                Err(_) => {}
+                Err(_) => user_store.load_failed.set(true),
             }
         });
     });
@@ -340,10 +345,13 @@ pub fn AppLayout() -> Element {
         });
     }
 
-    let current_path = use_route::<Route>().to_string();
+    let current_route = use_route::<Route>();
+    let current_path = current_route.to_string();
+    let page_title = route_page_title(&current_route, &i18n);
+    let document_title = format!("{page_title} · {site_name}");
 
     rsx! {
-        document::Title { "{site_name}" }
+        document::Title { "{document_title}" }
 
         AppShell {
             nav_sections,
@@ -359,6 +367,7 @@ pub fn AppLayout() -> Element {
             switch_to_zh_title: i18n.t("layout.switch_to_zh"),
             switch_to_en_title: i18n.t("layout.switch_to_en"),
             profile_label: i18n.t("nav.user.profile"),
+            user_menu_label: i18n.t("layout.user_menu"),
             account_settings_label: i18n.t("nav.account_settings"),
             logout_label: i18n.t("auth.logout"),
             expand_sidebar_title: i18n.t("layout.expand_sidebar"),
@@ -402,6 +411,7 @@ pub fn AdminLayout() -> Element {
     let is_admin = user_store.is_admin();
     // 用户信息已加载（info 不为 None）时才做判断，避免初始化闪屏
     let info_loaded = user_store.info.read().is_some();
+    let info_load_failed = (user_store.load_failed)();
 
     use_effect(move || {
         if info_loaded && !user_store.is_admin() {
@@ -411,6 +421,20 @@ pub fn AdminLayout() -> Element {
     });
 
     // 用户信息尚未加载完成，显示等待占位符
+    if !info_loaded && info_load_failed {
+        return rsx! {
+            div { class: "admin-guard-error alert alert-error",
+                p { {i18n.t("common.user_info_load_failed")} }
+                button {
+                    class: "btn btn-secondary btn-sm",
+                    r#type: "button",
+                    onclick: move |_| reload_current_page(),
+                    {i18n.t("common.retry")}
+                }
+            }
+        };
+    }
+
     if !info_loaded {
         return rsx! {
             div {
@@ -428,5 +452,124 @@ pub fn AdminLayout() -> Element {
 
     rsx! {
         Outlet::<Route> {}
+    }
+}
+
+fn route_page_title(route: &Route, i18n: &I18n) -> String {
+    let key = match route {
+        Route::Dashboard {} => "page.home",
+        Route::ApiKeyList {} => "page.api_keys",
+        Route::Usage {} => "page.usage",
+        Route::Billing {} => "page.billing",
+        Route::PaymentsOverview {} => "page.payments",
+        Route::Recharge {} => "recharge.title",
+        Route::DistributionOverview {} => "page.distribution",
+        Route::UserProfile {} => "page.profile",
+        Route::UserSettings {} => "page.account_settings",
+        Route::NodeToken {} => "page.node_token",
+        Route::NodeEarnings {} => "page.node_earnings",
+        Route::Users {} => "page.users",
+        Route::Accounts {} => "page.accounts",
+        Route::Pricing {} => "page.pricing",
+        Route::PaymentOrders {} => "page.payment_orders",
+        Route::DistributionRecords {} => "page.distribution_records",
+        Route::Tenants {} => "page.tenants",
+        Route::System {} => "page.system",
+        Route::NodeGateway {} => "page.node_gateway",
+        Route::Monitoring {} => "page.monitoring",
+        Route::Settings {} => "page.settings",
+        _ => "page.not_found",
+    };
+    i18n.t(key).to_string()
+}
+
+fn reload_current_page() {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(window) = web_sys::window() {
+        let _ = window.location().reload();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_page_title;
+    use crate::{
+        i18n::{I18n, Lang},
+        router::Route,
+    };
+
+    #[test]
+    fn every_console_route_has_a_document_title() {
+        let i18n = I18n::new(Lang::En);
+        let routes = [
+            Route::Dashboard {},
+            Route::ApiKeyList {},
+            Route::Usage {},
+            Route::Billing {},
+            Route::PaymentsOverview {},
+            Route::Recharge {},
+            Route::DistributionOverview {},
+            Route::UserProfile {},
+            Route::UserSettings {},
+            Route::NodeToken {},
+            Route::NodeEarnings {},
+            Route::Users {},
+            Route::Accounts {},
+            Route::Pricing {},
+            Route::PaymentOrders {},
+            Route::DistributionRecords {},
+            Route::Tenants {},
+            Route::System {},
+            Route::NodeGateway {},
+            Route::Monitoring {},
+            Route::Settings {},
+        ];
+
+        for route in routes {
+            let title = route_page_title(&route, &i18n);
+            assert!(!title.is_empty());
+            assert_ne!(title, "?");
+        }
+    }
+
+    #[test]
+    fn custom_console_dialogs_expose_dialog_roles() {
+        let sources = [
+            include_str!("views/api_keys/list.rs"),
+            include_str!("views/node/node_earnings.rs"),
+            include_str!("views/shared/accounts.rs"),
+            include_str!("views/shared/node_gateway.rs"),
+            include_str!("views/shared/pricing.rs"),
+            include_str!("views/shared/users.rs"),
+        ];
+
+        for source in sources {
+            for modal in source.split("class: \"modal\"").skip(1) {
+                let attributes = &modal[..modal.len().min(180)];
+                assert!(
+                    attributes.contains("role:"),
+                    "custom modal is missing a dialog role: {attributes}"
+                );
+                assert!(
+                    attributes.contains("aria_modal:"),
+                    "custom modal is missing aria-modal: {attributes}"
+                );
+            }
+
+            let close_chunks = source.split("\"✕\"").collect::<Vec<_>>();
+            for before_close in close_chunks
+                .iter()
+                .take(close_chunks.len().saturating_sub(1))
+            {
+                let attributes = before_close
+                    .rsplit("button {")
+                    .next()
+                    .unwrap_or(before_close);
+                assert!(
+                    attributes.contains("aria_label:"),
+                    "custom modal close button is missing an accessible name: {attributes}"
+                );
+            }
+        }
     }
 }

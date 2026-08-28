@@ -160,4 +160,11 @@ mod tests {
         };
         assert_eq!(route.to_string(), "/auth/register?");
     }
+
+    #[test]
+    fn nginx_node_api_rule_does_not_capture_console_routes() {
+        let nginx = include_str!("../../../nginx/nginx.conf");
+        assert!(nginx.contains("location /node/v1/ {"));
+        assert!(!nginx.contains("location /node/ {"));
+    }
 }

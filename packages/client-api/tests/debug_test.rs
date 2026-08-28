@@ -2,7 +2,7 @@
 
 use client_api::api::debug::DebugApi;
 use client_api::error::ClientError;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 mod common;
@@ -52,6 +52,43 @@ async fn test_debug_routing_success() {
     assert!(info.routed);
     assert_eq!(info.provider_status.len(), 1);
     assert_eq!(info.provider_status[0].provider, "openai");
+}
+
+#[tokio::test]
+async fn test_debug_routing_preserves_the_entry_protocol() {
+    let (client, mock_server) = create_test_client().await;
+    let debug_api = DebugApi::new(&client);
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/debug/routing"))
+        .and(query_param("model", "claude-3-5-sonnet"))
+        .and(query_param("entry", "anthropic"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "request_id": "550e8400-e29b-41d4-a716-446655440000",
+            "routed": false,
+            "primary": null,
+            "fallback_chain": [],
+            "pricing": {
+                "model_name": "claude-3-5-sonnet",
+                "currency": "CNY",
+                "input_price_per_1k": "0.01",
+                "output_price_per_1k": "0.03"
+            },
+            "provider_status": [],
+            "message": "No route"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let result = debug_api
+        .debug_routing_for_entry(
+            "claude-3-5-sonnet",
+            "anthropic",
+            fixtures::TEST_ACCESS_TOKEN,
+        )
+        .await;
+
+    assert!(result.is_ok());
 }
 
 #[tokio::test]

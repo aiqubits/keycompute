@@ -5,7 +5,6 @@
   --sidebar-width: 260px;
   --sidebar-collapsed: 64px;
   --header-height: 64px;
-  --bottom-nav-height: 56px;
   --content-max-width: 1440px;
 
   /* ── 颜色系统 ─────────────────────────────── */
@@ -58,7 +57,7 @@
   --space-2xl: 48px;
 
   /* ── 字体 ─────────────────────────────────── */
-  --font-family: "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-family: "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
   --font-display: var(--font-family);
   --font-mono: "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", monospace;
   --font-size-xs: 12px;

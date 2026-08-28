@@ -19,6 +19,7 @@ pub mod card;
 pub mod input;
 pub mod loading;
 pub mod modal;
+pub mod page_header;
 pub mod table;
 pub mod toast;
 
@@ -29,5 +30,6 @@ pub use card::Card;
 pub use input::{Input, Textarea};
 pub use loading::{LoadingSpinner, Skeleton};
 pub use modal::Modal;
+pub use page_header::PageHeader;
 pub use table::Table;
 pub use toast::{Toast, ToastKind, ToastMsg};

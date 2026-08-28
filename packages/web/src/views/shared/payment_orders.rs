@@ -1,6 +1,6 @@
 use client_api::{AdminApi, api::admin::PaymentQueryParams as AdminPaymentQueryParams};
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant, Pagination, Table, TableHead};
+use ui::{Badge, BadgeVariant, PageHeader, Pagination, Table, TableHead};
 
 const PAGE_SIZE: usize = 20;
 
@@ -11,6 +11,10 @@ use crate::services::{
 };
 use crate::stores::auth_store::AuthStore;
 use crate::stores::user_store::UserStore;
+use crate::utils::display::{
+    payment_provider_message, payment_provider_status_label, payment_status_label, short_id,
+};
+use crate::utils::format_cny_str;
 use crate::utils::time::format_time;
 
 /// 支付订单页面
@@ -95,17 +99,17 @@ pub fn PaymentOrders() -> Element {
         ("failed", i18n.t("payment_orders.filter_failed")),
         ("closed", i18n.t("payment_orders.filter_closed")),
     ];
+    let page_description = if is_admin {
+        i18n.t("payment_orders.subtitle_admin")
+    } else {
+        i18n.t("payment_orders.subtitle_user")
+    };
 
     rsx! {
-        div { class: "page-header",
-            h1 { class: "page-title", {i18n.t("page.payment_orders")} }
-            p { class: "page-description",
-                if is_admin {
-                    {i18n.t("payment_orders.subtitle_admin")}
-                } else {
-                    {i18n.t("payment_orders.subtitle_user")}
-                }
-            }
+        div { class: "page-container payment-orders-page",
+        PageHeader {
+            title: i18n.t("page.payment_orders").to_string(),
+            description: page_description.to_string(),
         }
 
         if is_admin {
@@ -134,7 +138,10 @@ pub fn PaymentOrders() -> Element {
                                         }
                                         p { class: "payment-provider-scenes", {provider.scenes.join(" · ")} }
                                     }
-                                    Badge { variant: status_to_variant(&provider.status), "{provider.status}" }
+                                    Badge {
+                                        variant: status_to_variant(&provider.status),
+                                        {payment_provider_status_label(&provider.status, &i18n)}
+                                    }
                                 }
                                 div { class: "payment-provider-meta",
                                     span { "{i18n.t(\"payment_orders.provider_switch\")}: "
@@ -144,7 +151,7 @@ pub fn PaymentOrders() -> Element {
                                         strong { if provider.configured { {i18n.t("common.configured")} } else { {i18n.t("common.not_configured")} } }
                                     }
                                 }
-                                if let Some(message) = provider.message {
+                                if let Some(message) = payment_provider_message(&provider.status, &i18n) {
                                     p { class: "payment-provider-message", "{message}" }
                                 }
                                 if provider.configured && !provider.available {
@@ -248,7 +255,7 @@ pub fn PaymentOrders() -> Element {
                                             td {
                                                 {
                                                     let uid = o.user_id.clone();
-                                                    let short = format!("{}\u{2026}", &uid[..uid.len().min(8)]);
+                                                    let short = short_id(&uid);
                                                     rsx! {
                                                         span {
                                                             title: "{uid}",
@@ -259,9 +266,9 @@ pub fn PaymentOrders() -> Element {
                                                 }
                                             }
                                             td { "{o.payment_method}" }
-                                            td { "¥{o.amount}" }
+                                            td { {format_cny_str(&o.amount)} }
                                             td {
-                                                Badge { variant: status_to_variant(&o.status), "{o.status}" }
+                                                Badge { variant: status_to_variant(&o.status), {payment_status_label(&o.status, &i18n)} }
                                             }
                                             td { {format_time(&o.created_at)} }
                                         }
@@ -297,10 +304,10 @@ pub fn PaymentOrders() -> Element {
                                             td {
                                                 code { "{o.out_trade_no}" }
                                             }
-                                            td { "¥{o.amount}" }
+                                            td { {format_cny_str(&o.amount)} }
                                             td { "{o.subject}" }
                                             td {
-                                                Badge { variant: status_to_variant(&o.status), "{o.status}" }
+                                                Badge { variant: status_to_variant(&o.status), {payment_status_label(&o.status, &i18n)} }
                                             }
                                             td { {format_time(&o.created_at)} }
                                         }
@@ -335,10 +342,13 @@ pub fn PaymentOrders() -> Element {
                     Pagination {
                         current: page(),
                         total_pages,
+                        previous_label: i18n.t("table.previous").to_string(),
+                        next_label: i18n.t("table.next").to_string(),
                         on_page_change: move |p| page.set(p),
                     }
                 }
             }
+        }
         }
     }
 }

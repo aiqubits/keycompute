@@ -2,13 +2,15 @@ use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 use ui::{
     Alert, AlertVariant, Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, ConfirmModal,
-    icons::IconCopy,
+    PageHeader, icons::IconCopy,
 };
 
 use crate::hooks::use_i18n::use_i18n;
+use crate::i18n::I18n;
 use crate::services::node_gateway_token_service;
 use crate::stores::{auth_store::AuthStore, ui_store::UiStore};
 use crate::utils::on_copy;
+use crate::utils::time::format_time;
 
 type TokenDetail = client_api::api::node_gateway_token::NodeGatewayTokenDetail;
 
@@ -20,6 +22,15 @@ fn status_dot_color(status: &str) -> &'static str {
         "consumed" => "#2196f3",
         "rejected" => "#f44336",
         _ => "#9e9e9e",
+    }
+}
+
+fn registered_node_status_label(status: &str, i18n: &I18n) -> String {
+    match status {
+        "online" => i18n.t("node_gateway.status_online").to_string(),
+        "offline" => i18n.t("node_gateway.status_offline").to_string(),
+        "excluded" => i18n.t("node_gateway.status_excluded").to_string(),
+        _ => status.to_string(),
     }
 }
 
@@ -128,9 +139,9 @@ pub fn NodeToken() -> Element {
 
     rsx! {
         div { class: "page-container node-token-page",
-            div { class: "page-header",
-                h1 { class: "page-title", {i18n.t("page.node_token")} }
-                p { class: "page-description", {i18n.t("node_token.subtitle")} }
+            PageHeader {
+                title: i18n.t("page.node_token").to_string(),
+                description: i18n.t("node_token.subtitle").to_string(),
             }
 
             if let Some(Err(ref e)) = tokens_resource().as_ref().map(|r| r.as_ref()) {
@@ -374,6 +385,7 @@ fn TokenListItem(detail: TokenDetail) -> Element {
                 message: i18n.t("node_token.delete_confirm_msg"),
                 confirm_text: i18n.t("node_token.delete"),
                 cancel_text: i18n.t("form.cancel"),
+                close_label: i18n.t("common.close"),
                 danger: true,
                 onconfirm: {
                     let token_id = detail.token.id.clone();
@@ -568,7 +580,7 @@ fn TokenConsumedDetail(
                             "excluded" => "node-token-node-status node-status-excluded",
                             _ => "node-token-node-status",
                         },
-                        "{n.status}"
+                        {registered_node_status_label(&n.status, &i18n)}
                     }
                 }
                 if let Some(ref hb) = n.last_heartbeat_at {
@@ -576,7 +588,7 @@ fn TokenConsumedDetail(
                         span { class: "node-token-card-meta-label",
                             {i18n.t("node_token.last_heartbeat")}
                         }
-                        span { class: "node-token-card-meta-value", "{hb}" }
+                        span { class: "node-token-card-meta-value", {format_time(hb)} }
                     }
                 }
             }
@@ -636,7 +648,7 @@ fn TokenRejectedDetail(
                             "excluded" => "node-token-node-status node-status-excluded",
                             _ => "node-token-node-status",
                         },
-                        "{n.status}"
+                        {registered_node_status_label(&n.status, &i18n)}
                     }
                 }
                 if let Some(ref hb) = n.last_heartbeat_at {
@@ -644,7 +656,7 @@ fn TokenRejectedDetail(
                         span { class: "node-token-card-meta-label",
                             {i18n.t("node_token.last_heartbeat")}
                         }
-                        span { class: "node-token-card-meta-value", "{hb}" }
+                        span { class: "node-token-card-meta-value", {format_time(hb)} }
                     }
                 }
             }

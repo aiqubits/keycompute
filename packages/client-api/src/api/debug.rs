@@ -27,7 +27,32 @@ impl DebugApi {
     /// - `model`: 模型名称，用于模拟路由决策
     /// - `token`: 认证令牌
     pub async fn debug_routing(&self, model: &str, token: &str) -> Result<RoutingDebugInfo> {
-        let path = format!("/api/v1/debug/routing?model={}", urlencoding::encode(model));
+        self.debug_routing_request(model, None, token).await
+    }
+
+    /// 获取指定入口协议的路由调试信息。
+    ///
+    /// `entry` 只应传入服务端支持的稳定协议标识（当前为 `openai` / `anthropic`）。
+    pub async fn debug_routing_for_entry(
+        &self,
+        model: &str,
+        entry: &str,
+        token: &str,
+    ) -> Result<RoutingDebugInfo> {
+        self.debug_routing_request(model, Some(entry), token).await
+    }
+
+    async fn debug_routing_request(
+        &self,
+        model: &str,
+        entry: Option<&str>,
+        token: &str,
+    ) -> Result<RoutingDebugInfo> {
+        let mut path = format!("/api/v1/debug/routing?model={}", urlencoding::encode(model));
+        if let Some(entry) = entry {
+            path.push_str("&entry=");
+            path.push_str(&urlencoding::encode(entry));
+        }
         self.client.get_json(&path, Some(token)).await
     }
 

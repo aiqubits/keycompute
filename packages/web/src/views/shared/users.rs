@@ -3,7 +3,11 @@ use client_api::{
     api::admin::{UpdateBalanceRequest, UpdateUserRequest, UserDetail, UserQueryParams},
 };
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Pagination, Table, TableHead};
+use gloo_timers::future::TimeoutFuture;
+use ui::{
+    Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, PageHeader, Pagination, Table,
+    TableHead,
+};
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::router::Route;
@@ -11,9 +15,35 @@ use crate::services::api_client::{get_client, with_auto_refresh};
 use crate::stores::auth_store::AuthStore;
 use crate::stores::ui_store::UiStore;
 use crate::stores::user_store::UserStore;
+use crate::utils::display::{short_id, user_role_label};
 use crate::utils::time::format_time;
 
 const PAGE_SIZE: usize = 20;
+const SEARCH_DEBOUNCE_MS: u32 = 300;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UserListQuery {
+    search: String,
+    page: u32,
+}
+
+impl Default for UserListQuery {
+    fn default() -> Self {
+        Self {
+            search: String::new(),
+            page: 1,
+        }
+    }
+}
+
+impl UserListQuery {
+    /// 提交新的搜索词时必须同时回到第一页，避免防抖窗口内的分页操作
+    /// 被带入新查询。搜索词与页码放在同一状态中也只会触发一次资源重载。
+    fn commit_search(&mut self, search: String) {
+        self.search = search;
+        self.page = 1;
+    }
+}
 
 #[component]
 pub fn Users() -> Element {
@@ -41,7 +71,7 @@ fn AdminUsersView() -> Element {
     let auth_store = use_context::<AuthStore>();
     let mut ui_store = use_context::<UiStore>();
     let mut search = use_signal(String::new);
-    let mut page = use_signal(|| 1u32);
+    let mut query = use_signal(UserListQuery::default);
     let current_user = user_store.info.read().clone();
     let can_current_user_manage_roles = current_user
         .as_ref()
@@ -74,30 +104,38 @@ fn AdminUsersView() -> Element {
     let mut balance_saving = use_signal(|| false);
     let mut balance_error = use_signal(String::new);
 
-    // 使用 memo 将 search + page 合并为单一响应式值，
-    // 避免在同一事件处理中同时写入两个信号时触发两次资源请求
-    let query_key = use_memo(move || (search(), page()));
-
-    let mut users_resource = use_resource(move || async move {
-        let (current_search, current_page) = query_key();
-        let params = UserQueryParams::new()
-            .with_page_size(PAGE_SIZE as i64)
-            .with_page(current_page as i64);
-        let params = if !current_search.is_empty() {
-            params.with_search(current_search)
-        } else {
-            params
-        };
-        with_auto_refresh(auth_store, move |token| {
-            let params = params.clone();
-            async move {
-                let client = get_client();
-                AdminApi::new(&client)
-                    .list_all_users(Some(&params), &token)
-                    .await
+    use_effect(move || {
+        let next_search = search();
+        spawn(async move {
+            TimeoutFuture::new(SEARCH_DEBOUNCE_MS).await;
+            if search() == next_search && query.read().search != next_search {
+                query.write().commit_search(next_search);
             }
-        })
-        .await
+        });
+    });
+
+    let mut users_resource = use_resource(move || {
+        let current_query = query();
+        async move {
+            let params = UserQueryParams::new()
+                .with_page_size(PAGE_SIZE as i64)
+                .with_page(current_query.page as i64);
+            let params = if !current_query.search.is_empty() {
+                params.with_search(current_query.search)
+            } else {
+                params
+            };
+            with_auto_refresh(auth_store, move |token| {
+                let params = params.clone();
+                async move {
+                    let client = get_client();
+                    AdminApi::new(&client)
+                        .list_all_users(Some(&params), &token)
+                        .await
+                }
+            })
+            .await
+        }
     });
 
     let paged_users = move || -> Vec<UserDetail> {
@@ -312,23 +350,36 @@ fn AdminUsersView() -> Element {
     let fmt_balance = |v: f64| crate::utils::format_money(v);
 
     rsx! {
-        div { class: "page-header",
-            h1 { class: "page-title", {i18n.t("page.users")} }
-            p { class: "page-description", {i18n.t("users.subtitle")} }
+        div { class: "page-container users-page",
+        PageHeader {
+            title: i18n.t("page.users").to_string(),
+            description: i18n.t("users.subtitle").to_string(),
         }
 
         div { class: "toolbar",
             div { class: "toolbar-left",
-                div { class: "input-wrapper",
+                div { class: "input-wrapper search-input-wrapper",
                     input {
                         class: "input-field",
                         r#type: "search",
+                        aria_label: i18n.t("users.search_placeholder"),
                         placeholder: "{i18n.t(\"users.search_placeholder\")}",
                         value: "{search}",
                         oninput: move |e| {
                             *search.write() = e.value();
-                            page.set(1);
                         },
+                    }
+                    if !search().is_empty() {
+                        button {
+                            class: "btn btn-ghost btn-sm input-clear-button",
+                            r#type: "button",
+                            aria_label: i18n.t("common.clear"),
+                            onclick: move |_| {
+                                search.set(String::new());
+                                query.write().commit_search(String::new());
+                            },
+                            "×"
+                        }
                     }
                 }
             }
@@ -369,9 +420,9 @@ fn AdminUsersView() -> Element {
                                         }
                                     }
                                     td {
-                                        Badge { variant: BadgeVariant::Info, "{u.role}" }
+                                        Badge { variant: BadgeVariant::Info, {user_role_label(&u.role, &i18n)} }
                                     }
-                                    td { "{u.tenant_id}" }
+                                    td { code { title: "{u.tenant_id}", {short_id(&u.tenant_id)} } }
                                     td {
                                         div { class: "balance-cell",
                                             span { class: "balance-available",
@@ -449,9 +500,11 @@ fn AdminUsersView() -> Element {
                 "{i18n.t(\"common.total_items\")} {total_items()} {i18n.t(\"pricing.items_suffix\")}"
             }
             Pagination {
-                current: page(),
+                current: query().page,
                 total_pages: total_pages(),
-                on_page_change: move |p| page.set(p),
+                previous_label: i18n.t("table.previous").to_string(),
+                next_label: i18n.t("table.next").to_string(),
+                on_page_change: move |p| query.write().page = p,
             }
         }
 
@@ -461,12 +514,16 @@ fn AdminUsersView() -> Element {
                 onclick: move |_| edit_user.set(None),
                 div {
                     class: "modal",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: i18n.t("users.edit_title"),
                     onclick: move |e| e.stop_propagation(),
                     div { class: "modal-header",
                         h2 { class: "modal-title", {i18n.t("users.edit_title")} }
                         button {
                             class: "btn btn-ghost btn-sm",
                             r#type: "button",
+                            aria_label: i18n.t("common.close"),
                             onclick: move |_| edit_user.set(None),
                             "✕"
                         }
@@ -523,6 +580,9 @@ fn AdminUsersView() -> Element {
                 onclick: move |_| delete_user.set(None),
                 div {
                     class: "modal",
+                    role: "alertdialog",
+                    aria_modal: "true",
+                    aria_label: i18n.t("users.delete_confirm_title"),
                     onclick: move |e| e.stop_propagation(),
                     div { class: "modal-header",
                         h2 { class: "modal-title", {i18n.t("users.delete_confirm_title")} }
@@ -560,6 +620,9 @@ fn AdminUsersView() -> Element {
                 },
                 div {
                     class: "modal",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: i18n.t("users.balance_title"),
                     onclick: move |e| e.stop_propagation(),
                     div { class: "modal-header",
                         h2 { class: "modal-title",
@@ -568,6 +631,7 @@ fn AdminUsersView() -> Element {
                         button {
                             class: "btn btn-ghost btn-sm",
                             r#type: "button",
+                            aria_label: i18n.t("common.close"),
                             onclick: move |_| {
                                 balance_error.set(String::new());
                                 balance_user.set(None);
@@ -653,6 +717,37 @@ fn AdminUsersView() -> Element {
                 }
             }
         }
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::{SEARCH_DEBOUNCE_MS, UserListQuery};
+
+    #[test]
+    fn admin_search_uses_a_short_debounce() {
+        assert!((250..=500).contains(&SEARCH_DEBOUNCE_MS));
+    }
+
+    #[test]
+    fn committing_a_debounced_search_resets_any_intervening_page_change() {
+        let mut query = UserListQuery {
+            search: "old term".to_string(),
+            page: 4,
+        };
+
+        // 模拟用户在防抖计时期间又点击了分页。
+        query.page = 2;
+        query.commit_search("new term".to_string());
+
+        assert_eq!(
+            query,
+            UserListQuery {
+                search: "new term".to_string(),
+                page: 1,
+            }
+        );
     }
 }
 
@@ -679,9 +774,10 @@ fn UserSelfView() -> Element {
         .unwrap_or_default();
 
     rsx! {
-        div { class: "page-header",
-            h1 { class: "page-title", {i18n.t("users.self_title")} }
-            p { class: "page-description", {i18n.t("users.self_desc")} }
+        div { class: "page-container",
+        PageHeader {
+            title: i18n.t("users.self_title").to_string(),
+            description: i18n.t("users.self_desc").to_string(),
         }
 
         div { class: "card",
@@ -710,6 +806,7 @@ fn UserSelfView() -> Element {
                     }
                 }
             }
+        }
         }
     }
 }

@@ -9,7 +9,8 @@ use crate::utils::on_copy;
 use crate::utils::time::format_time;
 use dioxus::prelude::*;
 use ui::{
-    Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Pagination, Table, TableHead,
+    Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, ConfirmModal, Pagination, Table,
+    TableHead,
     icons::{IconCopy, IconPlus},
 };
 
@@ -38,6 +39,8 @@ pub fn ApiKeyList() -> Element {
     let mut creating = use_signal(|| false);
     let mut create_error = use_signal(|| Option::<String>::None);
     let mut new_key_value = use_signal(|| Option::<String>::None);
+    let mut delete_candidate = use_signal(|| Option::<(String, String)>::None);
+    let mut delete_modal_open = use_signal(|| false);
     let mut page = use_signal(|| 1u32);
     // 是否显示已撤销的 Key（默认不显示）
     let mut include_revoked = use_signal(|| false);
@@ -361,7 +364,7 @@ pub fn ApiKeyList() -> Element {
             // 创建弹窗
             if show_create() {
                 div { class: "modal-overlay",
-                    div { class: "modal",
+                    div { class: "modal", role: "dialog", aria_modal: "true", aria_label: i18n.t("api_keys.create_title"),
                         h2 { class: "modal-title", {i18n.t("api_keys.create_title")} }
                         if let Some(err) = create_error() {
                             div { class: "alert alert-error", "{err}" }
@@ -398,6 +401,30 @@ pub fn ApiKeyList() -> Element {
                         }
                     }
                 }
+            }
+
+            ConfirmModal {
+                open: delete_modal_open,
+                title: i18n.t("api_keys.delete_confirm_title").to_string(),
+                message: delete_candidate()
+                    .as_ref()
+                    .map(|(_, name)| i18n.t_with_args("api_keys.delete_confirm_message", &[("name", name)]))
+                    .unwrap_or_default(),
+                confirm_text: i18n.t("form.delete").to_string(),
+                cancel_text: i18n.t("form.cancel").to_string(),
+                close_label: i18n.t("common.close").to_string(),
+                danger: true,
+                onconfirm: move |_| {
+                    if let Some((id, _)) = delete_candidate() {
+                        on_delete(id);
+                    }
+                    delete_candidate.set(None);
+                    delete_modal_open.set(false);
+                },
+                oncancel: move |_| {
+                    delete_candidate.set(None);
+                    delete_modal_open.set(false);
+                },
             }
 
             match keys() {
@@ -484,7 +511,11 @@ pub fn ApiKeyList() -> Element {
                                                         size: ButtonSize::Small,
                                                         onclick: {
                                                             let id = key.id.to_string();
-                                                            move |_| on_delete(id.clone())
+                                                            let name = key.name.clone();
+                                                            move |_| {
+                                                                delete_candidate.set(Some((id.clone(), name.clone())));
+                                                                delete_modal_open.set(true);
+                                                            }
                                                         },
                                                         {i18n.t("form.delete")}
                                                     }
@@ -498,6 +529,8 @@ pub fn ApiKeyList() -> Element {
                                     Pagination {
                                         current: page(),
                                         total_pages,
+                                        previous_label: i18n.t("table.previous").to_string(),
+                                        next_label: i18n.t("table.next").to_string(),
                                         on_page_change: move |p| page.set(p),
                                     }
                                 }

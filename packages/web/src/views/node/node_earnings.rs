@@ -1,11 +1,13 @@
 use dioxus::prelude::*;
 use ui::{
-    Alert, AlertVariant, Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Table, TableHead,
+    Alert, AlertVariant, Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, PageHeader, Table,
+    TableHead,
 };
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::services::node_tips_service;
 use crate::stores::{auth_store::AuthStore, ui_store::UiStore};
+use crate::utils::{display::short_id, format_precise_cny_str, time::format_time};
 
 const HISTORY_PAGE_SIZE: u32 = 20;
 
@@ -144,9 +146,20 @@ pub fn NodeEarnings() -> Element {
 
     rsx! {
         div { class: "page-container node-earnings-page",
-            div { class: "page-header",
-                h1 { class: "page-title", {i18n.t("page.node_earnings")} }
-                p { class: "page-description", {i18n.t("node_earnings.subtitle")} }
+            PageHeader {
+                title: i18n.t("page.node_earnings").to_string(),
+                description: i18n.t("node_earnings.subtitle").to_string(),
+                actions: rsx! {
+                    Button {
+                        variant: ButtonVariant::Primary,
+                        size: ButtonSize::Medium,
+                        onclick: move |_| {
+                            withdraw_error.set(None);
+                            withdraw_modal.set(WithdrawModalState::Open);
+                        },
+                        {i18n.t("node_earnings.withdraw_btn")}
+                    }
+                },
             }
 
             // 错误提示
@@ -159,7 +172,7 @@ pub fn NodeEarnings() -> Element {
                 if let Some(Ok(summary)) = summary_resource().as_ref().map(|r| r.as_ref()) {
                     EarningsCard {
                         label: i18n.t("node_earnings.pending_amount"),
-                        value: format!("¥{}", summary.pending_amount),
+                        value: format_precise_cny_str(&summary.pending_amount),
                         meta: i18n.t_with_args(
                             "node_earnings.pending_count",
                             &[("count", &summary.pending_count.to_string())],
@@ -168,13 +181,13 @@ pub fn NodeEarnings() -> Element {
                     }
                     EarningsCard {
                         label: i18n.t("node_earnings.withdrawn_amount"),
-                        value: format!("¥{}", summary.withdrawn_amount),
+                        value: format_precise_cny_str(&summary.withdrawn_amount),
                         meta: i18n.t("node_earnings.withdrawn_meta"),
                         variant: "success",
                     }
                     EarningsCard {
                         label: i18n.t("node_earnings.total_amount"),
-                        value: format!("¥{}", summary.total_amount),
+                        value: format_precise_cny_str(&summary.total_amount),
                         meta: i18n.t("node_earnings.total_meta"),
                         variant: "info",
                     }
@@ -182,19 +195,6 @@ pub fn NodeEarnings() -> Element {
                     div { class: "earnings-card-skeleton" }
                     div { class: "earnings-card-skeleton" }
                     div { class: "earnings-card-skeleton" }
-                }
-            }
-
-            // 提现按钮
-            div { class: "earnings-actions",
-                Button {
-                    variant: ButtonVariant::Primary,
-                    size: ButtonSize::Medium,
-                    onclick: move |_| {
-                        withdraw_error.set(None);
-                        withdraw_modal.set(WithdrawModalState::Open);
-                    },
-                    {i18n.t("node_earnings.withdraw_btn")}
                 }
             }
 
@@ -228,11 +228,11 @@ pub fn NodeEarnings() -> Element {
                                 tbody {
                                     for item in resp.items.iter() {
                                         tr {
-                                            td { "{item.created_at}" }
-                                            td { "¥{item.bill_amount}" }
-                                            td { "¥{item.tip_amount}" }
+                                            td { {format_time(&item.created_at)} }
+                                            td { {format_precise_cny_str(&item.bill_amount)} }
+                                            td { {format_precise_cny_str(&item.tip_amount)} }
                                             td { "{item.tip_ratio}" }
-                                            td { class: "text-muted", "{&item.id[..8]}" }
+                                            td { class: "text-muted", title: "{item.id}", {short_id(&item.id)} }
                                         }
                                     }
                                 }
@@ -302,8 +302,8 @@ pub fn NodeEarnings() -> Element {
                                 tbody {
                                     for w in records.iter() {
                                         tr {
-                                            td { "{w.created_at}" }
-                                            td { "¥{w.total_amount}" }
+                                            td { {format_time(&w.created_at)} }
+                                            td { {format_precise_cny_str(&w.total_amount)} }
                                             td {
                                                 match w.withdrawal_type.as_str() {
                                                     "alipay" => i18n.t("node_earnings.method_alipay"),
@@ -321,7 +321,7 @@ pub fn NodeEarnings() -> Element {
                                                     "—"
                                                 }
                                             }
-                                            td { class: "text-muted", "{&w.id[..8]}" }
+                                            td { class: "text-muted", title: "{w.id}", {short_id(&w.id)} }
                                         }
                                     }
                                 }
@@ -399,6 +399,9 @@ fn WithdrawModal(
             },
             div {
                 class: "modal",
+                role: "dialog",
+                aria_modal: "true",
+                aria_label: i18n.t("node_earnings.withdraw_title"),
                 // 阻止冒泡
                 onclick: move |evt| {
                     evt.stop_propagation();
@@ -408,6 +411,7 @@ fn WithdrawModal(
                     button {
                         class: "modal-close",
                         r#type: "button",
+                        aria_label: i18n.t("common.close"),
                         disabled: withdraw_loading(),
                         onclick: move |_| withdraw_modal.set(WithdrawModalState::Closed),
                         "✕"

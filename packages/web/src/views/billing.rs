@@ -16,7 +16,7 @@ pub fn Billing() -> Element {
     rsx! {
         div {
             class: "auth-redirect-loading",
-            style: "display:flex;align-items:center;justify-content:center;height:100vh",
+            style: "display:flex;align-items:center;justify-content:center;min-height:40vh",
             span { style: "color:var(--text-secondary,#64748b)", {i18n.t("common.redirecting")} }
         }
     }

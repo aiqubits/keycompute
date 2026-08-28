@@ -1,6 +1,9 @@
 use client_api::api::admin::AccountTestResponse;
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Pagination, Table, TableHead};
+use ui::{
+    Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, PageHeader, Pagination, Table,
+    TableHead,
+};
 
 const PAGE_SIZE: usize = 20;
 
@@ -12,6 +15,7 @@ use crate::services::{
 use crate::stores::auth_store::AuthStore;
 use crate::stores::ui_store::UiStore;
 use crate::stores::user_store::UserStore;
+use crate::utils::display::short_id;
 use crate::utils::time::format_time;
 
 /// 厂商预设列表：(预设 id, 显示名 i18n key, 协议, Base URL 模板)
@@ -356,14 +360,16 @@ fn AdminAccountsView() -> Element {
 
     rsx! {
         div { class: "page-container",
-            div { class: "page-header",
-                h1 { class: "page-title", {i18n.t("page.accounts")} }
-                p { class: "page-description", {i18n.t("accounts.subtitle")} }
-                button {
-                    class: "btn btn-primary",
-                    onclick: move |_| *show_create.write() = true,
-                    {i18n.t("accounts.add_channel")}
-                }
+            PageHeader {
+                title: i18n.t("page.accounts").to_string(),
+                description: i18n.t("accounts.subtitle").to_string(),
+                actions: rsx! {
+                    button {
+                        class: "btn btn-primary",
+                        onclick: move |_| *show_create.write() = true,
+                        {i18n.t("accounts.add_channel")}
+                    }
+                },
             }
 
             // 操作工具栏
@@ -656,6 +662,8 @@ fn AdminAccountsView() -> Element {
                             Pagination {
                                 current: page(),
                                 total_pages,
+                                previous_label: i18n.t("table.previous").to_string(),
+                                next_label: i18n.t("table.next").to_string(),
                                 on_page_change: move |p| page.set(p),
                             }
                         }
@@ -670,12 +678,16 @@ fn AdminAccountsView() -> Element {
                     onclick: move |_| *show_create.write() = false,
                     div {
                         class: "modal",
+                        role: "dialog",
+                        aria_modal: "true",
+                        aria_label: i18n.t("accounts.create_title"),
                         onclick: move |e| e.stop_propagation(),
                         div { class: "modal-header",
                             h2 { class: "modal-title", {i18n.t("accounts.create_title")} }
                             button {
                                 class: "btn btn-ghost btn-sm",
                                 r#type: "button",
+                                aria_label: i18n.t("common.close"),
                                 onclick: move |_| *show_create.write() = false,
                                 "✕"
                             }
@@ -771,12 +783,16 @@ fn AdminAccountsView() -> Element {
                     onclick: move |_| show_edit.set(false),
                     div {
                         class: "modal",
+                        role: "dialog",
+                        aria_modal: "true",
+                        aria_label: i18n.t("accounts.edit_title"),
                         onclick: move |e| e.stop_propagation(),
                         div { class: "modal-header",
                             h2 { class: "modal-title", {i18n.t("accounts.edit_title")} }
                             button {
                                 class: "btn btn-ghost btn-sm",
                                 r#type: "button",
+                                aria_label: i18n.t("common.close"),
                                 onclick: move |_| show_edit.set(false),
                                 "✕"
                             }
@@ -837,7 +853,7 @@ fn AdminAccountsView() -> Element {
                                         tenant_list
                                             .iter()
                                             .find(|t| t.id == tenant_id)
-                                            .map(|t| format!("{} ({})", t.name, &t.id[..t.id.len().min(8)]))
+                                            .map(|t| format!("{} ({})", t.name, short_id(&t.id)))
                                             .unwrap_or_else(|| tenant_id.clone())
                                     };
                                     rsx! {
@@ -932,12 +948,16 @@ fn AdminAccountsView() -> Element {
                     onclick: move |_| show_delete.set(false),
                     div {
                         class: "modal",
+                        role: "alertdialog",
+                        aria_modal: "true",
+                        aria_label: i18n.t("accounts.delete_confirm_title"),
                         onclick: move |e| e.stop_propagation(),
                         div { class: "modal-header",
                             h2 { class: "modal-title", {i18n.t("accounts.delete_confirm_title")} }
                             button {
                                 class: "btn btn-ghost btn-sm",
                                 r#type: "button",
+                                aria_label: i18n.t("common.close"),
                                 onclick: move |_| show_delete.set(false),
                                 "✕"
                             }
@@ -998,13 +1018,13 @@ pub fn NoPermissionView(resource: String) -> Element {
         .t("accounts.no_permission_desc")
         .replace("{resource}", &resource);
     rsx! {
-        div { class: "page-header",
-            h1 { class: "page-title", "{resource}" }
-        }
-        div { class: "empty-state",
-            div { class: "empty-icon", "🔒" }
-            h3 { class: "empty-title", {i18n.t("accounts.no_permission_title")} }
-            p { class: "empty-description", "{no_permission_desc}" }
+        div { class: "page-container",
+            PageHeader { title: resource.clone() }
+            div { class: "empty-state",
+                div { class: "empty-icon", "🔒" }
+                h3 { class: "empty-title", {i18n.t("accounts.no_permission_title")} }
+                p { class: "empty-description", "{no_permission_desc}" }
+            }
         }
     }
 }

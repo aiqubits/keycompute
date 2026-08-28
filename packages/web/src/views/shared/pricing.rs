@@ -1,22 +1,16 @@
 use client_api::api::admin::CreatePricingRequest;
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant, Pagination, Table, TableHead};
+use ui::{Badge, BadgeVariant, ConfirmModal, PageHeader, Pagination, Table, TableHead};
 
 const PAGE_SIZE: usize = 20;
 
-/// 全局默认定价的租户 ID（nil UUID）
-const GLOBAL_DEFAULT_TENANT_ID: &str = "00000000-0000-0000-0000-000000000000";
-
-/// 检查是否为全局默认定价
-fn is_global_default(tenant_id: &Option<String>) -> bool {
-    tenant_id
-        .as_ref()
-        .is_some_and(|id| id == GLOBAL_DEFAULT_TENANT_ID)
-}
-
 use crate::hooks::use_i18n::use_i18n;
 use crate::i18n::I18n;
-use crate::services::{api_client::with_auto_refresh, pricing_service, tenant_service};
+use crate::services::{
+    api_client::with_auto_refresh,
+    pricing_service::{self, is_global_default},
+    tenant_service,
+};
 use crate::stores::auth_store::AuthStore;
 use crate::stores::user_store::UserStore;
 use crate::utils::time::format_time;
@@ -38,6 +32,10 @@ fn pricing_provider_class(dimension: &str) -> &'static str {
     }
 }
 
+fn pricing_col_count(is_admin: bool) -> u32 {
+    if is_admin { 7 } else { 6 }
+}
+
 /// 定价管理页面
 ///
 /// - 普通用户：只读查看定价策略列表
@@ -57,6 +55,8 @@ pub fn Pricing() -> Element {
     // 控制创建弹窗
     let mut show_create = use_signal(|| false);
     let mut editing_pricing = use_signal(|| None as Option<client_api::api::admin::PricingInfo>);
+    let mut delete_candidate = use_signal(|| Option::<(String, String)>::None);
+    let mut delete_modal_open = use_signal(|| false);
     // 操作结果提示
     let mut op_ok = use_signal(String::new);
     let mut op_err = use_signal(String::new);
@@ -72,27 +72,28 @@ pub fn Pricing() -> Element {
         })
         .await
     });
+    let page_description = if is_admin {
+        i18n.t("pricing.admin_desc")
+    } else {
+        i18n.t("pricing.user_desc")
+    };
 
-    let col_count: u32 = if is_admin { 8 } else { 7 };
+    let col_count = pricing_col_count(is_admin);
 
     rsx! {
         div { class: "page-container",
-            div { class: "page-header",
-                h1 { class: "page-title", {i18n.t("page.pricing")} }
-                p { class: "page-description",
+            PageHeader {
+                title: i18n.t("page.pricing").to_string(),
+                description: page_description.to_string(),
+                actions: rsx! {
                     if is_admin {
-                        {i18n.t("pricing.admin_desc")}
-                    } else {
-                        {i18n.t("pricing.user_desc")}
+                        button {
+                            class: "btn btn-primary",
+                            onclick: move |_| show_create.set(true),
+                            {i18n.t("pricing.create")}
+                        }
                     }
-                }
-                if is_admin {
-                    button {
-                        class: "btn btn-primary",
-                        onclick: move |_| show_create.set(true),
-                        {i18n.t("pricing.create")}
-                    }
-                }
+                },
             }
 
             // 操作结果提示
@@ -277,32 +278,13 @@ pub fn Pricing() -> Element {
                                                         if !is_global_default(&p.tenant_id) {
                                                             {
                                                                 let pid = p.id.clone();
+                                                                let model_name = p.model_name.clone();
                                                                 rsx! {
                                                                     button {
                                                                         class: "btn btn-sm btn-danger",
                                                                         onclick: move |_| {
-                                                                            let id = pid.clone();
-                                                                            let token = auth_store.token().unwrap_or_default();
-                                                                            spawn(async move {
-                                                                                match pricing_service::delete(&id, &token).await {
-                                                                                    Ok(_) => {
-                                                                                        op_ok.set(i18n.t("pricing.deleted").to_string());
-                                                                                        op_err.set(String::new());
-                                                                                        *refresh_tick.write() += 1;
-                                                                                        spawn(async move {
-                                                                                            gloo_timers::future::TimeoutFuture::new(3_000).await;
-                                                                                            op_ok.set(String::new());
-                                                                                        });
-                                                                                    }
-                                                                                    Err(e) => {
-                                                                                        op_err.set(format!("{}：{e}", i18n.t("pricing.delete_failed")));
-                                                                                        spawn(async move {
-                                                                                            gloo_timers::future::TimeoutFuture::new(3_000).await;
-                                                                                            op_err.set(String::new());
-                                                                                        });
-                                                                                    }
-                                                                                }
-                                                                            });
+                                                                            delete_candidate.set(Some((pid.clone(), model_name.clone())));
+                                                                            delete_modal_open.set(true);
                                                                         },
                                                                         {i18n.t("form.delete")}
                                                                     }
@@ -325,6 +307,8 @@ pub fn Pricing() -> Element {
                         Pagination {
                             current: page(),
                             total_pages,
+                            previous_label: i18n.t("table.previous").to_string(),
+                            next_label: i18n.t("table.next").to_string(),
                             on_page_change: move |p| page.set(p),
                         }
                     }
@@ -371,6 +355,47 @@ pub fn Pricing() -> Element {
                         });
                     },
                 }
+            }
+
+            ConfirmModal {
+                open: delete_modal_open,
+                title: i18n.t("pricing.delete_confirm_title").to_string(),
+                message: delete_candidate()
+                    .as_ref()
+                    .map(|(_, model)| i18n.t_with_args("pricing.delete_confirm_message", &[("model", model)]))
+                    .unwrap_or_default(),
+                confirm_text: i18n.t("form.delete").to_string(),
+                cancel_text: i18n.t("form.cancel").to_string(),
+                close_label: i18n.t("common.close").to_string(),
+                danger: true,
+                onconfirm: move |_| {
+                    let candidate = delete_candidate();
+                    delete_candidate.set(None);
+                    delete_modal_open.set(false);
+                    if let Some((id, _)) = candidate {
+                        let token = auth_store.token().unwrap_or_default();
+                        spawn(async move {
+                            match pricing_service::delete(&id, &token).await {
+                                Ok(_) => {
+                                    op_ok.set(i18n.t("pricing.deleted").to_string());
+                                    op_err.set(String::new());
+                                    *refresh_tick.write() += 1;
+                                    spawn(async move {
+                                        gloo_timers::future::TimeoutFuture::new(3_000).await;
+                                        op_ok.set(String::new());
+                                    });
+                                }
+                                Err(e) => {
+                                    op_err.set(format!("{}：{e}", i18n.t("pricing.delete_failed")));
+                                }
+                            }
+                        });
+                    }
+                },
+                oncancel: move |_| {
+                    delete_candidate.set(None);
+                    delete_modal_open.set(false);
+                },
             }
         }
     }
@@ -465,12 +490,13 @@ fn CreatePricingModal(
 
     rsx! {
         div { class: "modal-backdrop", onclick: move |_| on_close.call(()),
-            div { class: "modal", onclick: move |e| e.stop_propagation(),
+            div { class: "modal", role: "dialog", aria_modal: "true", aria_label: i18n.t("pricing.create_title"), onclick: move |e| e.stop_propagation(),
                 div { class: "modal-header",
                     h2 { class: "modal-title", {i18n.t("pricing.create_title")} }
                     button {
                         class: "btn btn-ghost btn-sm",
                         r#type: "button",
+                        aria_label: i18n.t("common.close"),
                         onclick: move |_| on_close.call(()),
                         "✕"
                     }
@@ -649,12 +675,13 @@ fn EditPricingModal(
 
     rsx! {
         div { class: "modal-backdrop", onclick: move |_| on_close.call(()),
-            div { class: "modal", onclick: move |e| e.stop_propagation(),
+            div { class: "modal", role: "dialog", aria_modal: "true", aria_label: i18n.t("pricing.edit_title"), onclick: move |e| e.stop_propagation(),
                 div { class: "modal-header",
                     h2 { class: "modal-title", {i18n.t("pricing.edit_title")} }
                     button {
                         class: "btn btn-ghost btn-sm",
                         r#type: "button",
+                        aria_label: i18n.t("common.close"),
                         onclick: move |_| on_close.call(()),
                         "✕"
                     }
@@ -732,5 +759,16 @@ fn EditPricingModal(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pricing_col_count;
+
+    #[test]
+    fn empty_table_colspan_matches_visible_pricing_columns() {
+        assert_eq!(pricing_col_count(true), 7);
+        assert_eq!(pricing_col_count(false), 6);
     }
 }

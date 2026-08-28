@@ -916,6 +916,7 @@ fn LoginModal(
             open,
             title: t_title.to_string(),
             onclose,
+            close_label: i18n.t("common.close").to_string(),
             max_width: "420px".to_string(),
             div { class: "kc-auth-modal",
                 p { class: "kc-auth-modal-subtitle", "{t_subtitle}" }
@@ -1180,6 +1181,7 @@ fn RegisterModal(
             open,
             title: t_register.to_string(),
             onclose,
+            close_label: i18n.t("common.close").to_string(),
             max_width: "420px".to_string(),
             div { class: "kc-auth-modal",
                 p { class: "kc-auth-modal-subtitle", "{t_register_subtitle}" }
@@ -1547,6 +1549,7 @@ fn RequirementModal(open: ReadSignal<bool>, onclose: EventHandler<()>) -> Elemen
             open,
             title: t_title.to_string(),
             onclose,
+            close_label: i18n.t("common.close").to_string(),
             max_width: "620px".to_string(),
             div { class: "kc-req-modal",
                 if success() {

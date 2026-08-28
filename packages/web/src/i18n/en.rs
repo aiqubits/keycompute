@@ -170,6 +170,8 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     // ── Table ───────────────────────────────────
     m.insert("table.no_data", "No data");
     m.insert("table.loading", "Loading...");
+    m.insert("table.previous", "‹ Previous");
+    m.insert("table.next", "Next ›");
     m.insert("table.actions", "Actions");
     m.insert("table.status", "Status");
     m.insert("table.created_at", "Created At");
@@ -194,11 +196,18 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     );
     m.insert("common.refresh", "Refresh");
     m.insert("common.back", "Back");
+    m.insert("common.clear", "Clear");
+    m.insert("common.close", "Close");
     m.insert("common.time", "Time");
     m.insert("common.total_items", "Total");
     m.insert("common.range", "Range");
     m.insert("common.created_at_label", "Created");
     m.insert("common.load_failed", "Load failed");
+    m.insert(
+        "common.user_info_load_failed",
+        "Failed to load user information, so admin access could not be verified.",
+    );
+    m.insert("common.retry", "Retry");
     m.insert("common.redirecting", "Redirecting");
     m.insert("common.redirect_to_login", "Redirecting to sign in...");
     m.insert("common.redirect_to_home", "Redirecting to home...");
@@ -301,6 +310,11 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("api_keys.name_placeholder", "Name this key");
     m.insert("api_keys.creating", "Creating...");
     m.insert("api_keys.create_failed", "Create failed");
+    m.insert("api_keys.delete_confirm_title", "Delete API Key");
+    m.insert(
+        "api_keys.delete_confirm_message",
+        "Delete API Key “{name}”? This action cannot be undone.",
+    );
     m.insert("api_keys.loading_failed", "Load failed");
     m.insert("api_keys.registry", "API Key Management");
     m.insert("api_keys.empty_meta", "No keys match the current filter.");
@@ -323,6 +337,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("layout.back_to_home", "Back to Home");
     m.insert("layout.open_menu", "Open menu");
     m.insert("layout.close_menu", "Close menu");
+    m.insert("layout.user_menu", "User menu");
     m.insert("layout.switch_to_light", "Switch to light theme");
     m.insert("layout.switch_to_dark", "Switch to dark theme");
     m.insert("layout.switch_to_zh", "Switch to Chinese");
@@ -493,6 +508,10 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
 
     // ── Account Settings ────────────────────────
     m.insert(
+        "account_settings.subtitle",
+        "Update your password and account security",
+    );
+    m.insert(
         "account_settings.fill_all_passwords",
         "Please fill in all password fields",
     );
@@ -581,6 +600,8 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("usage.prompt_tokens", "Prompt Tokens");
     m.insert("usage.completion_tokens", "Completion Tokens");
     m.insert("usage.total_cost", "Total Cost");
+    m.insert("usage.status_success", "Succeeded");
+    m.insert("usage.status_failed", "Failed");
     m.insert("usage.usage_billed", "Usage-based billing");
     m.insert("usage.trend", "Call Trend");
     m.insert("usage.records", "Call Records");
@@ -632,6 +653,42 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("payment_orders.filter_paid", "Paid");
     m.insert("payment_orders.filter_failed", "Failed");
     m.insert("payment_orders.filter_closed", "Closed");
+    m.insert("payment_orders.status_pending", "Pending");
+    m.insert("payment_orders.status_processing", "Processing");
+    m.insert("payment_orders.status_paid", "Paid");
+    m.insert("payment_orders.status_failed", "Failed");
+    m.insert("payment_orders.status_closed", "Closed");
+    m.insert("payment_orders.status_cancelled", "Cancelled");
+    m.insert("payment_orders.provider_available", "Available");
+    m.insert("payment_orders.provider_disabled", "Disabled");
+    m.insert("payment_orders.provider_misconfigured", "Misconfigured");
+    m.insert("payment_orders.provider_state_error", "State error");
+    m.insert(
+        "payment_orders.provider_unverified",
+        "Verification required",
+    );
+    m.insert("payment_orders.provider_unavailable", "Unavailable");
+    m.insert("payment_orders.provider_degraded", "Degraded");
+    m.insert(
+        "payment_orders.provider_misconfigured_message",
+        "The provider is enabled, but credentials or callback settings are incomplete.",
+    );
+    m.insert(
+        "payment_orders.provider_state_error_message",
+        "Provider state is unavailable or invalid, so new orders are paused.",
+    );
+    m.insert(
+        "payment_orders.provider_unverified_message",
+        "Configuration loaded; provider verification is still required before use.",
+    );
+    m.insert(
+        "payment_orders.provider_unavailable_message",
+        "Authentication or signature verification failed, so new orders are paused.",
+    );
+    m.insert(
+        "payment_orders.provider_degraded_message",
+        "Recent provider requests were unstable; new orders remain enabled while monitoring continues.",
+    );
 
     // ── Recharge ──────────────────────────────
     m.insert("recharge.title", "Account Recharge");
@@ -725,6 +782,10 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("distribution.total_earnings", "Total Earnings");
     m.insert("distribution.available_balance", "Available Balance");
     m.insert("distribution.pending", "Pending Settlement");
+    m.insert("distribution.status_settled", "Settled");
+    m.insert("distribution.status_pending", "Pending");
+    m.insert("distribution.status_cancelled", "Cancelled");
+    m.insert("distribution.status_failed", "Failed");
     m.insert("distribution.referral_count", "Referral Count");
     m.insert("distribution.my_invite_link", "My Invite Link");
     m.insert("distribution.referral_users", "Referred Users");
@@ -852,6 +913,11 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("pricing.set_default", "Set Default");
     m.insert("pricing.deleted", "Pricing deleted");
     m.insert("pricing.delete_failed", "Failed to delete");
+    m.insert("pricing.delete_confirm_title", "Delete pricing");
+    m.insert(
+        "pricing.delete_confirm_message",
+        "Delete this pricing entry for “{model}”? This action cannot be undone.",
+    );
     m.insert("pricing.created", "Pricing created successfully");
     m.insert("pricing.updated", "Pricing updated successfully");
     m.insert("pricing.fill_all", "Please fill in all fields");
@@ -1025,6 +1091,10 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("system.fallback_chain", "Fallback Chain");
     m.insert("system.items", "items");
     m.insert("system.route_failed", "Route failed");
+    m.insert(
+        "system.no_routable_probe_model",
+        "The current tenant has no enabled account model available for provider routing diagnostics",
+    );
     m.insert("system.provider_status", "Provider Status");
     m.insert("system.no_provider_configured", "No providers configured");
     m.insert("system.provider_column", "Provider");
@@ -1288,6 +1358,11 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("monitoring.probe_done", "Probe completed");
     m.insert("monitoring.probe_failed", "Probe failed");
     m.insert("monitoring.probe_all_accounts", "Probe all accounts");
+    m.insert("monitoring.probe_confirm_title", "Probe all accounts?");
+    m.insert(
+        "monitoring.probe_confirm_message",
+        "This sends real upstream probes to every configured account and may incur a small charge. Continue?",
+    );
     m.insert("monitoring.last_updated", "Last updated");
     m.insert(
         "monitoring.empty_range",
@@ -1424,6 +1499,7 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     );
     m.insert("users.role_user", "user (standard)");
     m.insert("users.role_admin", "admin (administrator)");
+    m.insert("users.role_system", "system (protected)");
     m.insert("users.delete_confirm_title", "Confirm Deletion");
     m.insert("users.delete_confirm_prefix", "Delete user");
     m.insert(

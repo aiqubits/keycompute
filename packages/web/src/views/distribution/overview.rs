@@ -10,9 +10,9 @@ use crate::services::{
 use crate::stores::{
     auth_store::AuthStore, public_settings_store::PublicSettingsStore, ui_store::UiStore,
 };
-use crate::utils::on_copy;
 use crate::utils::time::format_time;
-use ui::icons::IconCopy;
+use crate::utils::{format_precise_cny_str, on_copy};
+use ui::{PageHeader, icons::IconCopy};
 
 fn is_distribution_disabled_error<T>(result: &Option<Result<T, ClientError>>) -> bool {
     matches!(
@@ -90,16 +90,16 @@ fn DistributionOverviewContent() -> Element {
     });
 
     let total_earnings = match earnings() {
-        Some(Ok(ref e)) => format!("¥{}", e.total_earnings),
+        Some(Ok(ref e)) => format_precise_cny_str(&e.total_earnings),
         Some(Err(ref e)) => user_error_message(e),
         None => i18n.t("table.loading").to_string(),
     };
     let available_earnings = match earnings() {
-        Some(Ok(ref e)) => format!("¥{}", e.available_earnings),
+        Some(Ok(ref e)) => format_precise_cny_str(&e.available_earnings),
         _ => "—".to_string(),
     };
     let pending_earnings = match earnings() {
-        Some(Ok(ref e)) => format!("¥{}", e.pending_earnings),
+        Some(Ok(ref e)) => format_precise_cny_str(&e.pending_earnings),
         _ => "—".to_string(),
     };
     let referral_count = match earnings() {
@@ -123,9 +123,9 @@ fn DistributionOverviewContent() -> Element {
 
     rsx! {
         div { class: "page-container",
-            div { class: "page-header",
-                h1 { class: "page-title", {i18n.t("distribution.title")} }
-                p { class: "page-subtitle", {i18n.t("distribution.subtitle")} }
+            PageHeader {
+                title: i18n.t("distribution.title").to_string(),
+                description: i18n.t("distribution.subtitle").to_string(),
             }
 
             if distribution_disabled {
@@ -228,8 +228,8 @@ fn DistributionOverviewContent() -> Element {
                                                     }
                                                 }
                                                 td { {format_time(&r.joined_at)} }
-                                                td { "¥{r.total_spent}" }
-                                                td { "¥{r.earnings_from_referral}" }
+                                                td { {format_precise_cny_str(&r.total_spent)} }
+                                                td { {format_precise_cny_str(&r.earnings_from_referral)} }
                                             }
                                         }
                                     },

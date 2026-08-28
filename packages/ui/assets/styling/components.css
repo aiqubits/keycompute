@@ -236,6 +236,10 @@
   font-variant-numeric: tabular-nums;
 }
 
+.table-container-empty .table {
+  min-width: 100%;
+}
+
 .table th {
   text-align: left;
   padding: 12px 18px;

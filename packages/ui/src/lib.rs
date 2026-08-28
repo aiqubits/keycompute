@@ -26,6 +26,7 @@ pub use components::card::{Card, StatCard};
 pub use components::input::{Input, Textarea};
 pub use components::loading::{CardSkeleton, LoadingOverlay, LoadingSpinner, Skeleton};
 pub use components::modal::{ConfirmModal, Modal};
+pub use components::page_header::PageHeader;
 pub use components::table::{Pagination, Table, TableCell, TableHead};
 pub use components::toast::{Toast, ToastKind, ToastMsg};
 

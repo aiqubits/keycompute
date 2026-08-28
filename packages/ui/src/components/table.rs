@@ -40,9 +40,14 @@ pub fn Table(
     children: Element,
 ) -> Element {
     let table_class = format!("table {}", class.trim());
+    let container_class = if empty {
+        "table-container table-container-empty"
+    } else {
+        "table-container"
+    };
 
     rsx! {
-        div { class: "table-container",
+        div { class: "{container_class}", tabindex: "0",
             table { class: "{table_class}",
                 if empty {
                     tbody {
@@ -105,6 +110,12 @@ pub fn Pagination(
     /// 页面变更回调
     #[props(default)]
     on_page_change: EventHandler<u32>,
+    /// 上一页按钮文案；共享库默认使用语言无关的箭头，业务层应传入本地化文案
+    #[props(default = "‹".to_string())]
+    previous_label: String,
+    /// 下一页按钮文案
+    #[props(default = "›".to_string())]
+    next_label: String,
 ) -> Element {
     if total_pages <= 1 {
         return rsx! {};
@@ -114,27 +125,42 @@ pub fn Pagination(
         div { class: "pagination",
             button {
                 class: "btn btn-ghost btn-sm",
+                aria_label: "{previous_label}",
                 disabled: current <= 1,
                 onclick: move |_| {
                     if current > 1 {
                         on_page_change.call(current - 1);
                     }
                 },
-                "‹ 上一页"
+                "{previous_label}"
             }
             span { class: "pagination-info",
                 "{current} / {total_pages}"
             }
             button {
                 class: "btn btn-ghost btn-sm",
+                aria_label: "{next_label}",
                 disabled: current >= total_pages,
                 onclick: move |_| {
                     if current < total_pages {
                         on_page_change.call(current + 1);
                     }
                 },
-                "下一页 ›"
+                "{next_label}"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shared_pagination_has_no_hard_coded_language() {
+        let source = include_str!("table.rs");
+        let component_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let previous: String = ['上', '一', '页'].into_iter().collect();
+        let next: String = ['下', '一', '页'].into_iter().collect();
+        assert!(!component_source.contains(&format!("‹ {previous}")));
+        assert!(!component_source.contains(&format!("{next} ›")));
     }
 }

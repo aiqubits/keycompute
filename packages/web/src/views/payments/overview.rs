@@ -1,10 +1,12 @@
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant, Table, TableHead};
+use ui::{Badge, BadgeVariant, PageHeader, Table, TableHead};
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::router::Route;
 use crate::services::{api_client::with_auto_refresh, billing_service, payment_service};
 use crate::stores::auth_store::AuthStore;
+use crate::utils::display::payment_status_label;
+use crate::utils::format_cny_str;
 use crate::utils::time::format_time;
 
 /// 支付与账单页面 - /payments
@@ -48,17 +50,18 @@ pub fn PaymentsOverview() -> Element {
     rsx! {
         div {
             class: "page-container",
-            div {
-                class: "page-header",
-                h1 { class: "page-title", {i18n.t("payments.title")} }
-                p { class: "page-subtitle", {i18n.t("payments.subtitle")} }
-                if matches!(payment_methods(), Some(Ok(ref methods)) if !methods.methods.is_empty()) {
-                    button {
-                        class: "btn btn-primary",
-                        onclick: move |_| { nav.push(Route::Recharge {}); },
-                        {i18n.t("payments.recharge_now")}
+            PageHeader {
+                title: i18n.t("payments.title").to_string(),
+                description: i18n.t("payments.subtitle").to_string(),
+                actions: rsx! {
+                    if matches!(payment_methods(), Some(Ok(ref methods)) if !methods.methods.is_empty()) {
+                        button {
+                            class: "btn btn-primary",
+                            onclick: move |_| { nav.push(Route::Recharge {}); },
+                            {i18n.t("payments.recharge_now")}
+                        }
                     }
-                }
+                },
             }
 
             // ─── 账户余额 ───
@@ -70,7 +73,7 @@ pub fn PaymentsOverview() -> Element {
                         None => rsx! { p { class: "stat-value", {i18n.t("table.loading")} } },
                         Some(Err(e)) => rsx! { p { class: "stat-value text-error", "{i18n.t(\"common.error\")}: {e}" } },
                         Some(Ok(b)) => rsx! {
-                            p { class: "stat-value", "¥ {crate::utils::format_money_str(&b.available_balance)}" }
+                            p { class: "stat-value", {format_cny_str(&b.available_balance)} }
                         },
                     }
                 }
@@ -78,7 +81,7 @@ pub fn PaymentsOverview() -> Element {
                     class: "stat-card",
                     p { class: "stat-title", {i18n.t("payments.frozen_amount")} }
                     match balance() {
-                        Some(Ok(b)) => rsx! { p { class: "stat-value", "¥ {crate::utils::format_money_str(&b.frozen_balance)}" } },
+                        Some(Ok(b)) => rsx! { p { class: "stat-value", {format_cny_str(&b.frozen_balance)} } },
                         _ => rsx! { p { class: "stat-value", "—" } },
                     }
                 }
@@ -86,7 +89,7 @@ pub fn PaymentsOverview() -> Element {
                     class: "stat-card",
                     p { class: "stat-title", {i18n.t("payments.total_recharge")} }
                     match balance() {
-                        Some(Ok(b)) => rsx! { p { class: "stat-value", "¥ {crate::utils::format_money_str(&b.total_recharged)}" } },
+                        Some(Ok(b)) => rsx! { p { class: "stat-value", {format_cny_str(&b.total_recharged)} } },
                         _ => rsx! { p { class: "stat-value", "—" } },
                     }
                 }
@@ -94,7 +97,7 @@ pub fn PaymentsOverview() -> Element {
                     class: "stat-card",
                     p { class: "stat-title", {i18n.t("payments.total_consumed")} }
                     match balance() {
-                        Some(Ok(b)) => rsx! { p { class: "stat-value", "¥ {crate::utils::format_money_str(&b.total_consumed)}" } },
+                        Some(Ok(b)) => rsx! { p { class: "stat-value", {format_cny_str(&b.total_consumed)} } },
                         _ => rsx! { p { class: "stat-value", "—" } },
                     }
                 }
@@ -148,12 +151,12 @@ pub fn PaymentsOverview() -> Element {
                                             tr {
                                                 key: "{order.id}",
                                                 td { code { "{order.out_trade_no}" } }
-                                                td { "¥ {crate::utils::format_money_str(&order.amount)}" }
+                                                td { {format_cny_str(&order.amount)} }
                                                 td { "{order.subject}" }
                                                 td {
                                                     Badge {
                                                         variant: payment_status_variant(&order.status),
-                                                        "{order.status}"
+                                                        {payment_status_label(&order.status, &i18n)}
                                                     }
                                                 }
                                                 td { { format_time(&order.created_at) } }

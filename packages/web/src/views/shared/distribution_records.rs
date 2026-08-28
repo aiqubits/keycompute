@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant, Pagination, Table, TableHead};
+use ui::{Badge, BadgeVariant, PageHeader, Pagination, Table, TableHead};
 
 const PAGE_SIZE: usize = 20;
 
@@ -10,6 +10,8 @@ use crate::services::{
 };
 use crate::stores::auth_store::AuthStore;
 use crate::stores::user_store::UserStore;
+use crate::utils::display::{distribution_status_label, short_id};
+use crate::utils::format_precise_cny_str;
 use crate::utils::time::format_time;
 
 /// 分销记录页面
@@ -30,8 +32,11 @@ pub fn DistributionRecords() -> Element {
 
     // 收益数据（普通用户）
     let earnings = use_resource(move || async move {
+        if is_admin {
+            return Ok(None);
+        }
         with_auto_refresh(auth_store, |token| async move {
-            distribution_service::get_earnings(&token).await
+            distribution_service::get_earnings(&token).await.map(Some)
         })
         .await
     });
@@ -80,16 +85,16 @@ pub fn DistributionRecords() -> Element {
     });
 
     let total_earnings = match earnings() {
-        Some(Ok(ref e)) => format!("¥{}", e.total_earnings),
-        _ => "¥ 0.00".to_string(),
+        Some(Ok(Some(ref e))) => format_precise_cny_str(&e.total_earnings),
+        _ => "¥0.00".to_string(),
     };
     let available = match earnings() {
-        Some(Ok(ref e)) => format!("¥{}", e.available_earnings),
-        _ => "¥ 0.00".to_string(),
+        Some(Ok(Some(ref e))) => format_precise_cny_str(&e.available_earnings),
+        _ => "¥0.00".to_string(),
     };
     let pending = match earnings() {
-        Some(Ok(ref e)) => format!("¥{}", e.pending_earnings),
-        _ => "¥ 0.00".to_string(),
+        Some(Ok(Some(ref e))) => format_precise_cny_str(&e.pending_earnings),
+        _ => "¥0.00".to_string(),
     };
 
     let mut page = use_signal(|| 1u32);
@@ -100,13 +105,14 @@ pub fn DistributionRecords() -> Element {
     };
 
     rsx! {
-        div { class: "page-header",
-            h1 { class: "page-title", {i18n.t("page.distribution_records")} }
-            p { class: "page-description", "{page_desc}" }
+        div { class: "page-container distribution-records-page",
+        PageHeader {
+            title: i18n.t("page.distribution_records").to_string(),
+            description: page_desc.to_string(),
         }
 
-        // 收益统计卡片
-        div { class: "stats-grid",
+        // 收益统计只属于个人视图；管理员页不混入当前管理员的个人收益。
+        if !is_admin { div { class: "stats-grid",
             div { class: "stat-card card",
                 div { class: "card-body",
                     p { class: "stat-label", {i18n.t("distribution.total_earnings")} }
@@ -125,7 +131,7 @@ pub fn DistributionRecords() -> Element {
                     p { class: "stat-value", "{pending}" }
                 }
             }
-        }
+        } }
 
         // 分销规则只读展示（Admin 可见）
         if is_admin {
@@ -210,21 +216,21 @@ pub fn DistributionRecords() -> Element {
                             if let Some(Ok(ref list)) = admin_records() {
                                 for rec in list.iter().skip(admin_start).take(PAGE_SIZE) {
                                     tr {
-                                        td { code { "{rec.id}" } }
+                                        td { code { title: "{rec.id}", {short_id(&rec.id)} } }
                                         td {
                                             // 截取 UUID 前 8 位＋全量 tooltip
                                             span {
                                                 title: "{rec.referred_id}",
                                                 style: "cursor: help; font-family: monospace; font-size: 13px;",
-                                                { format!("{}…", &rec.referred_id[..rec.referred_id.len().min(8)]) }
+                                                {short_id(&rec.referred_id)}
                                             }
                                         }
-                                        td { "¥{rec.amount}" }
-                                        td { "¥{rec.commission}" }
+                                        td { {format_precise_cny_str(&rec.amount)} }
+                                        td { {format_precise_cny_str(&rec.commission)} }
                                         td {
                                             Badge {
                                                 variant: dist_status_variant(&rec.status),
-                                                "{rec.status}"
+                                                {distribution_status_label(&rec.status, &i18n)}
                                             }
                                         }
                                         td { { format_time(&rec.created_at) } }
@@ -232,7 +238,7 @@ pub fn DistributionRecords() -> Element {
                                             span {
                                                 title: "{rec.referrer_id}",
                                                 style: "cursor: help; font-family: monospace; font-size: 13px;",
-                                                { format!("{}…", &rec.referrer_id[..rec.referrer_id.len().min(8)]) }
+                                                {short_id(&rec.referrer_id)}
                                             }
                                         }
                                     }
@@ -279,8 +285,8 @@ pub fn DistributionRecords() -> Element {
                                             }
                                         }
                                         td { { format_time(&r.joined_at) } }
-                                        td { "¥{r.total_spent}" }
-                                        td { "¥{r.earnings_from_referral}" }
+                                        td { {format_precise_cny_str(&r.total_spent)} }
+                                        td { {format_precise_cny_str(&r.earnings_from_referral)} }
                                     }
                                 }
                             }
@@ -303,10 +309,13 @@ pub fn DistributionRecords() -> Element {
                     Pagination {
                         current: page(),
                         total_pages,
+                        previous_label: i18n.t("table.previous").to_string(),
+                        next_label: i18n.t("table.next").to_string(),
                         on_page_change: move |p| page.set(p),
                     }
                 }
             }
+        }
         }
     }
 }

@@ -41,7 +41,7 @@ pub struct LineChartProps {
     pub x_data: Vec<String>,
     /// 数据系列列表
     pub series: Vec<LineSeriesData>,
-    /// 容器宽度（像素）
+    /// 容器最大宽度（像素）；实际宽度会随父容器收缩
     #[props(default = 500)]
     pub width: u32,
     /// 容器高度（像素）
@@ -62,6 +62,14 @@ pub fn LineChart(props: LineChartProps) -> Element {
     let title_text = props.title.clone();
     let x_data = props.x_data.clone();
     let series_data = props.series.clone();
+
+    let cleanup_id = props.id.clone();
+    use_drop(move || {
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::charts::echarts_bindgen::dispose_chart(&cleanup_id);
+        }
+    });
 
     use_effect(move || {
         #[cfg(target_arch = "wasm32")]
@@ -93,13 +101,28 @@ pub fn LineChart(props: LineChartProps) -> Element {
             }
 
             crate::charts::echarts_bindgen::render_chart(&id, width, height, &option);
+            crate::charts::echarts_bindgen::observe_chart_resize(&id, width, height);
         }
     });
 
     rsx! {
         div {
             id: "{props.id}",
-            style: "width: {width}px; height: {height}px;",
+            class: "responsive-chart",
+            style: "width: 100%; max-width: {width}px; height: {height}px;",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn line_chart_uses_a_fluid_container() {
+        let source = include_str!("line_chart.rs");
+        let component_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(component_source.contains("width: 100%; max-width: {width}px"));
+        assert!(component_source.contains("observe_chart_resize(&id, width, height)"));
+        assert!(component_source.contains("dispose_chart(&cleanup_id)"));
+        assert!(!component_source.contains("style: \"width: {width}px; height: {height}px;\""));
     }
 }

@@ -31,7 +31,6 @@ pub struct UiState {
 ///
 /// # Props
 /// - `nav_sections`：侧边栏导航分组列表
-/// - `page_title`：当前页面标题（显示在顶部栏）
 /// - `user_name`：当前登录用户名（显示头像首字母）
 /// - `site_logo_src`：侧边栏站点 Logo 地址
 /// - `children`：主内容区内容
@@ -39,7 +38,6 @@ pub struct UiState {
 #[component]
 pub fn AppShell(
     #[props(default)] nav_sections: Vec<NavSection>,
-    #[props(default)] page_title: String,
     #[props(default)] user_name: String,
     #[props(default)] current_path: String,
     #[props(default)] home_title: String,
@@ -50,6 +48,7 @@ pub fn AppShell(
     #[props(default)] switch_to_zh_title: String,
     #[props(default)] switch_to_en_title: String,
     #[props(default)] profile_label: String,
+    #[props(default)] user_menu_label: String,
     #[props(default)] account_settings_label: String,
     #[props(default)] logout_label: String,
     #[props(default)] expand_sidebar_title: String,
@@ -174,7 +173,6 @@ pub fn AppShell(
 
             div { class: "{main_class}",
                 Header {
-                    page_title: page_title.clone(),
                     user_name: user_name.clone(),
                     sidebar_collapsed,
                     sidebar_mobile_open,
@@ -187,6 +185,7 @@ pub fn AppShell(
                     switch_to_zh_title: switch_to_zh_title.clone(),
                     switch_to_en_title: switch_to_en_title.clone(),
                     profile_label: profile_label.clone(),
+                    user_menu_label: user_menu_label.clone(),
                     account_settings_label: account_settings_label.clone(),
                     logout_label: logout_label.clone(),
                     on_user_menu,
