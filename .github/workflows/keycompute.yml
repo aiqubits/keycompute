@@ -350,38 +350,12 @@ jobs:
       - name: Install wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
-
-      - name: Install dioxus-cli
-        run: cargo binstall dioxus-cli --version 0.7.9 -y --force
-
-      - name: Install locked Docker Web tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binaryen
-          cargo binstall wasm-bindgen-cli --version 0.2.114 -y --force
-          npm install --global esbuild@0.25.0
-
-      - name: Verify dx installation
-        run: |
-          echo "Cargo bin directory: $HOME/.cargo/bin"
-          ls -la $HOME/.cargo/bin/ | grep dx || echo "dx not found in cargo/bin"
-          which dx || echo "dx not in PATH"
-          if [ -f "$HOME/.cargo/bin/dx" ]; then
-            echo "dx found at: $HOME/.cargo/bin/dx"
-            $HOME/.cargo/bin/dx --version
-          else
-            echo "ERROR: dx binary not found, installing via cargo install as fallback"
-            cargo install dioxus-cli --version 0.7.9
-          fi
-
       - name: Build Web WASM
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo build --release -p web --target wasm32-unknown-unknown
 
-      - name: Verify Docker Web workspace
+      - name: Verify Web-only Docker Cargo workspace
         shell: bash
         run: |
           set -euo pipefail
@@ -397,40 +371,30 @@ jobs:
           ln -s "${GITHUB_WORKSPACE}/crates/keycompute-types" \
             "${web_workspace}/crates/keycompute-types"
 
-          # Normalize the root lockfile for the reduced member set, then prove
-          # the committed Docker lockfile is exactly that projection.
-          cargo metadata \
+          # Project the root lockfile onto the reduced member set, but download
+          # only dependencies selected for the Web/WASM target.
+          cargo fetch \
             --manifest-path "${web_workspace}/Cargo.toml" \
-            --offline \
-            --format-version 1 >/dev/null
-          cmp "${web_workspace}/Cargo.lock" prod-build/web/Cargo.lock
-
-          # Unlike `cargo metadata --no-deps`, this executes the same locked
-          # dependency resolution and target selection used by Dockerfile.web.
-          CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target" cargo check \
-            --manifest-path "${web_workspace}/Cargo.toml" \
-            --locked \
-            --offline \
-            --release \
-            --package web \
             --target wasm32-unknown-unknown
-
-          # Exercise the same locked/offline dx path and output layout copied
-          # by Dockerfile.web, including all NO_DOWNLOADS tool requirements.
-          (
-            cd "${web_workspace}"
-            NO_DOWNLOADS=1 \
-              CARGO_NET_OFFLINE=true \
-              CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/docker-web" \
-              dx build --release --package web --platform web
-          )
-          public_dir="${GITHUB_WORKSPACE}/target/docker-web/dx/web/release/web/public"
-          test -f "${public_dir}/index.html"
-          find "${public_dir}" -type f -name '*.wasm' -print -quit | grep -q .
-          find "${public_dir}" -type f -name '*.js' -print -quit | grep -q .
+          cmp "${web_workspace}/Cargo.lock" prod-build/web/Cargo.lock
 
       # ── Step: Run Web Unit Tests ────────────────────────────────────────────
       # web 包的单测（i18n key 一致性、示例文本生成、URL 归一化）只能在 native 下运行，
       # 与上方 wasm 构建互补：wasm 构建保证可编译，单测保证行为正确。
       - name: Run Web Unit Tests
         run: cargo test --package web
+
+      # Build the production Dockerfile itself so CI covers the locked/offline
+      # dx toolchain, asset bundling, artifact layout, and final Nginx image.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Verify production Web image
+        uses: docker/build-push-action@v7
+        timeout-minutes: 45
+        with:
+          context: .
+          file: ./Dockerfile.web
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=keycompute-web-image
+          cache-to: type=gha,mode=max,scope=keycompute-web-image,ignore-error=true

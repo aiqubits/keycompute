@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 thiserror = "2.0"
 uuid = { version = "1.16", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+# Shared types need UTC timestamps and serde, but never the host's local time
+# zone. Avoid Chrono's default `clock` feature and its non-Web OS backends.
+chrono = { version = "0.4", default-features = false, features = ["serde", "std", "now", "wasmbind"] }
 rust_decimal = { version = "1.36", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

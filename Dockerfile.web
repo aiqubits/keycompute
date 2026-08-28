@@ -62,6 +62,7 @@ RUN ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
 # Debian Bookworm 提供的 Binaryen 108 无法解析 Rust 1.92 默认生成的
 # reference-types/table.fill 指令，dx 会因此跳过 wasm-opt。用官方发布版覆盖
 # /usr/bin/wasm-opt，并校验架构对应的固定摘要，保证生产 Wasm 确实完成优化。
+# 单次下载最多 5 分钟；重试会续传临时文件，在 45 分钟 CI 预算内收敛失败并留出编译时间。
 ENV BINARYEN_VERSION=131
 RUN set -eux; \
     ARCH="$(uname -m)"; \
@@ -70,10 +71,21 @@ RUN set -eux; \
         aarch64) SHA256="ba991f677edd9a21d2bc96c0144bc8ac5b112d4d98a3eb266e075e22e557df2a" ;; \
         *) echo "Unsupported Binaryen architecture: $ARCH" >&2; exit 1 ;; \
     esac; \
-    curl -L --proto '=https' --tlsv1.2 -sSf \
-        --retry 5 --retry-all-errors --connect-timeout 20 \
-        "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${ARCH}-linux.tar.gz" \
-        -o /tmp/binaryen.tar.gz; \
+    archive="/tmp/binaryen.tar.gz"; \
+    download_url="https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${ARCH}-linux.tar.gz"; \
+    for attempt in 1 2 3 4 5 6; do \
+        if curl -L --proto '=https' --tlsv1.2 -sSf \
+            --connect-timeout 20 --max-time 300 --continue-at - \
+            --speed-limit 1024 --speed-time 60 \
+            "$download_url" -o "$archive"; then \
+            break; \
+        fi; \
+        if [ "$attempt" -eq 6 ]; then \
+            echo "Binaryen download failed after $attempt attempts" >&2; \
+            exit 1; \
+        fi; \
+        sleep "$attempt"; \
+    done; \
     echo "$SHA256  /tmp/binaryen.tar.gz" | sha256sum -c -; \
     tar xzf /tmp/binaryen.tar.gz -C /tmp; \
     install -m 0755 "/tmp/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" /usr/local/bin/wasm-opt; \
@@ -120,6 +132,14 @@ ENV CARGO_NET_OFFLINE=true
 RUN --mount=type=cache,id=keycompute-web-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=keycompute-web-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     dx build --release --package web --platform web
+
+# Fail the image build before the runtime stage if Dioxus changes its output
+# layout or produces an incomplete Web bundle.
+RUN set -eux; \
+    public_dir="/app/target/dx/web/release/web/public"; \
+    test -f "${public_dir}/index.html"; \
+    test -n "$(find "${public_dir}" -type f -name '*.wasm' -print -quit)"; \
+    test -n "$(find "${public_dir}" -type f -name '*.js' -print -quit)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 阶段 2：runtime — Nginx 静态文件托管
