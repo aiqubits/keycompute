@@ -107,6 +107,31 @@ async fn create_test_hmac_token(pool: &DatabaseConnection, user_id: Uuid, secret
     token_plaintext
 }
 
+fn chat_task_payload(request_id: Uuid) -> NodeTaskPayload {
+    NodeTaskPayload {
+        request_id,
+        chat: Some(keycompute_types::ChatCompletionRequest::new(
+            "deepseek-chat",
+            Vec::new(),
+        )),
+        image_generation: None,
+        image_edit: None,
+    }
+}
+
+fn image_generation_task_payload(request_id: Uuid) -> NodeTaskPayload {
+    NodeTaskPayload {
+        request_id,
+        chat: None,
+        image_generation: Some(ImageGenerationRequest {
+            prompt: "Node Gateway completion fixture".to_string(),
+            n: Some(1),
+            size: None,
+        }),
+        image_edit: None,
+    }
+}
+
 impl NodeTestEnv {
     /// 创建测试环境
     ///
@@ -1055,6 +1080,8 @@ async fn test_complete_idempotency() -> anyhow::Result<()> {
 
     // 2. 创建 leased 任务
     let lease_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let payload = chat_task_payload(request_id);
     let task = NodeTask::find_by_statement(
         Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -1064,10 +1091,10 @@ async fn test_complete_idempotency() -> anyhow::Result<()> {
             RETURNING *
             "#,
             [
-                Uuid::new_v4().into(),
+                request_id.into(),
                 Uuid::new_v4().into(),
                 "deepseek-chat".into(),
-                serde_json::json!({}).into(),
+                serde_json::to_value(&payload)?.into(),
                 register_resp.node_id.into(),
                 register_resp.session_id.into(),
                 lease_id.into(),
@@ -1203,6 +1230,8 @@ async fn test_client_error_does_not_exclude_node() -> anyhow::Result<()> {
 
     for i in 1..=3 {
         let lease_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let payload = chat_task_payload(request_id);
         let task = NodeTask::find_by_statement(
             Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -1212,10 +1241,10 @@ async fn test_client_error_does_not_exclude_node() -> anyhow::Result<()> {
                 RETURNING *
                 "#,
                 [
-                    Uuid::new_v4().into(),
+                    request_id.into(),
                     Uuid::new_v4().into(),
                     "deepseek-chat".into(),
-                    serde_json::json!({}).into(),
+                    serde_json::to_value(&payload)?.into(),
                     register_resp.node_id.into(),
                     register_resp.session_id.into(),
                     lease_id.into(),
@@ -1284,6 +1313,8 @@ async fn test_concurrent_complete_safety() -> anyhow::Result<()> {
 
     // 2. 创建 leased 任务
     let lease_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let payload = chat_task_payload(request_id);
     let task = NodeTask::find_by_statement(
         Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -1293,10 +1324,10 @@ async fn test_concurrent_complete_safety() -> anyhow::Result<()> {
             RETURNING *
             "#,
             [
-                Uuid::new_v4().into(),
+                request_id.into(),
                 Uuid::new_v4().into(),
                 "deepseek-chat".into(),
-                serde_json::json!({}).into(),
+                serde_json::to_value(&payload)?.into(),
                 register_resp.node_id.into(),
                 register_resp.session_id.into(),
                 lease_id.into(),
@@ -1415,6 +1446,8 @@ async fn test_image_succeeded_submission() -> anyhow::Result<()> {
 
     // 2. 创建 leased 任务
     let lease_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let payload = image_generation_task_payload(request_id);
     let task = NodeTask::find_by_statement(
         Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -1424,10 +1457,10 @@ async fn test_image_succeeded_submission() -> anyhow::Result<()> {
             RETURNING *
             "#,
             [
-                Uuid::new_v4().into(),
+                request_id.into(),
                 Uuid::new_v4().into(),
                 "stable-diffusion".into(),
-                serde_json::json!({}).into(),
+                serde_json::to_value(&payload)?.into(),
                 register_resp.node_id.into(),
                 register_resp.session_id.into(),
                 lease_id.into(),
@@ -2447,6 +2480,8 @@ async fn test_image_generation_idempotency() -> anyhow::Result<()> {
 
     // 2. 创建 leased 任务
     let lease_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let payload = image_generation_task_payload(request_id);
     let task = NodeTask::find_by_statement(
         Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -2456,10 +2491,10 @@ async fn test_image_generation_idempotency() -> anyhow::Result<()> {
             RETURNING *
             "#,
             [
-                Uuid::new_v4().into(),
+                request_id.into(),
                 test_user_id.into(),
                 "stable-diffusion".into(),
-                serde_json::json!({}).into(),
+                serde_json::to_value(&payload)?.into(),
                 register_resp.node_id.into(),
                 register_resp.session_id.into(),
                 lease_id.into(),
