@@ -183,8 +183,7 @@ fn SidebarNavItem(
     mut mobile_open: Signal<bool>,
     current_path: String,
 ) -> Element {
-    let is_active =
-        current_path == item.path || (item.path != "/" && current_path.starts_with(&item.path));
+    let is_active = nav_item_is_active(&current_path, &item.path);
 
     let item_class = if is_active {
         "sidebar-item active"
@@ -234,5 +233,32 @@ fn SidebarNavItem(
                 }
             }
         }
+    }
+}
+
+fn nav_item_is_active(current_path: &str, item_path: &str) -> bool {
+    current_path == item_path
+        || (item_path != "/"
+            && current_path
+                .strip_prefix(item_path)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nav_item_is_active;
+
+    #[test]
+    fn nested_console_routes_keep_their_parent_navigation_active() {
+        assert!(nav_item_is_active(
+            "/admin/monitoring/diagnostics",
+            "/admin/monitoring"
+        ));
+        assert!(nav_item_is_active("/admin/monitoring", "/admin/monitoring"));
+        assert!(!nav_item_is_active(
+            "/admin/monitoring-archive",
+            "/admin/monitoring"
+        ));
+        assert!(!nav_item_is_active("/dashboard", "/"));
     }
 }

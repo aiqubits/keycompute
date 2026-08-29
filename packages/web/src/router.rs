@@ -10,8 +10,8 @@ use crate::views::{
     node::{node_earnings::NodeEarnings, node_token::NodeToken},
     payments::{PaymentsOverview, Recharge},
     shared::{
-        Accounts, DistributionRecords, Monitoring, NodeGateway, PaymentOrders, Pricing, Settings,
-        System, Tenants, Users,
+        Accounts, DistributionRecords, Monitoring, MonitoringDiagnostics, NodeGateway,
+        PaymentOrders, Pricing, Settings, System, Tenants, Users,
     },
     user::{UserProfile, UserSettings},
 };
@@ -79,6 +79,8 @@ pub enum Route {
             NodeGateway {},
             #[route("/admin/monitoring")]
             Monitoring {},
+            #[route("/admin/monitoring/diagnostics")]
+            MonitoringDiagnostics {},
             #[route("/admin/settings")]
             Settings {},
         #[end_layout]
@@ -159,6 +161,22 @@ mod tests {
             query: RegisterQuery::default(),
         };
         assert_eq!(route.to_string(), "/auth/register?");
+    }
+
+    #[test]
+    fn monitoring_diagnostics_has_a_stable_nested_route() {
+        let url = "/admin/monitoring/diagnostics";
+        let route = Route::from_str(url).expect("diagnostics route should parse");
+        assert_eq!(route, Route::MonitoringDiagnostics {});
+        assert_eq!(route.to_string(), url);
+    }
+
+    #[test]
+    fn legacy_system_route_remains_parseable_for_compatibility() {
+        let url = "/admin/system";
+        let route = Route::from_str(url).expect("legacy system route should parse");
+        assert_eq!(route, Route::System {});
+        assert_eq!(route.to_string(), url);
     }
 
     #[test]

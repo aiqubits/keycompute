@@ -230,7 +230,6 @@ pub fn AppLayout() -> Element {
     let r_admin_payment_orders = Route::PaymentOrders {}.to_string();
     let r_admin_distribution = Route::DistributionRecords {}.to_string();
     let r_admin_tenants = Route::Tenants {}.to_string();
-    let r_admin_system = Route::System {}.to_string();
     let r_admin_node_gateway = Route::NodeGateway {}.to_string();
     let r_admin_monitoring = Route::Monitoring {}.to_string();
     let r_admin_system_settings = Route::Settings {}.to_string();
@@ -322,7 +321,6 @@ pub fn AppLayout() -> Element {
                 )
                 .admin(),
                 NavItem::new(i18n.t("nav.tenants"), r_admin_tenants, NavIcon::Home).admin(),
-                NavItem::new(i18n.t("nav.system"), r_admin_system, NavIcon::Settings).admin(),
                 NavItem::new(
                     i18n.t("nav.node_gateway"),
                     r_admin_node_gateway,
@@ -474,9 +472,10 @@ fn route_page_title(route: &Route, i18n: &I18n) -> String {
         Route::PaymentOrders {} => "page.payment_orders",
         Route::DistributionRecords {} => "page.distribution_records",
         Route::Tenants {} => "page.tenants",
-        Route::System {} => "page.system",
+        Route::System {} => "page.monitoring",
         Route::NodeGateway {} => "page.node_gateway",
         Route::Monitoring {} => "page.monitoring",
+        Route::MonitoringDiagnostics {} => "page.monitoring",
         Route::Settings {} => "page.settings",
         _ => "page.not_found",
     };
@@ -522,6 +521,7 @@ mod tests {
             Route::System {},
             Route::NodeGateway {},
             Route::Monitoring {},
+            Route::MonitoringDiagnostics {},
             Route::Settings {},
         ];
 
@@ -530,6 +530,18 @@ mod tests {
             assert!(!title.is_empty());
             assert_ne!(title, "?");
         }
+    }
+
+    #[test]
+    fn observability_routes_share_the_merged_page_title() {
+        let i18n = I18n::new(Lang::Zh);
+        let merged_title = route_page_title(&Route::Monitoring {}, &i18n);
+
+        assert_eq!(
+            route_page_title(&Route::MonitoringDiagnostics {}, &i18n),
+            merged_title
+        );
+        assert_eq!(route_page_title(&Route::System {}, &i18n), merged_title);
     }
 
     #[test]

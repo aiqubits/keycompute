@@ -26,9 +26,8 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("nav.payment_orders", "Payment Orders");
     m.insert("nav.distribution_records", "Distribution Records");
     m.insert("nav.tenants", "Tenants");
-    m.insert("nav.system", "System");
     m.insert("nav.node_gateway", "Node Gateway");
-    m.insert("nav.monitoring", "Monitoring");
+    m.insert("nav.monitoring", "Monitoring & Diagnostics");
     m.insert("nav.account_settings", "Account Settings");
     m.insert("nav.settings", "Settings");
     m.insert("nav.group.usage", "Usage");
@@ -140,11 +139,10 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("page.payment_orders", "Payment Orders");
     m.insert("page.distribution_records", "Distribution Records");
     m.insert("page.tenants", "Tenants");
-    m.insert("page.system", "System Diagnostics");
     m.insert("page.account_settings", "Account Settings");
     m.insert("page.settings", "Settings");
     m.insert("page.node_gateway", "Node Gateway");
-    m.insert("page.monitoring", "Monitoring");
+    m.insert("page.monitoring", "Monitoring & Diagnostics");
     m.insert("page.not_found", "Page Not Found");
 
     // ── Form ────────────────────────────────────
@@ -1067,10 +1065,6 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("dashboard.last_used_prefix", "Last used");
     m.insert("dashboard.no_usage_record", "No usage record");
 
-    m.insert(
-        "system.subtitle",
-        "Review provider health, gateway runtime metrics, and routing diagnostics",
-    );
     m.insert("system.provider_health", "Provider Health");
     m.insert(
         "system.no_healthy_provider",
@@ -1103,9 +1097,6 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("system.healthy", "Healthy");
     m.insert("system.unhealthy", "Unhealthy");
     m.insert("system.pricing_info", "Pricing");
-    m.insert("system.degraded", "Degraded");
-    m.insert("system.abnormal", "Abnormal");
-    m.insert("system.unknown", "Unknown");
 
     m.insert(
         "node_gateway.subtitle",
@@ -1252,7 +1243,14 @@ pub static EN: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
 
     m.insert(
         "monitoring.subtitle",
-        "Unified Provider Account and Node request lifecycles, target health, and billing state.",
+        "Review request trends, provider and node health, execution traces, and routing diagnostics in one place.",
+    );
+    m.insert("monitoring.views", "Monitoring and diagnostics views");
+    m.insert("monitoring.overview_tab", "Monitoring Overview");
+    m.insert("monitoring.diagnostics_tab", "System Diagnostics");
+    m.insert(
+        "monitoring.diagnostics_intro",
+        "In-memory metrics describe the current gateway instance independently of the overview time range; routing diagnostics use the current tenant's actual accounts and entry protocols to verify targets, provider state, and pricing.",
     );
     m.insert("monitoring.control_plane", "Execution Overview");
     m.insert(

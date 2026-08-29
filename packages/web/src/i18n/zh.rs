@@ -26,9 +26,8 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("nav.payment_orders", "支付订单");
     m.insert("nav.distribution_records", "分销记录");
     m.insert("nav.tenants", "租户管理");
-    m.insert("nav.system", "系统诊断");
     m.insert("nav.node_gateway", "节点网关");
-    m.insert("nav.monitoring", "监控追踪");
+    m.insert("nav.monitoring", "监控与诊断");
     m.insert("nav.account_settings", "账户设置");
     m.insert("nav.settings", "系统设置");
     m.insert("nav.group.usage", "用量");
@@ -125,11 +124,10 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("page.payment_orders", "支付订单");
     m.insert("page.distribution_records", "分销记录");
     m.insert("page.tenants", "租户管理");
-    m.insert("page.system", "系统诊断");
     m.insert("page.account_settings", "账户设置");
     m.insert("page.settings", "系统设置");
     m.insert("page.node_gateway", "节点网关");
-    m.insert("page.monitoring", "监控追踪");
+    m.insert("page.monitoring", "监控与诊断");
     m.insert("page.not_found", "页面不存在");
 
     // ── 表单 ────────────────────────────────────
@@ -910,10 +908,6 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("dashboard.none", "暂无");
     m.insert("dashboard.last_used_prefix", "最近使用");
     m.insert("dashboard.no_usage_record", "暂无使用记录");
-    m.insert(
-        "system.subtitle",
-        "查看 Provider 健康状态、网关运行统计和路由调试信息",
-    );
     m.insert("system.provider_health", "Provider 健康状态");
     m.insert("system.no_healthy_provider", "当前没有健康 Provider");
     m.insert("system.gateway_stats", "网关运行统计");
@@ -940,9 +934,6 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
     m.insert("system.healthy", "健康");
     m.insert("system.unhealthy", "不健康");
     m.insert("system.pricing_info", "定价信息");
-    m.insert("system.degraded", "降级");
-    m.insert("system.abnormal", "异常");
-    m.insert("system.unknown", "未知");
 
     m.insert(
         "node_gateway.subtitle",
@@ -1068,7 +1059,14 @@ pub static ZH: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| 
 
     m.insert(
         "monitoring.subtitle",
-        "统一追踪 Provider Account 与 Node 请求生命周期、目标健康和计费状态。",
+        "集中查看请求趋势、Provider 与节点健康、执行链路和路由诊断。",
+    );
+    m.insert("monitoring.views", "监控与诊断视图");
+    m.insert("monitoring.overview_tab", "监控概览");
+    m.insert("monitoring.diagnostics_tab", "系统诊断");
+    m.insert(
+        "monitoring.diagnostics_intro",
+        "进程内指标反映当前网关实例且不受概览时间范围影响；路由诊断按当前租户的真实账号与入口协议检查主备链路、Provider 状态和定价结果。",
     );
     m.insert("monitoring.control_plane", "执行链路概览");
     m.insert(

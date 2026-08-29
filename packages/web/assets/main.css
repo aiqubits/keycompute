@@ -3088,6 +3088,36 @@ select.form-input:focus {
   min-width: 0;
 }
 
+.monitoring-view-tabs {
+  align-self: flex-start;
+}
+
+.monitoring-view-tabs .filter-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
+.monitoring-diagnostics-intro {
+  max-width: 860px;
+  margin: -4px 0 0;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.system-diagnostics {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+.monitoring-legacy-redirect {
+  padding: 48px 20px;
+  text-align: center;
+}
+
 .monitoring-toolbar {
   display: flex;
   flex-direction: row;

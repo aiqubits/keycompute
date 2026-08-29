@@ -13,7 +13,7 @@ pub mod users;
 
 pub use accounts::Accounts;
 pub use distribution_records::DistributionRecords;
-pub use monitoring::Monitoring;
+pub use monitoring::{Monitoring, MonitoringDiagnostics};
 pub use node_gateway::NodeGateway;
 pub use payment_orders::PaymentOrders;
 pub use pricing::Pricing;

@@ -6,17 +6,17 @@ use client_api::{
     error::ClientError,
 };
 use dioxus::prelude::*;
-use ui::{Badge, BadgeVariant, PageHeader, Table, TableHead};
+use ui::{Badge, BadgeVariant, Table, TableHead};
 
 use crate::hooks::use_i18n::use_i18n;
+use crate::router::Route;
 use crate::services::{account_service, api_client::with_auto_refresh, debug_service};
 use crate::stores::auth_store::AuthStore;
 use crate::stores::user_store::UserStore;
 use crate::views::shared::accounts::NoPermissionView;
 
 const FALLBACK_ROUTING_PROBE_MODEL: &str = "gpt-4o";
-/// 系统页还会并行请求 Provider 健康和网关统计；将候选诊断限制在较小常数内，
-/// 避免异常账号较多时一次页面加载耗尽租户的 RPM 配额。
+/// 将候选诊断限制在较小常数内，避免异常账号较多时一次页面加载放大调试请求。
 const MAX_ROUTING_PROBES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -226,11 +226,31 @@ where
     search.finish()
 }
 
-/// 系统诊断页面（仅 Admin 可访问）
-///
-/// 展示 Provider 健康状态、网关运行统计、路由调试信息（调用 DebugApi）
+/// 旧“系统诊断”入口只负责兼容历史书签，统一跳转到监控中心的系统诊断视图。
+fn legacy_system_destination() -> Route {
+    Route::MonitoringDiagnostics {}
+}
+
 #[component]
 pub fn System() -> Element {
+    let i18n = use_i18n();
+    let nav = use_navigator();
+
+    use_effect(move || {
+        nav.replace(legacy_system_destination());
+    });
+
+    rsx! {
+        div { class: "monitoring-legacy-redirect text-secondary", {i18n.t("common.redirecting")} }
+    }
+}
+
+/// 监控中心内的系统诊断视图（仅 Admin 可访问）。
+///
+/// 历史请求、账号/节点健康和按时间窗聚合的指标由监控概览展示；这里保留来自
+/// 当前网关进程的实时状态，以及模拟路由决策、主备链路与定价检查。
+#[component]
+pub fn SystemDiagnostics() -> Element {
     let i18n = use_i18n();
     let user_store = use_context::<UserStore>();
     let auth_store = use_context::<AuthStore>();
@@ -243,7 +263,7 @@ pub fn System() -> Element {
 
     if !is_admin {
         return rsx! {
-            NoPermissionView { resource: i18n.t("page.system").to_string() }
+            NoPermissionView { resource: i18n.t("page.monitoring").to_string() }
         };
     }
 
@@ -254,6 +274,8 @@ pub fn System() -> Element {
         .map(|user| user.tenant_id.clone())
         .unwrap_or_default();
 
+    // 这两项来自网关进程内状态，不依赖监控聚合表。保持为独立资源，确保数据库
+    // 查询异常时仍可查看当前 Provider 和网关运行状态。
     let provider_health = use_resource(move || async move {
         with_auto_refresh(auth_store, |token| async move {
             debug_service::provider_health(&token).await
@@ -297,103 +319,53 @@ pub fn System() -> Element {
         }
     });
 
-    let (total_req, success_rate, avg_latency, fallback_count) = match gateway_stats() {
-        Some(Ok(ref s)) => (
-            s.total_requests.to_string(),
-            format!(
-                "{:.1}%",
-                s.successful_requests as f64 / s.total_requests.max(1) as f64 * 100.0
-            ),
-            format!("{}ms", s.avg_latency_ms),
-            s.fallback_count.to_string(),
-        ),
-        Some(Err(_)) => (
-            i18n.t("common.load_failed").to_string(),
-            "—".into(),
-            "—".into(),
-            "—".into(),
-        ),
-        None => (
-            i18n.t("table.loading").to_string(),
-            "—".into(),
-            "—".into(),
-            "—".into(),
-        ),
-    };
-
     rsx! {
-        div { class: "page-container system-page",
-        PageHeader {
-            title: i18n.t("page.system").to_string(),
-            description: i18n.t("system.subtitle").to_string(),
-        }
-
-        // Provider 健康状态
-        div { class: "section",
-            h2 { class: "section-title", {i18n.t("system.provider_health")} }
-            div { class: "section-body",
-                    match provider_health() {
-                        None => rsx! {
-                            p { class: "text-secondary", {i18n.t("table.loading")} }
-                        },
-                        Some(Err(_)) => rsx! {
-                            p { class: "text-secondary", {i18n.t("common.load_failed")} }
-                        },
-                        Some(Ok(ref resp)) => rsx! {
-                            div { class: "health-grid",
-                                for name in resp.healthy_providers.iter() {
-                                    HealthItem {
-                                        name: name.clone(),
-                                        status: "healthy".to_string(),
-                                        latency_ms: None,
-                                    }
-                                }
-                                if resp.healthy_providers.is_empty() {
-                                    div { class: "text-secondary", {i18n.t("system.no_healthy_provider")} }
-                                }
+        DiagnosticsSections {
+            provider_health: rsx! {
+                match provider_health() {
+                    None => rsx! {
+                        p { class: "text-secondary", {i18n.t("table.loading")} }
+                    },
+                    Some(Err(ref error)) => rsx! {
+                        div { class: "alert alert-error",
+                            "{i18n.t(\"common.load_failed\")}: {error}"
+                        }
+                    },
+                    Some(Ok(ref response)) => rsx! {
+                        div { class: "health-grid",
+                            for name in response.healthy_providers.iter() {
+                                HealthItem { name: name.clone() }
                             }
-                        },
-                    }
-            }
-        }
-
-        // 网关运行统计
-        div { class: "section",
-            h2 { class: "section-title", {i18n.t("system.gateway_stats")} }
-            div { class: "stats-grid",
-                div { class: "stat-card card",
-                    div { class: "card-body",
-                        p { class: "stat-label", {i18n.t("system.total_requests")} }
-                        p { class: "stat-value", "{total_req}" }
-                    }
+                            if response.healthy_providers.is_empty() {
+                                p { class: "text-secondary", {i18n.t("system.no_healthy_provider")} }
+                            }
+                        }
+                    },
                 }
-                div { class: "stat-card card",
-                    div { class: "card-body",
-                        p { class: "stat-label", {i18n.t("system.success_rate")} }
-                        p { class: "stat-value", "{success_rate}" }
-                    }
+            },
+            gateway_stats: rsx! {
+                match gateway_stats() {
+                    None => rsx! {
+                        p { class: "text-secondary", {i18n.t("table.loading")} }
+                    },
+                    Some(Err(ref error)) => rsx! {
+                        div { class: "alert alert-error",
+                            "{i18n.t(\"common.load_failed\")}: {error}"
+                        }
+                    },
+                    Some(Ok(ref stats)) => rsx! {
+                        GatewayRuntimeStats {
+                            total_requests: stats.total_requests,
+                            successful_requests: stats.successful_requests,
+                            avg_latency_ms: stats.avg_latency_ms,
+                            fallback_count: stats.fallback_count,
+                        }
+                    },
                 }
-                div { class: "stat-card card",
-                    div { class: "card-body",
-                        p { class: "stat-label", {i18n.t("system.avg_latency")} }
-                        p { class: "stat-value", "{avg_latency}" }
-                    }
-                }
-                div { class: "stat-card card",
-                    div { class: "card-body",
-                        p { class: "stat-label", {i18n.t("system.fallback_count")} }
-                        p { class: "stat-value", "{fallback_count}" }
-                    }
-                }
-            }
-        }
-
-        // 路由调试
-        div { class: "section",
-            h2 { class: "section-title", {i18n.t("system.routing_debug")} }
-            div { class: "section-body",
-                    h3 { class: "subsection-title section-body-title", {i18n.t("system.provider_status_diagnosis")} }
-                    match routing_info() {
+            },
+            routing_info: rsx! {
+                h3 { class: "subsection-title section-body-title", {i18n.t("system.provider_status_diagnosis")} }
+                match routing_info() {
                         None => rsx! {
                             p { class: "text-secondary", {i18n.t("table.loading")} }
                         },
@@ -486,34 +458,82 @@ pub fn System() -> Element {
                                 }
                             }
                         },
-                    }
-            }
-        }
+                }
+            },
         }
     }
 }
 
-// ── 内部组件 ──────────────────────────────────────────────────────
+/// 诊断区块采用独立内容槽位。任一区块失败时只替换自己的内容，不能阻断另外两项
+/// 来自不同数据源的运行状态。
+#[component]
+fn DiagnosticsSections(
+    provider_health: Element,
+    gateway_stats: Element,
+    routing_info: Element,
+) -> Element {
+    let i18n = use_i18n();
+
+    rsx! {
+        div { class: "system-diagnostics",
+            div { class: "section",
+                h2 { class: "section-title", {i18n.t("system.provider_health")} }
+                div { class: "section-body", {provider_health} }
+            }
+            div { class: "section",
+                h2 { class: "section-title", {i18n.t("system.gateway_stats")} }
+                div { class: "section-body", {gateway_stats} }
+            }
+            div { class: "section",
+                h2 { class: "section-title", {i18n.t("system.routing_debug")} }
+                div { class: "section-body", {routing_info} }
+            }
+        }
+    }
+}
 
 #[component]
-fn HealthItem(name: String, status: String, latency_ms: Option<i64>) -> Element {
+fn HealthItem(name: String) -> Element {
     let i18n = use_i18n();
-    let (status_class, status_text) = match status.as_str() {
-        "healthy" => (BadgeVariant::Success, i18n.t("system.healthy")),
-        "degraded" => (BadgeVariant::Warning, i18n.t("system.degraded")),
-        "unhealthy" => (BadgeVariant::Error, i18n.t("system.abnormal")),
-        _ => (BadgeVariant::Neutral, i18n.t("system.unknown")),
-    };
-
     rsx! {
         div { class: "health-item",
             div { class: "health-name", "{name}" }
             div { class: "health-status",
-                Badge { variant: status_class, "{status_text}" }
-                if let Some(ms) = latency_ms {
-                    span { class: "text-secondary text-sm", "{ms}ms" }
-                }
+                Badge { variant: BadgeVariant::Success, {i18n.t("system.healthy")} }
             }
+        }
+    }
+}
+
+#[component]
+fn GatewayRuntimeStats(
+    total_requests: i64,
+    successful_requests: i64,
+    avg_latency_ms: u64,
+    fallback_count: i64,
+) -> Element {
+    let i18n = use_i18n();
+    let success_rate = format!(
+        "{:.1}%",
+        successful_requests as f64 / total_requests.max(1) as f64 * 100.0
+    );
+
+    rsx! {
+        div { class: "stats-grid",
+            RuntimeStatCard { label: i18n.t("system.total_requests").to_string(), value: total_requests.to_string() }
+            RuntimeStatCard { label: i18n.t("system.success_rate").to_string(), value: success_rate }
+            RuntimeStatCard { label: i18n.t("system.avg_latency").to_string(), value: format!("{avg_latency_ms}ms") }
+            RuntimeStatCard { label: i18n.t("system.fallback_count").to_string(), value: fallback_count.to_string() }
+        }
+    }
+}
+
+#[component]
+fn RuntimeStatCard(label: String, value: String) -> Element {
+    rsx! {
+        div { class: "stat-card",
+            p { class: "stat-label", "{label}" }
+            p { class: "stat-value", "{value}" }
         }
     }
 }
@@ -521,14 +541,106 @@ fn HealthItem(name: String, status: String, latency_ms: Option<i64>) -> Element 
 #[cfg(test)]
 mod tests {
     use super::{
-        FALLBACK_ROUTING_PROBE_MODEL, MAX_ROUTING_PROBES, ProbeSearch, RoutingEntry, RoutingProbe,
-        routing_probes, routing_probes_from_catalog,
+        DiagnosticsSections, FALLBACK_ROUTING_PROBE_MODEL, MAX_ROUTING_PROBES, ProbeSearch,
+        RoutingEntry, RoutingProbe, routing_probes, routing_probes_from_catalog,
     };
     use client_api::api::admin::AccountInfo;
     use client_api::error::ClientError;
+    use dioxus::history::{History, MemoryHistory};
+    use dioxus::prelude::*;
+    use dioxus::router::components::HistoryProvider;
+    use std::rc::Rc;
 
     const TENANT: &str = "11111111-1111-1111-1111-111111111111";
     const OTHER_TENANT: &str = "22222222-2222-2222-2222-222222222222";
+
+    #[derive(Clone, Debug, Routable, PartialEq)]
+    enum RedirectHarnessRoute {
+        #[route("/admin/system")]
+        LegacySystemHarness {},
+        #[route("/admin/monitoring/diagnostics")]
+        MergedDiagnosticsHarness {},
+    }
+
+    #[component]
+    fn LegacySystemHarness() -> Element {
+        rsx! { super::System {} }
+    }
+
+    #[component]
+    fn MergedDiagnosticsHarness() -> Element {
+        rsx! { div { "merged-diagnostics" } }
+    }
+
+    #[derive(Clone)]
+    struct SharedHistory(Rc<MemoryHistory>);
+
+    impl PartialEq for SharedHistory {
+        fn eq(&self, other: &Self) -> bool {
+            Rc::ptr_eq(&self.0, &other.0)
+        }
+    }
+
+    #[component]
+    fn RedirectHarness(history: SharedHistory) -> Element {
+        rsx! {
+            HistoryProvider {
+                history: move |_| history.0.clone() as Rc<dyn History>,
+                Router::<RedirectHarnessRoute> {}
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_system_route_replaces_history_with_the_merged_diagnostics_view() {
+        let history = Rc::new(MemoryHistory::with_initial_path("/admin/system"));
+        let mut dom = VirtualDom::new_with_props(
+            RedirectHarness,
+            RedirectHarnessProps {
+                history: SharedHistory(history.clone()),
+            },
+        );
+
+        dom.rebuild_in_place();
+        dom.render_immediate(&mut dioxus::prelude::dioxus_core::NoOpMutations);
+
+        assert_eq!(history.current_route(), "/admin/monitoring/diagnostics");
+        assert!(!history.can_go_back(), "redirect must replace, not push");
+    }
+
+    fn diagnostics_failure_fixture() -> Element {
+        let provider = "provider-runtime-ready".to_string();
+        let gateway = "gateway-runtime-ready".to_string();
+        let routing = "routing-database-failed".to_string();
+
+        rsx! {
+            DiagnosticsSections {
+                provider_health: rsx! { p { "{provider}" } },
+                gateway_stats: rsx! { p { "{gateway}" } },
+                routing_info: rsx! { p { "{routing}" } },
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_sections_render_when_database_backed_routing_fails() {
+        let mut dom = VirtualDom::new(diagnostics_failure_fixture);
+        let mutations = dom.rebuild_to_vec();
+        let rendered_text = mutations
+            .edits
+            .iter()
+            .filter_map(|edit| match edit {
+                dioxus::prelude::dioxus_core::Mutation::CreateTextNode { value, .. } => {
+                    Some(value.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(rendered_text.contains(&"provider-runtime-ready"));
+        assert!(rendered_text.contains(&"gateway-runtime-ready"));
+        assert!(rendered_text.contains(&"routing-database-failed"));
+    }
 
     fn account(
         tenant_id: &str,

@@ -7,10 +7,12 @@ use ui::{Badge, BadgeVariant, ConfirmModal, PageHeader};
 
 use crate::hooks::use_i18n::use_i18n;
 use crate::i18n::I18n;
+use crate::router::Route;
 use crate::services::{api_client::with_auto_refresh, monitoring_service};
 use crate::stores::{auth_store::AuthStore, user_store::UserStore};
 use crate::utils::time::format_time;
 use crate::views::shared::accounts::NoPermissionView;
+use crate::views::shared::system::SystemDiagnostics;
 
 #[derive(Clone)]
 enum MonitoringData {
@@ -20,6 +22,80 @@ enum MonitoringData {
         health: MonitoringTargetHealthResponse,
         updated_at: String,
     },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MonitoringView {
+    Overview,
+    Diagnostics,
+}
+
+fn aria_current(active: MonitoringView, view: MonitoringView) -> &'static str {
+    if active == view { "page" } else { "false" }
+}
+
+#[component]
+fn MonitoringTabs(active: MonitoringView) -> Element {
+    let i18n = use_i18n();
+    let overview_class = if active == MonitoringView::Overview {
+        "filter-tab active"
+    } else {
+        "filter-tab"
+    };
+    let diagnostics_class = if active == MonitoringView::Diagnostics {
+        "filter-tab active"
+    } else {
+        "filter-tab"
+    };
+
+    rsx! {
+        nav {
+            class: "filter-tabs monitoring-view-tabs",
+            aria_label: i18n.t("monitoring.views"),
+            Link {
+                class: "{overview_class}",
+                aria_current: aria_current(active, MonitoringView::Overview),
+                to: Route::Monitoring {},
+                {i18n.t("monitoring.overview_tab")}
+            }
+            Link {
+                class: "{diagnostics_class}",
+                aria_current: aria_current(active, MonitoringView::Diagnostics),
+                to: Route::MonitoringDiagnostics {},
+                {i18n.t("monitoring.diagnostics_tab")}
+            }
+        }
+    }
+}
+
+/// 路由诊断子视图独立成子路由，避免进入监控概览时同时触发诊断请求。
+#[component]
+pub fn MonitoringDiagnostics() -> Element {
+    let i18n = use_i18n();
+    let user_store = use_context::<UserStore>();
+    if !user_store
+        .info
+        .read()
+        .as_ref()
+        .map(|user| user.is_admin())
+        .unwrap_or(false)
+    {
+        return rsx! { NoPermissionView { resource: i18n.t("page.monitoring").to_string() } };
+    }
+
+    rsx! {
+        div { class: "page-container monitoring-page",
+            PageHeader {
+                title: i18n.t("page.monitoring").to_string(),
+                description: i18n.t("monitoring.subtitle").to_string(),
+            }
+            MonitoringTabs { active: MonitoringView::Diagnostics }
+            p { class: "text-secondary monitoring-diagnostics-intro",
+                {i18n.t("monitoring.diagnostics_intro")}
+            }
+            SystemDiagnostics {}
+        }
+    }
 }
 
 #[component]
@@ -155,6 +231,7 @@ pub fn Monitoring() -> Element {
                 title: i18n.t("page.monitoring").to_string(),
                 description: i18n.t("monitoring.subtitle").to_string(),
             }
+            MonitoringTabs { active: MonitoringView::Overview }
 
             div { class: "monitoring-toolbar",
                 select {
@@ -888,7 +965,10 @@ fn format_duration(ms: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_query, detail_resource_key, format_currency_amounts, refreshed_relative_to};
+    use super::{
+        MonitoringView, aria_current, build_query, detail_resource_key, format_currency_amounts,
+        refreshed_relative_to,
+    };
 
     fn timestamp(value: &str) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339(value)
@@ -902,6 +982,22 @@ mod tests {
         assert_ne!(
             detail_resource_key("request-1", 1),
             detail_resource_key("request-1", 2)
+        );
+    }
+
+    #[test]
+    fn monitoring_tabs_expose_the_active_route_to_assistive_technology() {
+        assert_eq!(
+            aria_current(MonitoringView::Overview, MonitoringView::Overview),
+            "page"
+        );
+        assert_eq!(
+            aria_current(MonitoringView::Overview, MonitoringView::Diagnostics),
+            "false"
+        );
+        assert_eq!(
+            aria_current(MonitoringView::Diagnostics, MonitoringView::Diagnostics),
+            "page"
         );
     }
 
